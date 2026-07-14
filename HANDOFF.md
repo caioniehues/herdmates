@@ -25,13 +25,18 @@ contract, binary is stubs.
 
 ## NEXT steps (in order)
 
-1. **Verify the four spec §9 TODOs first** — cheapest de-risking:
-   - manifest `[[events]] on =` name for agent status changes (docs example
-     vocabulary vs socket's `pane.agent_status_changed`) — test with a linked
-     dummy plugin that logs `HERDR_PLUGIN_EVENT` env;
-   - event JSON payload shape;
-   - pointer-line injection into a mid-turn Claude Code pane queues cleanly;
-   - codex double-Enter under `pane run` vs `agent send`.
+1. ~~Verify the four spec §9 TODOs~~ — **ALL RESOLVED 2026-07-14** by live test
+   inside herdr 0.7.3 (protocol 16, matches snapshot). Findings + exact payload
+   recorded in spec §9. Test fixture: `tests/fixtures/event-logger-plugin/`
+   (linked but disabled; re-enable with
+   `herdr plugin enable herdr-agent-team.event-logger`). Headlines:
+   - `HERDR_PLUGIN_EVENT_JSON` = `{"event":"pane_agent_status_changed","data":{…socket payload…}}`;
+     dot form in `HERDR_PLUGIN_EVENT`, underscore form inside the JSON.
+   - Mid-turn `pane run` into Claude Code queues cleanly, auto-submits after
+     the turn.
+   - Codex: `pane run` submits in one call; double-Enter only needed for
+     `agent send` + immediate `send-keys Enter` (debounce). Rule: always
+     `pane run`.
 2. Implement `spawn` happy path (spec §4) against a throwaway 2-worker spec.
 3. Event hook `on-agent-status` (spec §5).
 4. `status` / `kill` (spec §6).

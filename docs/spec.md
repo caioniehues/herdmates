@@ -150,12 +150,37 @@ Given a spec (file or shorthand):
       `cobanov/herdr-ntfysh` and `horn553/herdr-ntfy` both hook
       `on = "pane.agent_status_changed"` in their manifests. Steal their
       payload handling as reference when implementing.
-- [ ] Confirm `HERDR_PLUGIN_EVENT_JSON` payload shape for that event
-      (`herdr api schema` + live test).
-- [ ] Live-verify inject-into-claude-pane lands as a queued user message
-      mid-turn.
-- [ ] Live-verify codex double-Enter behavior under `pane run` vs
-      `agent send`.
+- [x] Confirm `HERDR_PLUGIN_EVENT_JSON` payload shape — RESOLVED 2026-07-14 by
+      live test (herdr 0.7.3, protocol 16) with the linked fixture plugin
+      `tests/fixtures/event-logger-plugin/`:
+
+      ```json
+      HERDR_PLUGIN_EVENT=pane.agent_status_changed
+      HERDR_PLUGIN_EVENT_JSON={"event":"pane_agent_status_changed","data":{"type":"pane_agent_status_changed","pane_id":"wG:p2","workspace_id":"wG","agent_status":"idle","agent":"claude"}}
+      ```
+
+      Note the naming split: `HERDR_PLUGIN_EVENT` uses the dot form (manifest
+      vocabulary); the JSON `event`/`data.type` use the underscore form (socket
+      `EventKind`). `data` matches the socket schema's
+      `pane_agent_status_changed` payload; nullable fields (`custom_status`,
+      `display_agent`, `title`, `state_labels`) are omitted when null. Bonus:
+      `HERDR_PLUGIN_CONTEXT_JSON` carries workspace/tab/focused-pane context,
+      and `HERDR_PANE_ID`/`HERDR_WORKSPACE_ID`/`HERDR_TAB_ID` are set to the
+      event's pane.
+- [x] Live-verify inject-into-claude-pane mid-turn — RESOLVED 2026-07-14:
+      `herdr pane run <pane> "<pointer line>"` into a working Claude Code pane
+      lands as a queued message ("Press up to edit queued messages"), then
+      auto-submits as a normal user turn when the current turn ends. No lost
+      input, no interleaving into the active turn.
+- [x] Live-verify codex double-Enter — RESOLVED 2026-07-14 (codex TUI,
+      gpt-5.6-sol): `pane run` submits reliably in one call — use it. The
+      double-Enter lore is real but specific to the split path: `agent send`
+      followed *immediately* by `send-keys Enter` gets the Enter swallowed
+      (paste-detection debounce) and the text sits in the composer; a second
+      Enter submits. `agent send` + ~1 s delay + Enter also works. Plugin rule:
+      always `pane run`, never send-text/send-keys pairs; keep
+      `herdr agent wait --status working` as the submission check anyway
+      (ADR-0006).
 
 ## 10. Definition of done (v1)
 

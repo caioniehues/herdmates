@@ -34,10 +34,16 @@ stubs.
 ## Verified facts (don't re-derive)
 
 - Manifest event `on = "pane.agent_status_changed"` is valid — shipped plugins
-  `cobanov/herdr-ntfysh` and `horn553/herdr-ntfy` use it (spec §9 TODO #1
-  resolved). Payload-shape verification still pending.
-- Codex TUI often needs two Enters to submit injected text; verify submission
-  with `herdr agent wait --status working` (launcher table data, ADR-0006).
+  use it, and payload shape is live-verified (spec §9, all TODOs resolved
+  2026-07-14): `HERDR_PLUGIN_EVENT_JSON` =
+  `{"event":"pane_agent_status_changed","data":{type,pane_id,workspace_id,agent_status,agent}}` —
+  dot form in `HERDR_PLUGIN_EVENT`, underscore form inside the JSON.
+- Codex injection: `pane run` submits in one call — always use it. Double-Enter
+  is only needed when `agent send` is followed immediately by `send-keys Enter`
+  (paste-debounce swallows it). Keep `herdr agent wait --status working` as the
+  submission check (ADR-0006).
+- Mid-turn `pane run` into a working Claude Code pane queues as a user message
+  and auto-submits when the turn ends (pointer injection is safe mid-turn).
 - Herdr agent status enum: idle/working/blocked/done/unknown.
 
 ## Environment note

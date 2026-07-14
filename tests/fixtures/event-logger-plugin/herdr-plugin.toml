@@ -1,0 +1,10 @@
+id = "herdr-agent-team.event-logger"
+name = "Event Logger (test fixture)"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Test fixture: logs HERDR_PLUGIN_EVENT* env for spec §9 payload verification. Link with `herdr plugin link`, never install."
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "log-event.sh"]
