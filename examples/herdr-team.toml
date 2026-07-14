@@ -1,0 +1,27 @@
+# Example team spec — see docs/spec.md §2 for the full format.
+# A 2-worker heterogeneous team on a Rust repo: claude builder in an isolated
+# worktree, codex reviewer on the shared tree. Star topology: both report to
+# the god only.
+
+name = "example-team"
+topology = "star"
+cwd = "."
+setup = ["./scripts/worktree-setup.sh"]
+
+[god]
+target = "self"
+
+[[workers]]
+name = "builder-1"
+agent = "claude"
+role = "builder"
+worktree = true
+branch = "feat/example-builder-1"
+brief = "briefs/builder-1.md"
+
+[[workers]]
+name = "reviewer-1"
+agent = "codex"
+role = "reviewer"
+worktree = false
+brief = "briefs/reviewer-1.md"

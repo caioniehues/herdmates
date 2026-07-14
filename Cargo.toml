@@ -1,0 +1,11 @@
+[package]
+name = "herdr-agent-team"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Herdr plugin: heterogeneous coding-agent teams under a coordinating god session"
+repository = "https://github.com/caioniehues/herdr-agent-team"
+
+# Dependencies added as implementation lands (serde/toml for specs, likely no
+# more than that — the herdr CLI via HERDR_BIN_PATH is the whole API surface).
+[dependencies]

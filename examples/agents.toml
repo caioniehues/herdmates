@@ -1,0 +1,14 @@
+# Example launcher table — installed to $HERDR_PLUGIN_CONFIG_DIR/agents.toml.
+# See docs/spec.md §3 and ADR-0006. Add your agent as a new table — no code.
+
+[claude]
+command = ["claude"]
+submit = ["Enter"]
+submit_verify = true
+reads_agents_md = "pointer"   # needs a pointer line in the launch prompt
+
+[codex]
+command = ["codex"]
+submit = ["Enter", "Enter"]   # codex TUI often needs two Enters to submit
+submit_verify = true
+reads_agents_md = "native"    # codex reads AGENTS.md from cwd natively

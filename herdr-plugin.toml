@@ -1,0 +1,35 @@
+id = "caioniehues.agent-team"
+name = "Agent Team"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Spawn and run heterogeneous coding-agent teams (Claude, Codex, ...) under a coordinating god session, with push-based status reporting"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+[[actions]]
+id = "spawn"
+title = "Spawn agent team"
+contexts = ["workspace"]
+command = ["target/release/herdr-agent-team", "spawn"]
+
+[[actions]]
+id = "status"
+title = "Team status"
+contexts = ["workspace"]
+command = ["target/release/herdr-agent-team", "status"]
+
+[[actions]]
+id = "kill"
+title = "Kill team"
+contexts = ["workspace"]
+command = ["target/release/herdr-agent-team", "kill"]
+
+# Report flow: worker status flips -> inbox append + pointer injection into the
+# god pane (ADR-0002). Socket event is `pane.agent_status_changed`; the manifest
+# `on =` vocabulary for it is a build-time verification TODO (spec §9) — the
+# docs' example vocabulary shows names like `worktree.created`.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["target/release/herdr-agent-team", "on-agent-status"]
