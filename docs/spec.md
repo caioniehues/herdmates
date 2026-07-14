@@ -43,7 +43,7 @@ target = "self"              # "self" | explicit herdr agent name / pane id
 [[workers]]
 name = "builder-1"
 agent = "claude"             # key into the launcher table
-role = "builder"             # free text, goes into AGENTS.md + brief
+role = "builder"             # free text, recorded in the worker protocol
 worktree = true              # default: true for role=builder, false otherwise
 branch = "feat/wave3-builder-1"   # worktree branch (required when worktree=true)
 brief = "briefs/builder-1.md"     # path to brief file, injected at launch
@@ -67,16 +67,32 @@ Lives in `$HERDR_PLUGIN_CONFIG_DIR/agents.toml`. Ships with tested entries for
 ```toml
 [claude]
 command = ["claude"]                 # argv, launched via herdr pane run
-submit = ["Enter"]                   # keys to submit injected text
 submit_verify = true                 # verify via `herdr agent wait --status working`
 reads_agents_md = "pointer"          # needs a pointer line in the launch prompt
+queues_midturn = true                # mid-turn pane run queues cleanly (live-verified)
 
 [codex]
 command = ["codex"]
-submit = ["Enter", "Enter"]          # codex TUI often needs two Enters
 submit_verify = true
 reads_agents_md = "native"           # codex reads AGENTS.md from cwd natively
+queues_midturn = false               # unverified — deliver only when idle/done (§11)
 ```
+
+`reads_agents_md` describes how the agent consumes the repository's authored
+`AGENTS.md`; it does not control the generated worker protocol. Every worker
+receives an explicit absolute-path pointer to its own protocol.
+
+`queues_midturn` records whether a mid-turn `pane run` into this agent's TUI
+queues safely as a pending user message (verified for claude, spec §9).
+`false`/absent means the `msg` verb (§11) must not deliver while the target is
+`working` — it enqueues to the outbox instead. Conservative default: `false`.
+
+Submission keys are not configurable. `herdr pane run` injects and submits the
+pane-targeted prompt in one operation for every launcher.
+When `submit_verify = true`, the plugin waits for agent status `working`; if
+that verification times out, it performs one empty `pane run` to submit the
+existing composer without duplicating the prompt, then verifies again. The
+plugin never uses split send-text/send-keys submission.
 
 ## 4. `team spawn` behavior
 
@@ -85,25 +101,30 @@ Given a spec (file or shorthand):
 1. **Preflight**: validate spec; check each worker's agent CLI exists on PATH;
    check `herdr` reachable (`HERDR_BIN_PATH`).
 2. **Run dir**: create `$HERDR_PLUGIN_STATE_DIR/runs/<team>-<timestamp>/` with
-   `run.toml` (resolved spec + live state) and `inbox/`.
-3. Per worker:
-   a. If `worktree = true`: `herdr worktree create` (branch from spec), then run
-      the team `setup` command inside it.
-   b. `herdr workspace create --cwd <dir> --label <worker-name>`.
-   c. Launch agent CLI via `herdr pane run` in that workspace. **cwd is set at
+   `run.toml` (resolved spec + live state), `protocols/`, and `inbox/`.
+3. **Workspace allocation**: prepare every worker's cwd, create every Herdr
+   workspace, and record all returned workspace/pane IDs in `run.toml`. No agent
+   CLI launches until allocation completes for the whole team.
+   - If `worktree = true`: `herdr worktree create` (branch from spec), then run
+     the team `setup` command inside it.
+   - `herdr workspace create --cwd <dir> --label <worker-name>`.
+4. **Worker protocols**: after all workspace IDs are allocated, but before any
+   agent launch, create exactly one immutable generated file per worker at
+   `<run>/protocols/<worker>.md`:
+   - **star**: identity, report protocol (write to
+     `<run>/inbox/<worker>.md`, then print the completion sentinel), and how to
+     reach the god.
+   - **mesh**: all star content plus the peer table and message envelope.
+   Repository-authored `AGENTS.md` files remain untouched and in effect.
+5. Per worker:
+   a. Launch agent CLI via `herdr pane run` in that workspace. **cwd is set at
       pane creation, never via a `cd` in the prompt.**
-   d. Inject launch prompt: one line — read your brief at `<abs path>`, read
-      `AGENTS.md` (pointer form for agents that need it), then submit per the
-      launcher table (`submit` keys, verified with
-      `herdr agent wait --status working`).
-4. **Generate `AGENTS.md`** in the team cwd (and each worktree):
-   - **star**: identity block (who you are, your role), report protocol (write
-     report file to `<run>/inbox/<worker>.md`, then print the completion
-     sentinel), how the god reaches you.
-   - **mesh**: all of the above plus the peer table (name → workspace → how to
-     message: `herdr agent send <name> "<agent-msg>…"`) and the message envelope
-     format.
-5. Record every worker's herdr agent id/name in `run.toml`.
+   b. Inject one launch-prompt line containing the absolute brief path and that
+      worker's absolute protocol path, and submit it with one `herdr pane run`.
+      When `submit_verify = true`, verify with
+      `herdr agent wait --status working`; on timeout, retry once with an empty
+      `pane run` and verify again.
+6. Record every worker's herdr agent id/name in `run.toml`.
 
 ## 5. Report flow (push, not poll)
 
@@ -138,10 +159,17 @@ Given a spec (file or shorthand):
 ## 8. Out of scope for v1 (roadmap)
 
 - Dashboard pane (ratatui, overlay placement).
-- `team restart` / reassign work.
+- `team restart` / reassign work — herdr tracks `agent_session_id` /
+  `agent_session_path` per pane (`pane report-agent` flags), so restart can be
+  real reattachment (`claude --resume <session_id>` via a launcher-table
+  `resume_command`), not respawn.
 - Run history browsing.
 - opencode/gemini tested launchers (config entries welcome, untested).
 - limux backend (extract shared generator crate only when that becomes real).
+- Shared task-board files under the run dir (native-teammate TaskList parity:
+  claimable tickets + blocked-by edges), if dogfooding demands it.
+- Worker progress pings via `pane report-metadata --custom-status` (pending
+  the §9 coexistence verification).
 
 ## 9. Build-time verification TODOs
 
@@ -172,20 +200,81 @@ Given a spec (file or shorthand):
       lands as a queued message ("Press up to edit queued messages"), then
       auto-submits as a normal user turn when the current turn ends. No lost
       input, no interleaving into the active turn.
-- [x] Live-verify codex double-Enter — RESOLVED 2026-07-14 (codex TUI,
-      gpt-5.6-sol): `pane run` submits reliably in one call — use it. The
-      double-Enter lore is real but specific to the split path: `agent send`
-      followed *immediately* by `send-keys Enter` gets the Enter swallowed
-      (paste-detection debounce) and the text sits in the composer; a second
-      Enter submits. `agent send` + ~1 s delay + Enter also works. Plugin rule:
-      always `pane run`, never send-text/send-keys pairs; keep
-      `herdr agent wait --status working` as the submission check anyway
-      (ADR-0006).
+- [x] Live-verify Codex submission — RESOLVED 2026-07-14 (codex TUI,
+      gpt-5.6-sol): one `pane run` submits reliably. The plugin never uses split
+      send-text/send-keys submission. Keep
+      `herdr agent wait --status working` as the submission check; on timeout,
+      issue one empty `pane run` and verify again (ADR-0006).
+- [ ] Live-verify codex **mid-turn** `pane run`: does input queue like Claude
+      Code's pending-message behavior, or interrupt/corrupt the active turn?
+      Third-party warning (aashishd/herdr-agent-messenger PROTOCOL.md): only
+      Claude Code is known to queue. Until verified, the codex launcher entry
+      ships `queues_midturn = false` and `msg` delivery to a working codex
+      pane goes via the outbox (§11, ADR-0008).
+- [ ] Live-verify `pane report-metadata --custom-status` from a worker pane:
+      does a plugin-sourced `--source` coexist with the claude/codex
+      integration's own agent reporting, or fight it? If clean, workers can
+      surface progress pings ("cluster 3/7") in herdr chrome and `team
+      status` (roadmap §8, not v1).
 
 ## 10. Definition of done (v1)
 
 Spawn a real 2-worker team (claude builder in a worktree + codex reviewer,
 star topology) on the limux repo; both receive briefs and start; a completed
 worker's status flip lands a pointer line in the god pane within seconds; the
-report file exists at the pointer path; `team kill` tears down cleanly and
-preserves the dirty worktree.
+report file exists at the pointer path; a `msg` round-trip works (god →
+worker, worker → god reply, both submitted — not sitting in a composer);
+`team kill` tears down cleanly and preserves the dirty worktree.
+
+## 11. Worker messaging — `msg` verb + outbox (added 2026-07-15, ADR-0008)
+
+Background: the original generated protocols briefed workers to reply via
+`herdr agent send`, which writes literal text **without submitting** (herdr
+help; ADR-0006 verification). Defect found 2026-07-15 — as briefed, worker
+replies and mesh messages never submit. Fix: workers are never briefed on raw
+herdr primitives; they get one plugin verb.
+
+### `msg` subcommand
+
+```
+herdr-agent-team msg <target> <text> [--run <run-dir>]
+```
+
+- `<target>`: `god` or a worker name from the active run. Resolution: name →
+  pane id via `run.toml`. Ambiguity or unknown name = hard error listing
+  candidates (never guess — marketplace pattern #2).
+- Delivery: one `herdr pane run <pane_id> <text>`; submission verified per
+  launcher policy (`herdr agent wait --status working`, one empty `pane run`
+  retry on timeout — ADR-0006 discipline).
+- Readiness gate: if the target's launcher entry has `queues_midturn = true`,
+  deliver immediately regardless of status. Otherwise deliver immediately only
+  when the target's agent status is `idle`/`done`/`unknown`; if `working`,
+  write the message to the outbox and return 0 immediately (sender never
+  blocks — deliberately unlike herdr-agent-messenger's 3 s × 300 s
+  sender-side poll).
+- Text is treated as opaque payload; the mesh `<agent-msg>` envelope
+  (ADR-0003) travels inside it. Long/durable content goes in a file and the
+  message carries the pointer — same rule as everywhere else.
+
+### Outbox + hook drain
+
+- Queue location: `<run>/outbox/<target>/<seq>.msg` (zero-padded sequence,
+  content = exact text to deliver).
+- The `pane.agent_status_changed` hook (§5), on any team member flipping to
+  `idle` or `done`, drains that member's outbox in sequence order: deliver via
+  `pane run`, verify, delete the file, append a `delivered` entry to
+  `inbox/events.jsonl`. Drain happens before report-pointer injection logic.
+- Failed delivery leaves the file in place (retried on the next flip) and
+  logs a `delivery_failed` event.
+- No daemon; the hook is the only drain trigger. Worst case latency = time to
+  the target's next status flip, which is exactly when it can read the
+  message anyway.
+
+### Protocol briefing
+
+Generated worker protocols (star and mesh) reference only:
+
+- `herdr-agent-team msg god "<text>"` — reply / escalate.
+- mesh: `herdr-agent-team msg <peer> "<agent-msg>…</agent-msg>"`.
+
+The peer table lists names only; pane ids stay in `run.toml`.

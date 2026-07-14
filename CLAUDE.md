@@ -9,10 +9,11 @@ stubs.
 1. `HANDOFF.md` — current state + exact NEXT steps.
 2. `docs/spec.md` — buildable v1 spec. §9 = open verification TODOs, §10 =
    definition of done.
-3. `docs/adr/0001–0007` — locked decisions with the why. Don't relitigate
+3. `docs/adr/0001–0008` — locked decisions with the why. Don't relitigate
    silently; new evidence → new ADR, ask Caio first.
 4. `CONTEXT.md` — vocabulary. Use these words exactly (god, worker, star/mesh,
-   pointer injection, run-board, launcher table, status flip).
+   pointer injection, run-board, launcher table, status flip, msg verb,
+   outbox, queues mid-turn).
 
 ## Hard rules
 
@@ -42,6 +43,10 @@ stubs.
   is only needed when `agent send` is followed immediately by `send-keys Enter`
   (paste-debounce swallows it). Keep `herdr agent wait --status working` as the
   submission check (ADR-0006).
+- `herdr agent send` writes literal text WITHOUT submitting — never brief it
+  as a messaging channel. Workers message only via the plugin `msg` verb
+  (ADR-0008, spec §11); mid-turn queueing is per-agent (`queues_midturn`:
+  claude verified true, codex unverified → false).
 - Mid-turn `pane run` into a working Claude Code pane queues as a user message
   and auto-submits when the turn ends (pointer injection is safe mid-turn).
 - Herdr agent status enum: idle/working/blocked/done/unknown.

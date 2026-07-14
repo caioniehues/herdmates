@@ -10,9 +10,9 @@ injection loop is the actual innovation and is demoable without a dashboard.
 
 ## Decision
 
-v1 ships: `team spawn` (spec + shorthand), AGENTS.md generation, status-event
-hook → inbox + god-pane pointer injection, worktrees + setup command, durable
-run-state file, `team status`, `team kill`.
+v1 ships: `team spawn` (spec + shorthand), immutable run-local per-worker
+protocol generation, status-event hook → inbox + god-pane pointer injection,
+worktrees + setup command, durable run-state file, `team status`, `team kill`.
 
 Deferred to v1.1+: ratatui dashboard pane (overlay), `team restart`/reassign,
 run-history browsing, additional tested agents.

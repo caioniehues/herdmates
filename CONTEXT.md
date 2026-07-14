@@ -17,17 +17,30 @@ drift here first.
 - **Report** — a worker's durable output file at `<run>/inbox/<worker>.md`.
   Written by the worker before it goes idle/done.
 - **Pointer injection** — the delivery mechanism: one line typed into a pane
-  naming a file path. Payload stays on disk; context stays lean.
+  naming durable file paths. Payload stays on disk; context stays lean.
 - **Inbox** — the run dir's `inbox/` directory: report files + `events.jsonl`.
-- **Run-board** — the durable record of a team run (`run.toml` + inbox): who
-  was spawned, where, current lifecycle state.
+- **Run-board** — the durable record of a team run (`run.toml` + worker
+  protocols + inbox): who was spawned, where, current lifecycle state.
 - **Launcher table** — data-driven config mapping agent kind → launch argv,
-  submit keys, AGENTS.md capability. Adding an agent = adding a table entry.
+  submission-verification policy, repository-authored AGENTS.md capability,
+  and mid-turn queueability (`queues_midturn`). Adding an agent = adding a
+  table entry.
+- **Msg verb** — the plugin subcommand (`herdr-agent-team msg <target>
+  <text>`) that is the only messaging channel workers are ever briefed on.
+  Resolves name → pane, delivers via `pane run`, verifies submission,
+  readiness-gates per launcher policy (ADR-0008).
+- **Outbox** — `<run>/outbox/<target>/` queue of pending messages for a
+  target that can't safely receive mid-turn; drained in order by the status
+  hook when the target flips idle/done. Counterpart of the inbox.
+- **Queues mid-turn** — launcher-table property: whether a mid-turn `pane
+  run` into that agent's TUI queues as a pending user message (claude:
+  verified true) or risks interrupting the turn (codex: unverified, treated
+  false).
 - **Setup command** — team-spec command run inside each fresh worktree before
   the worker launches (project preflight: symlinks, deps, skip-worktree).
-- **AGENTS.md (generated)** — the communication protocol file the plugin writes
-  into the team cwd/worktrees: identity, report protocol, and (mesh only) the
-  peer table + message envelope. Distinct from any repo's own authored
-  AGENTS.md.
+- **Worker protocol** — one immutable generated file per worker at
+  `<run>/protocols/<worker>.md`: identity, report protocol, and (mesh only) the
+  peer table + message envelope. It is passed by absolute-path pointer and is
+  distinct from the repository's authored `AGENTS.md`, which remains untouched.
 - **Status flip** — a Herdr agent-status transition (idle/working/blocked/
   done/unknown). Flips to `blocked`/`done` trigger the report flow.

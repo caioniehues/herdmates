@@ -29,7 +29,7 @@ When your output names a domain concept (in an issue title, a refactor proposal,
 
 If the concept you need isn't in the glossary yet, that's a signal — either you're inventing language the project doesn't use (reconsider) or there's a real gap (note it for `/domain-modeling`).
 
-In this repo glossary drift becomes **protocol drift**: the generated worker AGENTS.md reuses CONTEXT.md's terms (god, worker, report, pointer injection), so a renamed concept changes what worker agents are told.
+In this repo glossary drift becomes **protocol drift**: the generated worker protocol (`<run>/protocols/<worker>.md`) reuses CONTEXT.md's terms (god, worker, report, pointer injection), so a renamed concept changes what worker agents are told.
 
 ## Flag ADR conflicts
 

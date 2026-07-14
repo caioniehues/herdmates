@@ -1,8 +1,7 @@
 # HANDOFF — next session orientation
 
-Scaffold committed 2026-07-14 (design locked same day via grilling interview in
-the limux repo). You are picking up a **pre-v1 scaffold**: docs are the
-contract, binary is stubs.
+Design locked 2026-07-14 via grilling interview in the limux repo. The scaffold
+and core wave are committed; docs remain the contract.
 
 ## Read first
 
@@ -14,8 +13,12 @@ contract, binary is stubs.
 
 ## State
 
-- `cargo build --release` compiles; every subcommand is an explicit todo
-  pointing at its spec section.
+- Wave 0 scaffold: `0d75e23`.
+- Wave 1 core modules (tickets 02-06): `a6e0ff9` — spec parsing/dry-run,
+  launcher table, generated worker protocols, typed Herdr client, and durable run
+  board. Central gate green: build, fmt, Clippy `-D warnings`, 32 tests.
+- `spawn --dry-run` is demoable. Real spawn, event hook, status, and kill are
+  still ticket stubs awaiting wave 2.
 - Local git only — **NOT on GitHub yet.** Publishing = create public repo
   `caioniehues/herdr-agent-team` + topic `herdr-plugin` (marketplace auto-lists
   in ~30 min). Ask Caio before pushing.
@@ -37,11 +40,22 @@ contract, binary is stubs.
    - Codex: `pane run` submits in one call; double-Enter only needed for
      `agent send` + immediate `send-keys Enter` (debounce). Rule: always
      `pane run`.
-2. Implement `spawn` happy path (spec §4) against a throwaway 2-worker spec.
-3. Event hook `on-agent-status` (spec §5).
-4. `status` / `kill` (spec §6).
-5. Live DoD run on the limux repo (spec §10), then talk to Caio about
-   publishing.
+2. Run wave 2 in parallel: ticket 07 spawn happy path, ticket 08 event hook,
+   ticket 09 status/kill. Serialize `src/main.rs` ownership: 07 edits it first;
+   08/09 report wiring patches if their edits would conflict.
+3. Run ticket 10 worktree-worker support after 07 lands.
+4. **Messaging wave (tickets 12–15, added 2026-07-15 — ADR-0008, spec §11):**
+   fix the live protocol defect (generated protocols brief `herdr agent
+   send`, which types but never submits) via the `msg` verb +
+   `queues_midturn` launcher field + outbox drained by the status hook.
+   Order: 12 → 13 → 14; 15 after 08+13. Ticket 14 now blocks the DoD
+   (spec §10 gained a `msg` round-trip check). Background research:
+   `docs/research/native-teammate-parity-2026-07-15.md` +
+   `docs/research/herdr-agent-messenger-2026-07-15.md`.
+5. Run ticket 11 manifest actions and the live limux DoD from the god session
+   with Caio watching.
+6. Only then talk to Caio about publishing; never push or add the
+   `herdr-plugin` topic without explicit approval.
 
 ## Context that doesn't fit the docs
 

@@ -33,11 +33,21 @@ This file is the re-ranked, load-bearing distillation.
   reimplementing status reads. (Distinct from `jwarykowski/shepherd`, same
   name.)
 - `aashishd/herdr-agent-messenger` — inter-agent messaging; overlaps mesh
-  topology. Young. We differentiate on protocol *generation* (AGENTS.md) +
-  heterogeneous spawn + run-board.
+  topology. Young. We differentiate on protocol *generation* (per-worker protocol files) +
+  heterogeneous spawn + run-board. **Deep-dived 2026-07-15** (full report:
+  [research/herdr-agent-messenger-2026-07-15.md](research/herdr-agent-messenger-2026-07-15.md)):
+  no daemon/MCP — TSV call-sign registry + `pane run` as sole delivery
+  primitive + sender-side readiness poll (3 s interval, 300 s cap, blocks the
+  sender). Stole: readiness-gating idea (ours moves to the hook-drained
+  outbox, ADR-0008), ambiguity-refusal addressing, SKILL-taught single `msg`
+  verb instead of raw primitives, `pane split --env` for state passing.
+  Their gaps our design already covers: single-line messages only, no
+  delivery ACK, no broadcast, call-signs die with panes. Independent
+  confirmation of two of our verified facts: `pane run` is the only submit,
+  and only Claude Code is known to queue mid-turn input.
 - `carsonjones/herdr-agent-dashboard` — precedent to study before building our
   v1.1 dashboard pane.
-- Niche check (2026-07-14): nobody does spawn-team + generated AGENTS.md +
+- Niche check (2026-07-14): nobody does spawn-team + generated worker protocols +
   heterogeneous roster.
 
 ## Curated install list for Caio's machine (context: CachyOS/KDE, god-agent workflow)

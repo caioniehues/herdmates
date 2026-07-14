@@ -13,7 +13,9 @@ of polling.
 - **`team spawn`** — reads a `herdr-team.toml` spec (or `--agents claude,codex`
   shorthand), creates one Herdr workspace per worker, launches each agent CLI in
   its pane (per-worker git worktree optional, with a project `setup` command),
-  and generates an `AGENTS.md` communication protocol in the shared cwd.
+  and creates one immutable worker protocol at
+  `<run>/protocols/<worker>.md`. Repository-authored `AGENTS.md` files remain
+  untouched.
 - **Push reporting** — a manifest event hook fires on agent status transitions
   (`idle/working/blocked/done`); the plugin writes a report pointer into the
   team's inbox directory and injects a one-line wake-up into the god session's
@@ -28,7 +30,7 @@ of polling.
 
 Nothing on the Herdr marketplace orchestrates *heterogeneous* agent teams. The
 two existing orchestration plugins are Pi-only. This plugin ports the
-`agent-team` concept (peer-protocol `AGENTS.md` generation) from the
+`agent-team` concept (generated peer communication protocols) from the
 [limux](https://github.com/caioniehues/limux) project onto Herdr's superior
 control plane (agent status machine, blocking waits, native worktrees).
 
@@ -37,8 +39,13 @@ control plane (agent status machine, blocking waits, native worktrees).
 | Agent | Status |
 |---|---|
 | Claude Code (`claude`) | first-class, live-tested |
-| Codex (`codex`) | first-class, live-tested (incl. the double-Enter submit quirk) |
+| Codex (`codex`) | first-class, live-tested with pane-run-only submission |
 | others | add via the data-driven launcher table in plugin config — no code changes |
+
+Every launch prompt is injected and submitted with one `herdr pane run` call.
+For launchers with `submit_verify = true`, the plugin waits for status
+`working`; if that times out, it performs one empty `pane run` to submit the
+existing composer without duplicating the prompt, then verifies again.
 
 ## Install (once released)
 
