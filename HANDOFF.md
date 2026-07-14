@@ -40,9 +40,11 @@ contract, binary is stubs.
 
 ## Context that doesn't fit the docs
 
-- A survey of all 175 marketplace plugins ran on 2026-07-14 (workflow in the
-  limux Claude session) — its report should list overlap plugins and patterns
-  to steal; check with Caio if not already applied here.
+- Marketplace survey (175 plugins, 2026-07-14) is applied: curated conclusions
+  in `docs/marketplace-notes.md` (patterns to steal with source pointers,
+  competitive watch, Caio's install list); raw verdicts in
+  `docs/marketplace-survey-2026-07-14.json`. Spec §9 TODO #1 (event name) is
+  resolved from it.
 - Caio plans to run coordinator (god) sessions inside herdr from now on —
   which this plugin's ADR-0002 report path requires anyway.
 - Herdr is closed-source. Compatibility contract: snapshot `herdr api schema
