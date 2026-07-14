@@ -145,9 +145,11 @@ Given a spec (file or shorthand):
 
 ## 9. Build-time verification TODOs
 
-- [ ] Confirm the manifest `[[events]] on =` vocabulary for agent status
-      transitions (docs show `worktree.created`; socket schema shows
-      `pane.agent_status_changed`).
+- [x] Confirm the manifest `[[events]] on =` vocabulary for agent status
+      transitions — RESOLVED 2026-07-14 by marketplace survey: shipped plugins
+      `cobanov/herdr-ntfysh` and `horn553/herdr-ntfy` both hook
+      `on = "pane.agent_status_changed"` in their manifests. Steal their
+      payload handling as reference when implementing.
 - [ ] Confirm `HERDR_PLUGIN_EVENT_JSON` payload shape for that event
       (`herdr api schema` + live test).
 - [ ] Live-verify inject-into-claude-pane lands as a queued user message
