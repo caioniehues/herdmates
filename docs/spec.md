@@ -476,6 +476,34 @@ herdr-agent-team msg <target> <text> [--attention] [--ack] [--run <run-dir>]
   once for that worker. This is the explicit attention channel; agent status
   values remain Herdr's fixed enum.
 
+### Message lifecycle — Queued / Submitted / Acknowledged (adopted 2026-07-15, Stage 3)
+
+Product vocabulary for one message's states:
+
+- **Queued** — written to the outbox (`MessageOutcome::Enqueued`), awaiting
+  the hook drain.
+- **Submitted** — typed into the target pane's input via `pane run` with
+  submission verified per launcher policy. **Decided: the code and audit
+  words stay `delivered`** (`MessageOutcome::Delivered`; the `delivered`
+  event in `inbox/events.jsonl`) so the durable event stream remains
+  compatible with existing runs — read **Delivered = Submitted**. It is
+  submission semantics only: no claim the agent read or processed the text.
+- **Acknowledged** — the target demonstrably read/acted on the message.
+  Today this is only human-observable; no durable per-message ack exists.
+  (`msg --ack` clears *attention*, not a message — see below.)
+
+**Non-guarantee (#60, decided 2026-07-15): submission is asynchronous to
+worker progress.** Stage 0 run 2 showed a god's "immediate" message landing
+after a fast worker had already finalized its first report (the worker then
+updated the report). This is accepted semantics: submission ordering is not
+synchronized with what the worker has done or is doing. A god that needs
+read-before-work sequencing must wait for Acknowledged — a future concern,
+since acknowledgment is currently only human-observable.
+
+Report readiness uses the separate **Result ready / completion sentinel**
+vocabulary (§13): a report is ready only when its final non-empty line is
+`HERDR_TEAM_WORKER_COMPLETE`.
+
 ### Attention lifecycle (raise / observe / clear — decided 2026-07-15)
 
 Attention has an **owned lifecycle** in durable run state
@@ -500,11 +528,16 @@ effect of unrelated activity.
 - Queue location: `<run>/outbox/<target>/<seq>.msg` (zero-padded sequence,
   content = exact text to deliver).
 - The `pane.agent_status_changed` hook (§5), on any team member flipping to
-  `idle` or `done`, drains that member's outbox in sequence order: deliver via
-  `pane run`, verify, delete the file, append a `delivered` entry to
-  `inbox/events.jsonl`. Drain happens before report-pointer injection logic.
-- Failed delivery leaves the file in place (retried on the next flip) and
-  logs a `delivery_failed` event.
+  `idle` or `done`, drains that member's outbox in sequence order: atomically
+  claim the entry (rename `<seq>.msg` → `<seq>.claim`), deliver via `pane
+  run`, verify, remove the claimed file, append a `delivered` entry (=
+  **Submitted**, per the lifecycle above) to `inbox/events.jsonl`. Drain
+  happens before report-pointer injection logic.
+- Concurrent duplicate drains are resolved by the atomic claim (defect #59):
+  the rename winner owns delivery; a loser's ENOENT means already-claimed and
+  is skipped silently — never recorded as a failure.
+- Failed delivery requeues the claimed file (renamed back to `.msg`, retried
+  on the next flip) and logs a `delivery_failed` event.
 - No daemon; the hook is the only drain trigger. Worst case latency = time to
   the target's next status flip, which is exactly when it can read the
   message anyway.

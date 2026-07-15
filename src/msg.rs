@@ -112,6 +112,7 @@ enum DeliveryDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MessageOutcome {
+    /// Submitted to the target pane's input (audit word `delivered`, spec §11); not agent-acknowledged.
     Delivered,
     Enqueued(PathBuf),
 }

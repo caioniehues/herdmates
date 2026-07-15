@@ -341,6 +341,7 @@ where
                 break;
             }
         }
+        // `delivered` = Submitted (spec §11 message lifecycle); not agent-acknowledged.
         append_delivery_event(run_dir, "delivered", target, &path, None)?;
     }
     Ok(())

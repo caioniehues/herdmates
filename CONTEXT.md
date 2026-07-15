@@ -35,6 +35,19 @@ drift here first.
   <text>`) that is the only messaging channel workers are ever briefed on.
   Resolves name → pane, delivers via `pane run`, verifies submission,
   readiness-gates per launcher policy (ADR-0008).
+- **Message lifecycle** — **Queued / Submitted / Acknowledged**. **Queued**:
+  the message sits in the outbox awaiting drain (`MessageOutcome::Enqueued`).
+  **Submitted**: the text was typed into the target pane's input and
+  submission was verified per launcher policy — this is what the code and the
+  durable audit event call `delivered` (**Delivered → Submitted**; the word
+  is kept in `MessageOutcome::Delivered` and `events.jsonl` for compatibility
+  with existing runs). **Acknowledged**: the target demonstrably read/acted
+  on the message — today only human-observable; there is no durable ack
+  event. (`msg --ack` acknowledges *attention*, not a specific message — see
+  Attention lifecycle.) Non-guarantee (#60): submission is asynchronous to
+  worker progress — a Submitted message may land after a fast worker already
+  finalized its Report; read-before-work sequencing requires waiting for
+  Acknowledged (future concern).
 - **Outbox** — `<run>/outbox/<target>/` queue of pending messages for a
   target that can't safely receive mid-turn; drained in order by the status
   hook when the target flips idle/done. Counterpart of the inbox.
