@@ -1,7 +1,7 @@
 //! Team status and teardown commands from `docs/spec.md` sections 6 and 12.
 
 use crate::herdr::{AgentInfo, HerdrClient, HerdrError};
-use crate::run::{load_run, mark_ended, save_run, RunBoard, RunError};
+use crate::run::{load_run, mark_ended, RunBoard, RunError};
 use crate::types::{RunLifecycle, WorkerLifecycle};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,9 +55,6 @@ pub enum StatusKillError {
 
     #[error("refusing to remove dirty worktree(s): {paths:?}")]
     DirtyWorktrees { paths: Vec<PathBuf> },
-
-    #[error("adopted worker '{worker}' has no recorded pane id")]
-    MissingAdoptedPane { worker: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -318,13 +315,13 @@ fn kill_run_with_backend(
 ) -> Result<(), StatusKillError> {
     let mut run = load_run(run_dir)?;
     if run.state.lifecycle == RunLifecycle::Ended {
-        if end_non_failed_owned_workers(&mut run) {
+        if end_worker_lifecycles(&mut run) {
             mark_ended(&mut run)?;
         }
         return Ok(());
     }
 
-    release_adopted_workers(&mut run, backend)?;
+    release_adopted_workers(&mut run, backend);
 
     let workspace_ids = run
         .state
@@ -334,7 +331,9 @@ fn kill_run_with_backend(
         .filter_map(|worker| worker.workspace_id.as_deref())
         .collect::<BTreeSet<_>>();
     for workspace_id in workspace_ids {
-        backend.workspace_close(workspace_id)?;
+        if let Err(error) = backend.workspace_close(workspace_id) {
+            log_teardown_note("workspace", workspace_id, &error);
+        }
     }
 
     let mut dirty_paths = Vec::new();
@@ -347,15 +346,21 @@ fn kill_run_with_backend(
             .filter_map(|worker| worker.worktree_path.as_deref())
             .collect::<BTreeSet<_>>();
         for path in worktree_paths {
-            if backend.worktree_is_dirty(path)? {
-                dirty_paths.push(path.to_path_buf());
-            } else {
-                backend.worktree_remove(path)?;
+            match backend.worktree_is_dirty(path) {
+                Ok(true) => dirty_paths.push(path.to_path_buf()),
+                Ok(false) => {
+                    if let Err(error) = backend.worktree_remove(path) {
+                        log_teardown_note("worktree", &path.display().to_string(), &error);
+                    }
+                }
+                Err(error) => {
+                    log_teardown_note("worktree", &path.display().to_string(), &error);
+                }
             }
         }
     }
 
-    end_non_failed_owned_workers(&mut run);
+    end_worker_lifecycles(&mut run);
     mark_ended(&mut run)?;
     if dirty_paths.is_empty() {
         Ok(())
@@ -364,54 +369,53 @@ fn kill_run_with_backend(
     }
 }
 
-fn release_adopted_workers(
-    run: &mut RunBoard,
-    backend: &impl TeardownBackend,
-) -> Result<(), StatusKillError> {
+fn release_adopted_workers(run: &mut RunBoard, backend: &impl TeardownBackend) {
     let pending = run
         .state
         .workers
         .iter()
         .filter(|(_, worker)| worker.adopted && worker.lifecycle != WorkerLifecycle::Released)
-        .map(|(name, worker)| {
-            let pane_id =
-                worker
-                    .pane_id
-                    .clone()
-                    .ok_or_else(|| StatusKillError::MissingAdoptedPane {
-                        worker: name.clone(),
-                    })?;
-            Ok((name.clone(), pane_id))
-        })
-        .collect::<Result<Vec<_>, StatusKillError>>()?;
+        .map(|(name, worker)| (name.clone(), worker.pane_id.clone()))
+        .collect::<Vec<_>>();
     let notice = release_notice(&run.state.spec.name);
 
     for (name, pane_id) in pending {
-        backend.pane_run(&pane_id, &notice)?;
+        match pane_id {
+            Some(pane_id) => {
+                if let Err(error) = backend.pane_run(&pane_id, &notice) {
+                    log_teardown_note("adopted pane", &pane_id, &error);
+                }
+            }
+            None => eprintln!(
+                "note: team kill found adopted worker '{name}' without a pane; releasing it"
+            ),
+        }
         run.state
             .workers
             .get_mut(&name)
             .expect("release candidates come from the same run state")
             .lifecycle = WorkerLifecycle::Released;
-        save_run(run)?;
     }
-    Ok(())
 }
 
 fn release_notice(team_name: &str) -> String {
     format!("team {team_name} ended; report protocol no longer applies")
 }
 
-fn end_non_failed_owned_workers(run: &mut RunBoard) -> bool {
+fn log_teardown_note(resource: &str, identifier: &str, error: &StatusKillError) {
+    eprintln!("note: team kill could not close {resource} '{identifier}' ({error}); continuing");
+}
+
+fn end_worker_lifecycles(run: &mut RunBoard) -> bool {
     let mut changed = false;
     for worker in run.state.workers.values_mut() {
-        if !worker.adopted
-            && !matches!(
-                worker.lifecycle,
-                WorkerLifecycle::Failed | WorkerLifecycle::Ended
-            )
-        {
-            worker.lifecycle = WorkerLifecycle::Ended;
+        let terminal = if worker.adopted {
+            WorkerLifecycle::Released
+        } else {
+            WorkerLifecycle::Ended
+        };
+        if worker.lifecycle != terminal {
+            worker.lifecycle = terminal;
             changed = true;
         }
     }
@@ -619,6 +623,8 @@ mod tests {
     #[derive(Default)]
     struct FakeTeardown {
         dirty: BTreeSet<PathBuf>,
+        unavailable_panes: BTreeSet<String>,
+        unavailable_workspaces: BTreeSet<String>,
         closed: RefCell<Vec<String>>,
         notices: RefCell<Vec<(String, String)>>,
         inspected: RefCell<Vec<PathBuf>>,
@@ -628,6 +634,9 @@ mod tests {
     impl TeardownBackend for FakeTeardown {
         fn workspace_close(&self, workspace_id: &str) -> Result<(), StatusKillError> {
             self.closed.borrow_mut().push(workspace_id.to_owned());
+            if self.unavailable_workspaces.contains(workspace_id) {
+                return Err(StatusKillError::Usage("workspace_not_found".to_owned()));
+            }
             Ok(())
         }
 
@@ -635,6 +644,9 @@ mod tests {
             self.notices
                 .borrow_mut()
                 .push((pane_id.to_owned(), input.to_owned()));
+            if self.unavailable_panes.contains(pane_id) {
+                return Err(StatusKillError::Usage("pane_not_found".to_owned()));
+            }
             Ok(())
         }
 
@@ -728,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_preserves_failed_workers_while_ending_every_other_lifecycle() {
+    fn kill_ends_failed_workers_with_every_other_owned_worker() {
         let temp = TempDir::new();
         let mut state = run_state(temp.path());
         state
@@ -749,7 +761,39 @@ mod tests {
         );
         assert_eq!(
             ended.state.workers["reviewer"].lifecycle,
-            WorkerLifecycle::Failed
+            WorkerLifecycle::Ended
+        );
+    }
+
+    #[test]
+    fn kill_with_a_closed_adopted_pane_releases_every_worker_and_ends_the_run() {
+        let temp = TempDir::new();
+        let mut state = run_state(temp.path());
+        let adopted = state.workers.get_mut("reviewer").expect("reviewer runtime");
+        adopted.adopted = true;
+        adopted.workspace_id = Some("workspace-borrowed".to_owned());
+        adopted.pane_id = Some("pane-closed".to_owned());
+        adopted.worktree_path = None;
+        let run = create_run(temp.path(), state).expect("create mixed-ownership run");
+        let backend = FakeTeardown {
+            unavailable_panes: BTreeSet::from(["pane-closed".to_owned()]),
+            unavailable_workspaces: BTreeSet::from(["workspace-builder".to_owned()]),
+            ..FakeTeardown::default()
+        };
+
+        kill_run_with_backend(&run.dir, false, &backend)
+            .expect("missing adopted resources must not abort kill");
+
+        assert_eq!(backend.closed.into_inner(), ["workspace-builder"]);
+        let ended = load_run(&run.dir).expect("load ended run");
+        assert_eq!(ended.state.lifecycle, RunLifecycle::Ended);
+        assert_eq!(
+            ended.state.workers["builder"].lifecycle,
+            WorkerLifecycle::Ended
+        );
+        assert_eq!(
+            ended.state.workers["reviewer"].lifecycle,
+            WorkerLifecycle::Released
         );
     }
 

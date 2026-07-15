@@ -46,6 +46,11 @@ pub enum AdoptError {
     #[error("multiple active team runs found; pass --run with one of: {candidates}")]
     AmbiguousRuns { candidates: String },
 
+    #[error(
+        "--team names a new ad-hoc team, but run {run_dir} is active; pass --run <dir> or kill it"
+    )]
+    TeamConflictsWithActiveRun { run_dir: PathBuf },
+
     #[error("cannot adopt into ended run `{run_dir}`")]
     InactiveRun { run_dir: PathBuf },
 
@@ -121,7 +126,12 @@ pub fn adopt_command(args: &[String]) -> Result<(), AdoptError> {
     let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR")
         .map(|path| absolutize(Path::new(&path), &current_dir))
         .ok_or(AdoptError::MissingEnvironment("HERDR_PLUGIN_STATE_DIR"))?;
-    let target = select_run_target(arguments.run_dir.as_deref(), &state_dir, &current_dir)?;
+    let target = select_run_target(
+        arguments.run_dir.as_deref(),
+        arguments.team.as_deref(),
+        &state_dir,
+        &current_dir,
+    )?;
     let god_pane_id = match &target {
         RunTarget::Existing(run) => run.state.god_pane_id.clone(),
         RunTarget::Bootstrap => env::var("HERDR_PANE_ID")
@@ -234,14 +244,27 @@ fn arguments(detail: impl AsRef<str>) -> AdoptError {
 
 fn select_run_target(
     explicit_run: Option<&Path>,
+    team: Option<&str>,
     state_dir: &Path,
     current_dir: &Path,
 ) -> Result<RunTarget, AdoptError> {
+    if explicit_run.is_some() && team.is_some() {
+        return Err(arguments("--team and --run cannot be used together"));
+    }
     if let Some(run_dir) = explicit_run {
         let run = load_run(&absolutize(run_dir, current_dir))?;
         return choose_run(Some(run), Vec::new());
     }
-    choose_run(None, list_active_runs(state_dir)?)
+    let active_runs = list_active_runs(state_dir)?;
+    if team.is_some() {
+        if let Some(run) = active_runs.first() {
+            return Err(AdoptError::TeamConflictsWithActiveRun {
+                run_dir: run.dir.clone(),
+            });
+        }
+        return Ok(RunTarget::Bootstrap);
+    }
+    choose_run(None, active_runs)
 }
 
 fn choose_run(
@@ -670,6 +693,46 @@ mod tests {
         assert!(error.contains(&first.dir.display().to_string()));
         assert!(error.contains(&second.dir.display().to_string()));
         assert!(error.contains("pass --run"));
+    }
+
+    #[test]
+    fn team_is_rejected_when_an_active_run_exists() {
+        let temp = TempDir::new();
+        let active = existing_run(temp.path(), Topology::Star);
+
+        let error = select_run_target(None, Some("scratch"), temp.path(), temp.path())
+            .expect_err("--team must not silently select an active run")
+            .to_string();
+
+        assert_eq!(
+            error,
+            format!(
+                "--team names a new ad-hoc team, but run {} is active; pass --run <dir> or kill it",
+                active.dir.display()
+            )
+        );
+    }
+
+    #[test]
+    fn team_and_explicit_run_are_contradictory() {
+        let temp = TempDir::new();
+        let run = existing_run(temp.path(), Topology::Star);
+
+        let error = select_run_target(Some(&run.dir), Some("scratch"), temp.path(), temp.path())
+            .expect_err("--team and --run must be refused")
+            .to_string();
+
+        assert!(error.contains("--team and --run cannot be used together"));
+    }
+
+    #[test]
+    fn team_bootstraps_when_no_run_is_active() {
+        let temp = TempDir::new();
+
+        let target = select_run_target(None, Some("scratch"), temp.path(), temp.path())
+            .expect("--team should bootstrap only without an active run");
+
+        assert!(matches!(target, RunTarget::Bootstrap));
     }
 
     #[test]
