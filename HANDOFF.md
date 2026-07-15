@@ -38,12 +38,13 @@ Invoke these Claude Code skills at the named moments — don't rediscover them:
 - **`/verify`** — before committing any coordinator-authored nontrivial
   change: drive the real flow (the post-release `plugin unlink`+`link` IS
   the release smoke test).
-- Workers: claude pane workers CAN be skill-driven (user-level
-  `~/.claude/skills` load in panes — live-verified 2026-07-15); codex
-  workers CANNOT (`Unrecognized command`, own slash surface — issue #34
-  tracks a codex-prompting reference skill). Default remains briefs
-  (`briefs/*.md`) + generated worker protocols; inline skill content into
-  codex briefs, or route skill-dependent tasks to a claude worker. Delegation
+- Workers CAN be skill-driven, both agents (live-verified 2026-07-15):
+  claude panes load user-level `~/.claude/skills` (slash invocation);
+  codex 0.144.4 invokes the same skills via `$<skill-name>` (`$` opens its
+  skill picker; slash fails — separate surfaces). Reference:
+  `skills/codex-prompting/SKILL.md`. Default remains briefs
+  (`briefs/*.md`) + generated worker protocols; inlining skill content is
+  optional hardening. Delegation
   substrate: this plugin's `spawn`/`msg` + herdr panes — for implementation
   work do NOT use `/implement`/`/tdd` inline; the coordinator never writes
   code (memory rule delegate-to-codex-workers).
