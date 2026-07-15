@@ -395,9 +395,11 @@ herdr-agent-team adopt <pane-id> --name <worker> [--role <text>]
   Hook push, `msg`, `status`, inbox — identical to spawned workers.
   Immutability invariant: **immutable since generation**.
 - **Run targeting:** newest active run by default; `--run` explicit;
-  several active runs without `--run` = hard error listing candidates. No
-  active run → bootstrap an ad-hoc star run (name from `--team`, default
-  `adhoc`; god = current pane; cwd = adopted pane's cwd; reconstructed
+  several active runs without `--run` = hard error listing candidates. `--team`
+  names a new ad-hoc team: it is a hard error when any run is active (pass
+  `--run <dir>` or kill the active run instead), and it cannot be combined with
+  `--run`. No active run → bootstrap an ad-hoc star run (name from `--team`,
+  default `adhoc`; god = current pane; cwd = adopted pane's cwd; reconstructed
   minimal spec lives only in `run.toml`).
 - **Topology:** star-only. Adopting into a mesh run is a hard error
   (immutable peer tables would go stale — ADR-0009 defers the amendment
