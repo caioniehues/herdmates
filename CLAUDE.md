@@ -35,25 +35,38 @@ stubs.
 - Report pointer injection into the god pane carries a file path only — never
   report content (ADR-0002).
 
-## Verified facts (don't re-derive)
+## Verified facts (don't re-derive; authority tags per ADR-0010)
 
-- Manifest event `on = "pane.agent_status_changed"` is valid — shipped plugins
-  use it, and payload shape is live-verified (spec §9, all TODOs resolved
-  2026-07-14): `HERDR_PLUGIN_EVENT_JSON` =
+Herdr is **open source**: github.com/ogulcancelik/herdr (Rust core; Zig only
+as vendored libghostty-vt). Local clone `~/Projects/herdr-upstream`. Evidence
+hierarchy: live = behavior, source = attribution, preview = feature-detect
+(ADR-0010). Reference layer: `docs/research/*2026-07-15*.md`.
+
+- Manifest event `on = "pane.agent_status_changed"` valid `[live 2026-07-14]`,
+  one of 21 hookable events `[source 2026-07-15]`: `HERDR_PLUGIN_EVENT_JSON` =
   `{"event":"pane_agent_status_changed","data":{type,pane_id,workspace_id,agent_status,agent}}` —
-  dot form in `HERDR_PLUGIN_EVENT`, underscore form inside the JSON.
-- Codex injection: `pane run` submits in one call — always use it. Double-Enter
-  is only needed when `agent send` is followed immediately by `send-keys Enter`
-  (paste-debounce swallows it). Keep `herdr agent wait --status working` as the
-  submission check (ADR-0006).
+  dot form in `HERDR_PLUGIN_EVENT`, underscore form inside the JSON. `agent`
+  optional; `title`/`display_agent`/`state_labels` may appear — tolerate
+  unknown/absent optional fields.
+- `pane run` = ONE request carrying text + Enter; herdr has NO paste-debounce
+  `[source 2026-07-15]` — Enter-swallowing after `agent send` is agent-TUI
+  behavior. Rule unchanged: always `pane run`, never split send-text/send-keys;
+  `herdr agent wait --status working` as submission check (ADR-0006).
 - `herdr agent send` writes literal text WITHOUT submitting — never brief it
   as a messaging channel. Workers message only via the plugin `msg` verb
-  (ADR-0008, spec §11); mid-turn queueing is per-agent (`queues_midturn`:
-  claude AND codex both live-verified true 2026-07-15; outbox covers
-  launchers declaring false).
-- Mid-turn `pane run` into a working Claude Code pane queues as a user message
-  and auto-submits when the turn ends (pointer injection is safe mid-turn).
-- Herdr agent status enum: idle/working/blocked/done/unknown.
+  (ADR-0008, spec §11).
+- Mid-turn `pane run` queues as a user message and auto-submits when the turn
+  ends `[live: claude 2026-07-14, codex 2026-07-15]`. Queueing is implemented
+  in the agent TUIs, not herdr `[source 2026-07-15]` — hence per-launcher
+  `queues_midturn`; outbox covers launchers declaring false.
+- Status enum exactly idle/working/blocked/done/unknown `[source 2026-07-15]`;
+  `done` = idle + unseen attention state (`agent wait` rejects `done`,
+  `wait agent-status` accepts it).
+- `custom_status` is GONE from current upstream; metadata `tokens` are
+  preview surface — schema-probe before any use (spec §8 step 3, §9).
+- Shipped bug (priority issue): hooking only `agent_status_changed` misses
+  `pane.moved` (new public pane id!) / `pane.exited` / `pane.closed` /
+  `workspace.closed` / `worktree.removed` — run board can go silently stale.
 
 ## Environment note
 
@@ -92,6 +105,13 @@ See `docs/agents/triage-labels.md`.
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root.
 See `docs/agents/domain.md`.
+
+### Research rules
+
+Always research external repos/libraries/docs via **ctx7** (find-docs skill)
+first, upstream source second, live behavior decisive. Never assume — verify
+inherited claims before building on them. Herdr is **open source**
+(github.com/ogulcancelik/herdr). See `docs/agents/research.md`.
 
 ## Conventions
 

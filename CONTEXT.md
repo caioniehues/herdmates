@@ -34,8 +34,7 @@ drift here first.
   hook when the target flips idle/done. Counterpart of the inbox.
 - **Queues mid-turn** — launcher-table property: whether a mid-turn `pane
   run` into that agent's TUI queues as a pending user message (claude:
-  verified true) or risks interrupting the turn (codex: unverified, treated
-  false).
+  verified true; codex: verified true) or risks interrupting the turn.
 - **Setup command** — team-spec command run inside each fresh worktree before
   the worker launches (project preflight: symlinks, deps, skip-worktree).
 - **Worker protocol** — one immutable generated file per worker at
@@ -44,6 +43,9 @@ drift here first.
   distinct from the repository's authored `AGENTS.md`, which remains untouched.
 - **Status flip** — a Herdr agent-status transition (idle/working/blocked/
   done/unknown). Flips to `blocked`/`done` trigger the report flow.
+- **Evidence hierarchy / authority tags** — claim authority labels: `live`
+  (current observed behavior), `source` (local upstream source), and `preview`
+  (runtime schema probe required), per ADR-0010.
 - **Adopted worker** — an existing pane registered into a run as a full
   worker (`team adopt`, ADR-0009): protocol generated at adoption,
   `adopted = true` in run state. Kill releases it (notice injected)

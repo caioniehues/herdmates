@@ -26,6 +26,23 @@ This file is the re-ranked, load-bearing distillation.
    into the god pane must be built from our own strings only; any
    worker-derived fragment (names, paths) gets the same stripping.
 
+### Ecosystem conventions
+
+Titles only; see [awesome-herdr-2026-07-15.md](research/awesome-herdr-2026-07-15.md#ecosystem-conventions-to-adopt) for the twelve source-backed conventions:
+
+1. Require `HERDR_ENV=1` for in-pane control.
+2. Use `pane run` for text plus submit.
+3. Store large payloads in files and inject pointers.
+4. Refuse ambiguous routing.
+5. Separate mechanism from policy.
+6. Close only resources the plugin created.
+7. Plugin processes start in the plugin root.
+8. Cover both `worktree.created` and `worktree.opened`.
+9. Use `HERDR_PLUGIN_STATE_DIR` for runtime state.
+10. Dashboards should consume snapshots/events.
+11. Lifecycle integrations aggregate and debounce child events.
+12. Expose least authority by role.
+
 ## Competitive watch
 
 - `ryonakae/shepherd` — structured `agent list/get/read --json` for
@@ -49,6 +66,16 @@ This file is the re-ranked, load-bearing distillation.
   v1.1 dashboard pane.
 - Niche check (2026-07-14): nobody does spawn-team + generated worker protocols +
   heterogeneous roster.
+
+Closest strategic competitors; retain the team-domain boundary in [upstream-integration-opportunities-2026-07-15.md §9](research/upstream-integration-opportunities-2026-07-15.md#9-native-overlap-and-obsolescence-watch):
+
+- `razajamil/herdr-factory` — heterogeneous ticket-to-PR belts with queue, attention, resume, and dashboard overlap broadly; we retain explicit star/mesh topology, spawned/adopted workers, durable run state, pointer reports, and the verified `msg`/outbox path. ([awesome-herdr §Executive findings and Roadmap overlaps](research/awesome-herdr-2026-07-15.md#executive-findings))
+- `Tudor0404/dual-author` — fixed issue→implementation→dual-review pipeline with a dependency dashboard overlaps roles, DAG, and dashboard; we remain a general heterogeneous team protocol rather than one delivery pipeline. ([awesome-herdr §Executive findings and Roadmap overlaps](research/awesome-herdr-2026-07-15.md#roadmap-overlaps-and-recommended-response))
+- `sean1588/herdr-orchestrator` — deterministic YAML state, SQLite audit, GitHub gates, and recovery overlap task state/restart; we retain cross-launcher god/worker teams, adopted workers, worktree isolation, and pointer reports without a fixed YAML/GitHub model. ([awesome-herdr §Executive findings and Roadmap overlaps](research/awesome-herdr-2026-07-15.md#roadmap-overlaps-and-recommended-response))
+- `erwins-enkel/shepherd` — browser mission control with plan/review/merge gates and resume overlaps supervised heterogeneous fleets; we remain Herdr-native and in-terminal, with explicit topology and durable run/report semantics. ([awesome-herdr §Executive findings and Roadmap overlaps](research/awesome-herdr-2026-07-15.md#roadmap-overlaps-and-recommended-response))
+- `tomoasleep/herdr-symphony` — tracker-driven headless workers with report-file completion overlap task boards and report protocol; we retain an interactive god pane, heterogeneous/adopted workers, explicit topology, verified messaging, and richer run lifecycle. ([awesome-herdr §Executive findings and Roadmap overlaps](research/awesome-herdr-2026-07-15.md#roadmap-overlaps-and-recommended-response))
+- `machine-machine/herdr-factory-loop-skill` — spec-driven mixed-agent fleet with disk context, dispatch/collect, hooks, and TUI overlaps fleet/run-board control; we retain Herdr-specific durable membership, worktree isolation, pointer reports, and explicit star/mesh coordination. ([awesome-herdr §Executive findings](research/awesome-herdr-2026-07-15.md#executive-findings))
+- `david-lutz/herdr-claude-teams` — Claude experimental-team calls translated into native Herdr panes overlap team launch, metadata, notifications, and resume; we retain first-class Claude/Codex heterogeneity, adopted workers, and plugin-owned topology/task/report state. ([awesome-herdr §Executive findings](research/awesome-herdr-2026-07-15.md#executive-findings))
 
 ## Curated install list for Caio's machine (context: CachyOS/KDE, god-agent workflow)
 

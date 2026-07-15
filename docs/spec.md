@@ -128,9 +128,9 @@ Given a spec (file or shorthand):
 
 ## 5. Report flow (push, not poll)
 
-- Manifest event hook on agent status change (socket event
-  `pane.agent_status_changed`; exact manifest `on =` name to be verified against
-  the herdr docs during build — see spec TODOs).
+- Manifest event hook on agent status change (`on =
+  "pane.agent_status_changed"` — verified `[live 2026-07-14]` and against the
+  upstream event allowlist `[source 2026-07-15]`, spec §9).
 - Hook receives `HERDR_PLUGIN_EVENT_JSON`; plugin matches the pane against
   active runs (ignores non-team panes — cheap exit).
 - On a team worker flipping `blocked` or `done`:
@@ -156,26 +156,111 @@ Given a spec (file or shorthand):
 - `[[events]]`: agent status change → `<binary> on-agent-status`.
 - No `[[panes]]` in v1 (dashboard is v1.1+), no link handlers.
 
-## 8. Out of scope for v1 (roadmap)
+## 8. Post-v1 roadmap (rewritten 2026-07-15 from the research wave)
 
-- Dashboard pane (ratatui, overlay placement).
-- `team restart` / reassign work — herdr tracks `agent_session_id` /
-  `agent_session_path` per pane (`pane report-agent` flags), so restart can be
-  real reattachment (`claude --resume <session_id>` via a launcher-table
-  `resume_command`), not respawn.
-- Run history browsing.
-- opencode/gemini tested launchers (config entries welcome, untested).
-- limux backend (extract shared generator crate only when that becomes real).
-- Shared task-board files under the run dir (native-teammate TaskList parity:
-  claimable tickets + blocked-by edges), if dogfooding demands it.
-- `team wait [--worker <name>] [--until blocked|done|report]` — blocking
-  god-side wait wrapping `herdr wait agent-status` + the completion
-  sentinel, so a god outside the event hook never hand-rolls poll monitors
-  (motivated by the 2026-07-15 silent-monitor incident during wave 2.5).
-- Worker progress pings via `pane report-metadata --custom-status` (pending
-  the §9 coexistence verification).
+Evidence-ordered sequence (sources: the four `docs/research/*2026-07-15*.md`
+reports; decisions grilled with Caio 2026-07-15). Research evidence and
+dogfooding pain both justify ordering; speculation still doesn't (ADR-0007).
 
-## 9. Build-time verification TODOs
+**Not roadmap — shipped bug (filed as priority issue):** the hook listens
+only to `pane.agent_status_changed`, so a `pane.moved` (which assigns a NEW
+public pane id), `pane.exited`/`pane.closed`, `workspace.closed`, or
+`worktree.removed` silently stales the run board and every later
+command/event match. Lifecycle-event reconciliation ships as a fix, not a
+feature.
+
+1. **Lifecycle reconciliation** (the bug above): hook `pane.moved`
+   (atomically migrate pane/tab/workspace ids from `previous_pane_id`),
+   `pane.exited` vs `pane.closed` (dead vs removed), `workspace.closed`,
+   `worktree.removed`, and `pane.agent_detected` (bind identity earlier).
+2. **Full `agent_session` persistence**: store `{source, agent, kind,
+   value}` per worker (today only `.value` survives), plus the exact herdr
+   session/socket identity per run. Prerequisite for any real restart.
+3. **Schema-gated metadata + aggregate notifications**: publish `team` /
+   `role` / `task` / `progress` via `pane report-metadata` tokens with
+   `--seq`/`--ttl-ms` — only after a runtime schema probe confirms token
+   support (preview surface, ADR-0010); `display_agent`/title fallback
+   otherwise. `notification show` for team-complete / blocked-beyond-
+   threshold / unrecoverable-exit only — never per status flip.
+4. **Native board pane**: `[[panes]]` entrypoint (durable tab placement +
+   popup variant), `open-board` action, `plugin_action` keybinds, link
+   handler making report/task pointers clickable. Board shows team
+   membership, tasks, dependencies, reports, mailbox state — never a
+   generic agent list (herdr's sidebar owns that).
+5. **Direct socket backend behind `HerdrApi`** (ADR-0011): snapshot +
+   subscription for the board and aggregate `team wait
+   [--until all|any|blocked|report]`; CLI stays default/fallback.
+6. **Run-scoped broadcast + bounded previews + conservative restart**:
+   `team msg --all` loops run members with per-target results; board
+   previews via bounded `recent-unwrapped` reads; `team restart` only for
+   launchers with a deliberately implemented, tested `resume_command`
+   (upstream has no public targeted resume — delete ours if one appears).
+7. **Later/optional**: declarative layouts (`layout.export/apply`) for
+   deterministic team topologies; Kitty-graphics board enrichment; run
+   history browsing; opencode/gemini tested launchers; limux backend
+   extraction.
+
+**Cancelled** (native overlap, `docs/research/upstream-integration-opportunities-2026-07-15.md` §9):
+- generic plugin statusline/agent list (herdr sidebar + rollups own it);
+- per-worker CLI-wait fan-out for team wait;
+- `pane report-metadata --custom-status` progress pings — `custom_status`
+  does not exist in current upstream source; superseded by schema-gated
+  tokens (step 3).
+
+**Watch item**: an optional Claude-native visible-team compatibility mode
+(Claude owns team/mailbox; herdr panes provide visibility — proven feasible
+by herdr-claude-teams). Separate experiment, never the core
+(`docs/research/herdr-claude-teams-analysis-2026-07-15.md` §5).
+
+## 9. Verified facts (authority-tagged)
+
+Every fact carries its authority per ADR-0010: `[live <date>]` = observed on
+the installed herdr (decisive for behavior); `[source <date>]` = upstream
+checkout (decisive for attribution/surface); `[preview]` = in upstream
+source but unconfirmed on our runtime — feature-detect before use. Dense
+reference detail lives in `docs/research/` (ADR-0010 §3), not here.
+
+### Corrections from the 2026-07-15 source audit
+
+(`docs/research/upstream-architecture-claims-2026-07-15.md` Part B)
+
+- **Herdr core is Rust, not Zig** `[source 2026-07-15]`. Zig is the vendored
+  `libghostty-vt` terminal engine behind FFI; Rust owns multiplexing, agent
+  detection, plugins, CLI, IPC.
+- **`pane run` is one API request carrying text + `keys:["Enter"]`; herdr
+  has no paste-debounce** `[source 2026-07-15]`. The historical "double-Enter
+  after `agent send`" observation `[live 2026-07-14]` is agent-TUI behavior
+  (the TUI swallowing an immediately following Enter), not a herdr timer.
+  Behavior rule unchanged: always `pane run`, never split
+  send-text/send-keys (ADR-0006).
+- **Mid-turn queueing lives in the agent TUIs, not herdr**
+  `[source 2026-07-15]`. Herdr writes bytes to the PTY immediately; Claude
+  Code and Codex queue the injected turn themselves `[live 2026-07-14/15]`.
+  `queues_midturn` therefore stays a *launcher* property — exactly where the
+  launcher table put it.
+- **`custom_status` does not exist in current upstream** `[source
+  2026-07-15]`; our protocol-16 snapshot predates its removal. Current
+  source `PaneInfo` exposes metadata `tokens` instead `[preview]`. Roadmap
+  step 3 is schema-gated on this.
+- **Event payload may add optional fields** `[source 2026-07-15]`: `agent`
+  is omitted when none; `title`, `display_agent`, `state_labels` may appear.
+  Parsers must tolerate unknown/absent optional fields.
+- **`done` is an attention state** `[source 2026-07-15]`: derived from
+  internal `Idle` when the pane is unseen; the detector knows only
+  idle/working/blocked/unknown. Explains why `agent wait` rejects `done`
+  while `wait agent-status` accepts it. Status enum
+  idle/working/blocked/done/unknown confirmed exhaustive.
+- **Env injection**: all managed panes also get `HERDR_SOCKET_PATH` (plus
+  `TERM`/`COLORTERM`) `[source 2026-07-15]` — previously undocumented here.
+  Event hooks additionally get the `HERDR_PLUGIN_*` set; full matrix in the
+  research report Part A §2.
+- **Plugin surface**: 21 hookable manifest events (not just
+  `pane.agent_status_changed`); actions, panes, keybinds, link handlers
+  available `[source 2026-07-15]`. High-frequency kinds
+  (`pane.output_changed`, `layout.updated`, …) are deliberately not
+  plugin-hookable — direct subscription territory (ADR-0011).
+
+### Build-time verification TODOs (resolved)
 
 - [x] Confirm the manifest `[[events]] on =` vocabulary for agent status
       transitions — RESOLVED 2026-07-14 by marketplace survey: shipped plugins
@@ -217,11 +302,12 @@ Given a spec (file or shorthand):
       `queues_midturn = true` (third-party messenger warning was
       over-conservative for current codex). Outbox path (§11) remains for
       launcher entries that declare `false`.
-- [ ] Live-verify `pane report-metadata --custom-status` from a worker pane:
-      does a plugin-sourced `--source` coexist with the claude/codex
-      integration's own agent reporting, or fight it? If clean, workers can
-      surface progress pings ("cluster 3/7") in herdr chrome and `team
-      status` (roadmap §8, not v1).
+- [x] ~~Live-verify `pane report-metadata --custom-status`~~ — CANCELLED
+      2026-07-15: `custom_status` is gone from current upstream source
+      (`[source]`, corrections above). Superseded by the schema-gated
+      metadata-token plan (§8 step 3): probe `herdr api schema --json` for
+      token support at runtime; the coexistence question (plugin `--source`
+      vs agent integration authority) transfers to that verification.
 
 ## 10. Definition of done (v1)
 

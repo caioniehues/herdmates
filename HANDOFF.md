@@ -1,97 +1,74 @@
 # HANDOFF — next session orientation
 
-Design locked 2026-07-14 via grilling interview in the limux repo. The scaffold
-and core wave are committed; docs remain the contract.
+Last updated 2026-07-15 (post research wave + docs overhaul).
 
 ## Read first
 
-1. `docs/spec.md` — buildable v1 spec. §10 is the definition of done.
-2. `docs/adr/0001–0007` — every locked decision + why. Don't relitigate
-   silently; new evidence → new ADR.
-3. `CONTEXT.md` — vocabulary (god, worker, star/mesh, pointer injection,
-   run-board, launcher table).
+1. `docs/spec.md` — v1 spec; §8 = post-v1 roadmap (research-backed wave),
+   §9 = authority-tagged verified facts.
+2. `docs/adr/0001–0011` — locked decisions + why. New evidence → new ADR,
+   ask Caio first. ADR-0010 (evidence hierarchy) and ADR-0011 (socket
+   backend) are the newest.
+3. `CONTEXT.md` — vocabulary. `docs/agents/research.md` — research rules
+   (ctx7 first; never assume; verify inherited claims).
 
 ## State
 
-- Wave 0 scaffold: `0d75e23`. Wave 1 core (tickets 02-06): `a6e0ff9`.
-- 2026-07-15: docs+ADR-0008 `2cd4e31`; waves 2+2.5 `15cd171` (spawn, hook,
-  status/kill, `msg` verb, `queues_midturn`, msg-only protocols); ticket 15
-  outbox drain `9e2f613`; ticket 10 worktree workers `20b8633`.
-- Ticket 16 (agent-start tolerance, found by DoD run 1): `051c1dc`.
-- Central gate green: build, fmt, Clippy `-D warnings`, 83 tests.
-- **DoD (spec §10) PASSED 2026-07-15, run 2 on the limux repo**, plugin
-  linked+enabled live: worktree+setup+pane-cwd correct (ADR-0004), both
-  workers briefed and started, status-flip pointer injections landed in the
-  god pane within seconds, `msg` round-trip god→builder→god verified
-  (PONG), durable reports in the run inbox, `team kill` closed workspaces
-  and preserved the dirty worktree. Evidence: run dir
-  `dod-demo-1784075553674` under the plugin state dir; dirty worktree
-  `~/.herdr/worktrees/limux/dod-builder-1` kept for inspection.
-- Ticket 17 landed: `699988e` — protocols embed shell-quoted absolute
-  binary (current_exe) + `--run`; live re-verified from a bare codex pane
-  (command runs verbatim; codex's default sandbox then denies the herdr
-  socket — launcher policy, documented in spec §11 + examples/agents.toml).
-  85 tests green.
-- Ticket 18 landed (`3b8d0c6`): kill marks worker lifecycles ended; README
-  reflects shipped v1. 87 tests.
-- **PUBLISHED 2026-07-15 with Caio's explicit go-ahead:**
+- **v1 SHIPPED + PUBLISHED** (2026-07-15, Caio's go-ahead):
   https://github.com/caioniehues/herdr-agent-team — public, topic
-  `herdr-plugin` (marketplace listing ~30 min), tag `v0.1.0`. Issue tracker
-  switched to GitHub Issues (docs/agents/issue-tracker.md). All tickets
-  01–18 closed pre-publish.
-- Post-v1 backlog seeds: spec §8 roadmap (dashboard pane, `team wait`,
-  `team restart` via agent_session resume, task-board files,
-  report-metadata progress pings) — order by dogfooding pain, not
-  speculation (ADR-0007 discipline).
-- Local git only — **NOT on GitHub yet.** Publishing = create public repo
-  `caioniehues/herdr-agent-team` + topic `herdr-plugin` (marketplace auto-lists
-  in ~30 min). Ask Caio before pushing.
-- Source logic to port lives in the limux fork:
-  `~/Projects/cmux-kde/limux/rust/limux-cli/src/main.rs` — `build_agents_md`,
-  `agent_launch_command` (copy, don't depend — ADR-0005).
+  `herdr-plugin`, tag `v0.1.0`, marketplace-listed. Pushes to `main` are
+  releases: gate (fmt/clippy/tests), bump manifest version for behavior
+  changes, tag, never push without Caio's ask.
+- DoD passed 2026-07-15 (run 2, limux repo, live): spawn, worktrees,
+  pointer injection, msg round-trip, kill preserving dirty worktree.
+- `team adopt` shipped (`10a855a`, closes #1): existing panes become full
+  workers; ADR-0009, spec §12.
+- **Herdr is OPEN SOURCE** — github.com/ogulcancelik/herdr (Rust core,
+  vendored Zig libghostty-vt). The old "closed-source" note was an
+  unverified assumption, corrected 2026-07-15 (ADR-0010). Local clone:
+  `~/Projects/herdr-upstream`. Schema-snapshot discipline stays as drift
+  detection (`docs/herdr-api-schema.snapshot.json`, protocol 16).
+- **Research wave 2026-07-15** (4 reports in `docs/research/`): upstream
+  architecture + claims audit, integration opportunities, herdr-claude-teams
+  competitor analysis (verdict: pattern-source, not threat), awesome-herdr
+  ecosystem survey (133 entries). Key corrections live in spec §9; roadmap
+  rewritten in spec §8 from this evidence (grilled decisions Q1–Q6 with
+  Caio, 2026-07-15).
+- Central gate green at last commit: build, fmt, clippy `-D warnings`,
+  98 tests.
 
 ## NEXT steps (in order)
 
-1. ~~Verify the four spec §9 TODOs~~ — **ALL RESOLVED 2026-07-14** by live test
-   inside herdr 0.7.3 (protocol 16, matches snapshot). Findings + exact payload
-   recorded in spec §9. Test fixture: `tests/fixtures/event-logger-plugin/`
-   (linked but disabled; re-enable with
-   `herdr plugin enable herdr-agent-team.event-logger`). Headlines:
-   - `HERDR_PLUGIN_EVENT_JSON` = `{"event":"pane_agent_status_changed","data":{…socket payload…}}`;
-     dot form in `HERDR_PLUGIN_EVENT`, underscore form inside the JSON.
-   - Mid-turn `pane run` into Claude Code queues cleanly, auto-submits after
-     the turn.
-   - Codex: `pane run` submits in one call; double-Enter only needed for
-     `agent send` + immediate `send-keys Enter` (debounce). Rule: always
-     `pane run`.
-2. ~~Wave 2 (tickets 07-09)~~ — **LANDED 2026-07-15** in `15cd171` (spawn
-   happy path, event hook, status/kill + client-mismatch remediation).
-3. ~~Ticket 10 worktree workers~~ — **LANDED 2026-07-15** in `20b8633`
-   (worktree create before allocation, setup in worktree cwd with captured
-   output, ADR-0004 cwd discipline; 82 tests).
-4. ~~Messaging wave (tickets 12–15 — ADR-0008, spec §11)~~ — **LANDED
-   2026-07-15** (`15cd171` waves 2+2.5, `9e2f613` ticket 15; 79 tests).
-   `msg` verb + `queues_midturn` + protocols brief msg-only + outbox drain
-   in the hook. Codex mid-turn `pane run` live-verified: QUEUES cleanly —
-   both shipped launchers `queues_midturn = true`; outbox covers launchers
-   declaring false. Background research:
-   `docs/research/native-teammate-parity-2026-07-15.md` +
-   `docs/research/herdr-agent-messenger-2026-07-15.md`.
-5. Run ticket 11 manifest actions and the live limux DoD from the god session
-   with Caio watching. DoD now includes a live `msg` round-trip (spec §10)
-   and ticket 08's deferred live pointer-injection check.
-6. Only then talk to Caio about publishing; never push or add the
-   `herdr-plugin` topic without explicit approval.
+1. **Issue #4 (bug, priority; not roadmap): lifecycle-event reconciliation** —
+   `pane.moved` assigns a new public pane id and silently stales the run
+   board; also `pane.exited`/`pane.closed`/`workspace.closed`/
+   `worktree.removed`. Fix before feature work.
+2. **Roadmap step 2 / Issue #5:** persist full `agent_session
+   {source,agent,kind,value}` + herdr session identity.
+3. **Roadmap step 3 / Issue #6:** schema-gated metadata tokens (spec §8 step
+   3) + aggregate notifications.
+4. **Roadmap step 4 / Issue #7:** native board pane (`[[panes]]` + action +
+   keybinds + link handler).
+5. **Roadmap step 5 / Issue #8:** direct socket backend behind `HerdrApi`
+   (ADR-0011); #2 team wait rides it.
+6. **Roadmap step 6 / Issue #9:** run-scoped broadcast, bounded previews, and
+   conservative restart (blocked by #5).
+7. **Roadmap step 7:** later/optional declarative layouts, Kitty-graphics
+   board enrichment, run-history browsing, tested opencode/gemini launchers,
+   and limux backend extraction.
+
+Work them via codex pane workers (never implement in this repo from the
+coordinator — memory rule), one ticket per worker worktree, coordinator
+commits and gates centrally.
 
 ## Context that doesn't fit the docs
 
-- Marketplace survey (175 plugins, 2026-07-14) is applied: curated conclusions
-  in `docs/marketplace-notes.md` (patterns to steal with source pointers,
-  competitive watch, Caio's install list); raw verdicts in
-  `docs/marketplace-survey-2026-07-14.json`. Spec §9 TODO #1 (event name) is
-  resolved from it.
-- Caio plans to run coordinator (god) sessions inside herdr from now on —
-  which this plugin's ADR-0002 report path requires anyway.
-- Herdr is closed-source. Compatibility contract: snapshot `herdr api schema
-  --json` into the repo and diff on herdr updates (not yet done — worth adding
-  as a small script + CI-less check).
+- Marketplace survey (175 plugins) + awesome-herdr survey conclusions:
+  `docs/marketplace-notes.md`; raw verdicts in the two survey JSON/report
+  files. Competitive watch: herdr-factory, dual-author, herdr-orchestrator,
+  Shepherd, herdr-symphony, herdr-factory-loop-skill, herdr-claude-teams.
+- Caio runs god sessions inside herdr; research/analysis fan-outs run as
+  **visible herdr pane teammates** (codex yolo), never invisible Agent-tool
+  subagents (2026-07-15 incident: mailbox-spawned agents never started).
+- Watch item: optional Claude-native visible-team compatibility mode
+  (herdr-claude-teams proved feasibility) — separate experiment, never core.
