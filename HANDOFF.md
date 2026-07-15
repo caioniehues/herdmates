@@ -38,8 +38,12 @@ Invoke these Claude Code skills at the named moments — don't rediscover them:
 - **`/verify`** — before committing any coordinator-authored nontrivial
   change: drive the real flow (the post-release `plugin unlink`+`link` IS
   the release smoke test).
-- Workers are NOT skill-driven: they get briefs (`briefs/*.md`) + generated
-  worker protocols. Skills above are for the god session only. Delegation
+- Workers: claude pane workers CAN be skill-driven (user-level
+  `~/.claude/skills` load in panes — live-verified 2026-07-15); codex
+  workers CANNOT (`Unrecognized command`, own slash surface — issue #34
+  tracks a codex-prompting reference skill). Default remains briefs
+  (`briefs/*.md`) + generated worker protocols; inline skill content into
+  codex briefs, or route skill-dependent tasks to a claude worker. Delegation
   substrate: this plugin's `spawn`/`msg` + herdr panes — for implementation
   work do NOT use `/implement`/`/tdd` inline; the coordinator never writes
   code (memory rule delegate-to-codex-workers).
