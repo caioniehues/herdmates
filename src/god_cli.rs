@@ -64,6 +64,9 @@ pub trait GodCollector {
     fn wait_for_change(&self, timeout: Duration) {
         thread::sleep(timeout);
     }
+    fn subscription_panes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct RunGodCollector {
@@ -73,6 +76,17 @@ pub struct RunGodCollector {
 impl GodCollector for RunGodCollector {
     fn collect(&self) -> Result<GodSnapshot, GodCliError> {
         collect_snapshot(&self.run_dir)
+    }
+    fn subscription_panes(&self) -> Vec<String> {
+        load_run(&self.run_dir)
+            .map(|run| {
+                run.state
+                    .workers
+                    .values()
+                    .filter_map(|worker| worker.pane_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -201,7 +215,13 @@ pub fn wait_with(
     timeout: Duration,
 ) -> Result<WaitVerdict, GodCliError> {
     let start = Instant::now();
+    let deadline = start + timeout;
+    let mut first = true;
     loop {
+        if !first && Instant::now() >= deadline {
+            return Ok(verdict(VerdictKind::Timeout, until, None, start));
+        }
+        first = false;
         let snapshot = collector.collect()?;
         if snapshot.lifecycle != RunLifecycle::Active {
             return Ok(verdict(VerdictKind::InactiveRun, until, None, start));
@@ -212,10 +232,11 @@ pub fn wait_with(
         if condition_met(&snapshot, until) {
             return Ok(verdict(VerdictKind::Reached, until, None, start));
         }
-        if start.elapsed() >= timeout {
+        if Instant::now() >= deadline {
             return Ok(verdict(VerdictKind::Timeout, until, None, start));
         }
-        collector.wait_for_change(POLL_INTERVAL.min(timeout.saturating_sub(start.elapsed())));
+        collector
+            .wait_for_change(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -532,6 +553,23 @@ mod tests {
             worker_lifecycles: vec![("a".into(), life)],
             statuses: vec![("a".into(), status.into())],
         }
+    }
+    struct DeadlineCollector;
+    impl GodCollector for DeadlineCollector {
+        fn collect(&self) -> Result<GodSnapshot, GodCliError> {
+            Ok(snap(false, "working", WorkerLifecycle::Running))
+        }
+        fn wait_for_change(&self, timeout: Duration) {
+            std::thread::sleep(timeout);
+        }
+    }
+    #[test]
+    fn wait_preserves_total_deadline_without_second_fallback_sleep() {
+        let timeout = Duration::from_millis(40);
+        let started = Instant::now();
+        let verdict = wait_with(&DeadlineCollector, &Until::AnyReport, timeout).unwrap();
+        assert_eq!(verdict.verdict, VerdictKind::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(80));
     }
     #[test]
     fn every_until_mode_resolves() {

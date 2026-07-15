@@ -53,6 +53,13 @@ pub struct BoardSnapshot {
 /// Collection stays behind this seam so socket snapshots can replace polling in #8.
 pub trait BoardCollector {
     fn collect(&self) -> Result<BoardSnapshot, BoardError>;
+    fn wait_for_change(&self, timeout: Duration) -> bool {
+        std::thread::sleep(timeout);
+        true
+    }
+    fn subscription_panes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct RunCollector {
@@ -62,6 +69,17 @@ pub struct RunCollector {
 impl BoardCollector for RunCollector {
     fn collect(&self) -> Result<BoardSnapshot, BoardError> {
         collect_run(&self.run_dir)
+    }
+    fn subscription_panes(&self) -> Vec<String> {
+        load_run(&self.run_dir)
+            .map(|run| {
+                run.state
+                    .workers
+                    .values()
+                    .filter_map(|worker| worker.pane_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -279,8 +297,10 @@ fn run_board(collector: impl BoardCollector) -> Result<(), BoardError> {
             )?;
             print!("{}", render(&snapshot, selection));
             stdout.flush()?;
-            if !event::poll(Duration::from_secs(2))? {
-                snapshot = collector.collect()?;
+            if !event::poll(Duration::from_millis(100))? {
+                if collector.wait_for_change(Duration::from_millis(100)) {
+                    snapshot = collector.collect()?;
+                }
                 continue;
             }
             let Event::Key(key) = event::read()? else {
