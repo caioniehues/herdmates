@@ -2,6 +2,7 @@
 
 use crate::reconcile::HookMetadata;
 use crate::types::{RunLifecycle, RunState};
+use fs4::FileExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
@@ -12,6 +13,7 @@ use thiserror::Error;
 
 const RUNS_DIR: &str = "runs";
 const RUN_FILE: &str = "run.toml";
+const RUN_LOCK_FILE: &str = ".run.toml.lock";
 const INBOX_DIR: &str = "inbox";
 const EVENTS_FILE: &str = "events.jsonl";
 
@@ -144,6 +146,43 @@ pub fn save_run_with_hook(run: &RunBoard, hook: &HookMetadata) -> Result<(), Run
         }
     }
     write_run_contents(&run.dir, &contents)
+}
+
+/// Serialize a fresh load-mutate-save transaction across plugin processes.
+///
+/// The dedicated lock file remains stable while `run.toml` is atomically
+/// replaced, so every cooperating writer locks the same inode.
+pub fn update_run_with_hook<T, E>(
+    run_dir: &Path,
+    update: impl FnOnce(&mut RunBoard, &mut HookMetadata) -> Result<T, E>,
+) -> Result<(RunBoard, T), E>
+where
+    E: From<RunError>,
+{
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(run_dir.join(RUN_LOCK_FILE))
+        .map_err(RunError::from)?;
+    FileExt::lock(&lock_file).map_err(RunError::from)?;
+
+    let result = (|| {
+        let mut run = load_run(run_dir).map_err(E::from)?;
+        let mut hook = load_hook_metadata(run_dir).map_err(E::from)?;
+        let value = update(&mut run, &mut hook)?;
+        save_run_with_hook(&run, &hook).map_err(E::from)?;
+        Ok((run, value))
+    })();
+    let unlock = FileExt::unlock(&lock_file)
+        .map_err(RunError::from)
+        .map_err(E::from);
+    match (result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
 }
 
 fn write_run_contents(run_dir: &Path, contents: &str) -> Result<(), RunError> {
@@ -305,6 +344,7 @@ mod tests {
                 agent_session: None,
                 worktree_path: Some(PathBuf::from("/tmp/worktree")),
                 adopted: false,
+                launch_checkpoint: Default::default(),
                 lifecycle: WorkerLifecycle::Running,
             },
         );
