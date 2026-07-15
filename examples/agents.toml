@@ -6,6 +6,12 @@ command = ["claude"]
 submit_verify = true
 reads_agents_md = "pointer"   # needs a pointer line in the launch prompt
 queues_midturn = true          # mid-turn pane run queues cleanly (live-verified)
+# NOTE (live-verified 2026-07-15): codex's default sandbox denies herdr socket
+# access ("Operation not permitted"), so a plain-codex worker cannot run the
+# `msg` verb without an interactive approval. Teams relying on worker->god
+# messaging from codex should use a permissive entry, e.g.:
+#   command = ["codex", "--dangerously-bypass-approvals-and-sandbox"]
+# Weigh that trade-off deliberately; the shipped default stays sandboxed.
 
 [codex]
 command = ["codex"]

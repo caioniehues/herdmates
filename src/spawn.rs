@@ -1723,6 +1723,7 @@ mod tests {
             "every launcher mode needs a pointer"
         );
         assert_ne!(protocol_paths[0], protocol_paths[1]);
+        let running_binary = env::current_exe().expect("resolve test executable");
 
         for (path, worker_name) in protocol_paths
             .iter()
@@ -1733,6 +1734,8 @@ mod tests {
             let protocol = fs::read_to_string(path).expect("read generated protocol");
             assert!(protocol.contains(&format!("- Worker: `{worker_name}`")));
             assert!(protocol.contains(&format!("/inbox/{worker_name}.md")));
+            assert!(protocol.contains(&running_binary.display().to_string()));
+            assert!(protocol.contains(&format!("--run '{}'", run.dir.display())));
             let other = if worker_name == "pointer-worker" {
                 "native-worker"
             } else {

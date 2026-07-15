@@ -278,9 +278,19 @@ herdr-agent-team msg <target> <text> [--run <run-dir>]
 
 ### Protocol briefing
 
-Generated worker protocols (star and mesh) reference only:
+Generated worker protocols (star and mesh) carry a **self-contained
+invocation** — shell-quoted absolute binary path (resolved via
+`current_exe` at spawn time) plus an explicit `--run <run-dir>` — so a
+bare worker pane needs no PATH or env provision (live-verified deviation,
+DoD run 2):
 
-- `herdr-agent-team msg god "<text>"` — reply / escalate.
-- mesh: `herdr-agent-team msg <peer> "<agent-msg>…</agent-msg>"`.
+- `'<abs-binary>' msg god "<text>" --run '<run-dir>'` — reply / escalate.
+- mesh: same form with `msg <peer>` and the `<agent-msg>` envelope.
 
 The peer table lists names only; pane ids stay in `run.toml`.
+
+**Sandbox caveat (live-verified 2026-07-15):** codex's default sandbox
+denies herdr socket access (`Operation not permitted`), so a plain-codex
+worker can only run `msg` behind an interactive approval. Teams relying on
+codex worker→god messaging should configure a permissive launcher entry
+(see `examples/agents.toml`); the shipped default stays sandboxed.

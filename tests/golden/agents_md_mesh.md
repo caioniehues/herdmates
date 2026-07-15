@@ -27,7 +27,11 @@ The report is the durable payload. The god receives only a pointer to it when yo
 
 ## God contact
 
-- Reply with `herdr-agent-team msg god "<text>"`.
+Reply with:
+
+```bash
+'/plugins/agent-team/target/release/herdr-agent-team' msg god "<text>" --run '/state/runs/protocol-wave-20260714'
+```
 
 ## Peers in this team
 
@@ -52,7 +56,7 @@ Wrap mesh messages in an `<agent-msg>` envelope so the recipient can identify, r
 Send it with:
 
 ```bash
-herdr-agent-team msg <peer> "<agent-msg>...</agent-msg>"
+'/plugins/agent-team/target/release/herdr-agent-team' msg <peer> "<agent-msg>...</agent-msg>" --run '/state/runs/protocol-wave-20260714'
 ```
 
 Rules:

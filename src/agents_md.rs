@@ -1,6 +1,7 @@
 //! Generated worker communication protocol from `docs/spec.md` sections 4 and 11.
 
 use crate::types::{RunState, TeamSpec, Topology, WorkerRunState, WorkerSpec};
+use std::env;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -12,6 +13,10 @@ pub const COMPLETION_SENTINEL: &str = "HERDR_TEAM_WORKER_COMPLETE";
 pub enum AgentsMdError {
     #[error("run directory must be absolute: {0}")]
     RelativeRunDir(PathBuf),
+    #[error("agent-team executable path must be absolute: {0}")]
+    RelativeExecutable(PathBuf),
+    #[error("failed to resolve the running agent-team executable: {0}")]
+    CurrentExecutable(String),
 }
 
 pub fn render_agents_md(
@@ -20,8 +25,23 @@ pub fn render_agents_md(
     run: &RunState,
     run_dir: &Path,
 ) -> Result<String, AgentsMdError> {
+    let executable =
+        env::current_exe().map_err(|error| AgentsMdError::CurrentExecutable(error.to_string()))?;
+    render_agents_md_with_executable(team, worker, run, run_dir, &executable)
+}
+
+pub(crate) fn render_agents_md_with_executable(
+    team: &TeamSpec,
+    worker: &WorkerSpec,
+    run: &RunState,
+    run_dir: &Path,
+    executable: &Path,
+) -> Result<String, AgentsMdError> {
     if !run_dir.is_absolute() {
         return Err(AgentsMdError::RelativeRunDir(run_dir.to_path_buf()));
+    }
+    if !executable.is_absolute() {
+        return Err(AgentsMdError::RelativeExecutable(executable.to_path_buf()));
     }
 
     let report_path = run_dir.join("inbox").join(format!("{}.md", worker.name));
@@ -66,10 +86,18 @@ your status changes. Never print the sentinel before the report exists.\n\n",
     );
 
     out.push_str("## God contact\n\n");
-    out.push_str("- Reply with `herdr-agent-team msg god \"<text>\"`.\n");
+    out.push_str("Reply with:\n\n```bash\n");
+    writeln!(
+        out,
+        "{} msg god \"<text>\" --run {}",
+        shell_quote(&executable.to_string_lossy()),
+        shell_quote(&run_dir.to_string_lossy())
+    )
+    .expect("writing to String cannot fail");
+    out.push_str("```\n");
 
     if team.topology == Topology::Mesh {
-        render_mesh_protocol(&mut out, team, worker);
+        render_mesh_protocol(&mut out, team, worker, executable, run_dir);
     }
 
     Ok(out)
@@ -81,7 +109,13 @@ fn workspace_label(state: Option<&WorkerRunState>) -> String {
         .unwrap_or_else(|| "pending".to_owned())
 }
 
-fn render_mesh_protocol(out: &mut String, team: &TeamSpec, worker: &WorkerSpec) {
+fn render_mesh_protocol(
+    out: &mut String,
+    team: &TeamSpec,
+    worker: &WorkerSpec,
+    executable: &Path,
+    run_dir: &Path,
+) {
     out.push_str("\n## Peers in this team\n\n");
     out.push_str("| Name |\n");
     out.push_str("|---|\n");
@@ -103,7 +137,13 @@ route, and reply to them:\n\n",
     )
     .expect("writing to String cannot fail");
     out.push_str("Send it with:\n\n");
-    out.push_str("```bash\nherdr-agent-team msg <peer> \"<agent-msg>...</agent-msg>\"\n```\n\n");
+    writeln!(
+        out,
+        "```bash\n{} msg <peer> \"<agent-msg>...</agent-msg>\" --run {}\n```\n",
+        shell_quote(&executable.to_string_lossy()),
+        shell_quote(&run_dir.to_string_lossy())
+    )
+    .expect("writing to String cannot fail");
     out.push_str("Rules:\n");
     out.push_str("- `from` and `to` must name the sender and recipient from the table.\n");
     out.push_str("- Use a fresh UUID for `id` and ISO-8601 UTC for `ts`.\n");
@@ -113,11 +153,18 @@ route, and reply to them:\n\n",
     );
 }
 
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{RunLifecycle, WorkerLifecycle};
     use std::collections::BTreeMap;
+
+    const GOLDEN_EXECUTABLE: &str = "/plugins/agent-team/target/release/herdr-agent-team";
+    const GOLDEN_RUN_DIR: &str = "/state/runs/protocol-wave-20260714";
 
     fn worker(name: &str, role: &str, worktree: bool) -> WorkerSpec {
         WorkerSpec {
@@ -173,11 +220,12 @@ mod tests {
     #[test]
     fn renders_star_protocol_golden() {
         let (team, run) = fixture(Topology::Star);
-        let rendered = render_agents_md(
+        let rendered = render_agents_md_with_executable(
             &team,
             &team.workers[0],
             &run,
-            Path::new("/state/runs/protocol-wave-20260714"),
+            Path::new(GOLDEN_RUN_DIR),
+            Path::new(GOLDEN_EXECUTABLE),
         )
         .unwrap();
 
@@ -194,16 +242,18 @@ mod tests {
         ]
         .iter()
         .all(|forbidden| !rendered.contains(forbidden)));
+        assert_no_bare_msg_invocation(&rendered);
     }
 
     #[test]
     fn renders_mesh_protocol_golden() {
         let (team, run) = fixture(Topology::Mesh);
-        let rendered = render_agents_md(
+        let rendered = render_agents_md_with_executable(
             &team,
             &team.workers[0],
             &run,
-            Path::new("/state/runs/protocol-wave-20260714"),
+            Path::new(GOLDEN_RUN_DIR),
+            Path::new(GOLDEN_EXECUTABLE),
         )
         .unwrap();
 
@@ -219,6 +269,32 @@ mod tests {
         ]
         .iter()
         .all(|forbidden| !rendered.contains(forbidden)));
+        assert_no_bare_msg_invocation(&rendered);
+    }
+
+    #[test]
+    fn invocation_supports_linked_and_installed_binary_layouts() {
+        let (team, run) = fixture(Topology::Star);
+
+        for executable in [
+            "/repo/target/release/herdr-agent-team",
+            "/home/user/.local/share/herdr/plugins/agent-team/target/release/herdr-agent-team",
+        ] {
+            let rendered = render_agents_md_with_executable(
+                &team,
+                &team.workers[0],
+                &run,
+                Path::new(GOLDEN_RUN_DIR),
+                Path::new(executable),
+            )
+            .expect("render absolute invocation");
+
+            assert!(rendered.contains(&format!(
+                "'{}' msg god \"<text>\" --run '{}'",
+                executable, GOLDEN_RUN_DIR
+            )));
+            assert_no_bare_msg_invocation(&rendered);
+        }
     }
 
     #[test]
@@ -226,8 +302,40 @@ mod tests {
         let (team, run) = fixture(Topology::Star);
 
         assert_eq!(
-            render_agents_md(&team, &team.workers[0], &run, Path::new("relative/run")),
+            render_agents_md_with_executable(
+                &team,
+                &team.workers[0],
+                &run,
+                Path::new("relative/run"),
+                Path::new(GOLDEN_EXECUTABLE),
+            ),
             Err(AgentsMdError::RelativeRunDir(PathBuf::from("relative/run")))
         );
+    }
+
+    #[test]
+    fn rejects_a_relative_executable_path() {
+        let (team, run) = fixture(Topology::Star);
+
+        assert_eq!(
+            render_agents_md_with_executable(
+                &team,
+                &team.workers[0],
+                &run,
+                Path::new(GOLDEN_RUN_DIR),
+                Path::new("target/release/herdr-agent-team"),
+            ),
+            Err(AgentsMdError::RelativeExecutable(PathBuf::from(
+                "target/release/herdr-agent-team"
+            )))
+        );
+    }
+
+    fn assert_no_bare_msg_invocation(rendered: &str) {
+        assert!(!rendered.lines().any(|line| {
+            line.trim_start()
+                .trim_start_matches("- Reply with `")
+                .starts_with("herdr-agent-team msg")
+        }));
     }
 }

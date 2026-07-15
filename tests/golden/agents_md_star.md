@@ -27,4 +27,8 @@ The report is the durable payload. The god receives only a pointer to it when yo
 
 ## God contact
 
-- Reply with `herdr-agent-team msg god "<text>"`.
+Reply with:
+
+```bash
+'/plugins/agent-team/target/release/herdr-agent-team' msg god "<text>" --run '/state/runs/protocol-wave-20260714'
+```
