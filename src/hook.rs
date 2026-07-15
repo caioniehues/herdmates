@@ -63,8 +63,7 @@ pub fn on_agent_status<H: HerdrApi>(
     let raw_event: Value = serde_json::from_str(event_json)?;
     let event = parse_event(serde_json::from_value(raw_event.clone())?)?;
 
-    for mut run in run::list_active_runs(state_dir)? {
-        let metadata = run::load_hook_metadata(&run.dir)?;
+    for listed_run in run::list_active_runs(state_dir)? {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(run::RunError::from)?
@@ -74,27 +73,30 @@ pub fn on_agent_status<H: HerdrApi>(
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(300_000);
-        let mut reconciliation = reconcile_at(
-            &event,
-            run.state.clone(),
-            metadata,
-            now_ms,
-            blocked_threshold_ms,
-        );
+        let (run, reconciliation) =
+            run::update_run_with_hook(&listed_run.dir, |run, metadata| -> Result<_, HookError> {
+                let mut reconciliation = reconcile_at(
+                    &event,
+                    run.state.clone(),
+                    metadata.clone(),
+                    now_ms,
+                    blocked_threshold_ms,
+                );
+                if reconciliation.metadata.metadata_capabilities.is_none()
+                    && reconciliation.actions.iter().any(|action| {
+                        matches!(action, ReconciliationAction::PublishMetadata { .. })
+                    })
+                {
+                    reconciliation.metadata.metadata_capabilities =
+                        Some(MetadataCapabilities::from_schema(&herdr.api_schema()?));
+                }
+                run.state = reconciliation.state.clone();
+                *metadata = reconciliation.metadata.clone();
+                Ok(reconciliation)
+            })?;
         if reconciliation.actions.is_empty() {
             continue;
         }
-        if reconciliation.metadata.metadata_capabilities.is_none()
-            && reconciliation
-                .actions
-                .iter()
-                .any(|action| matches!(action, ReconciliationAction::PublishMetadata { .. }))
-        {
-            reconciliation.metadata.metadata_capabilities =
-                Some(MetadataCapabilities::from_schema(&herdr.api_schema()?));
-        }
-        run.state = reconciliation.state;
-        run::save_run_with_hook(&run, &reconciliation.metadata)?;
         run::append_event(&run.dir, &raw_event)?;
 
         for action in reconciliation.actions {

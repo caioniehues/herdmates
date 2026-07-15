@@ -131,20 +131,24 @@ Given a spec (file or shorthand):
       `herdr agent wait --status working`; on timeout, retry once with an empty
       `pane run` and verify again.
    c. Persist the worker as `running` with launch checkpoint `brief_submitted`.
-      Run-board mutation and the existing atomic temp-file rename are serialized,
-      so concurrent checkpoints cannot overwrite one another.
+      Spawn checkpoint updates and hook reconciliation take a run-scoped
+      advisory file lock around a fresh load, narrow mutation/reconciliation,
+      and the existing atomic temp-file rename. Spawn threads and separate hook
+      processes therefore cannot overwrite one another with stale snapshots.
 6. After brief submission, poll lazily for each optional Herdr `agent_session`.
    Persist it when available; missing identity does not delay this or another
    worker's brief and does not fail an otherwise running worker.
 
-`team spawn --resume <run-dir>` resumes an interrupted active run. Workers with
-`lifecycle = running` are untouched. For each `pending` worker, resume reuses a
-live recorded pane and existing worktree, creates any absent resource, and
-recreates a workspace when the recorded pane is gone. Existing immutable worker
-protocols are reused; missing protocols are generated before launch. Resume then
-runs the same concurrent launch + brief flow and advances checkpoints from
-`pending` to `resources_ready` to `brief_submitted`. A run with no pending
-workers is an idempotent no-op with a clear message.
+`team spawn --resume <run-dir>` resumes an interrupted active run. Running and
+adopted workers are untouched. For each spawn-owned `pending` worker, resume
+reuses a live recorded pane and existing worktree, creates any absent resource,
+and recreates a workspace when the recorded pane is gone. If the live pane
+already reports an agent, resume skips the launcher command and continues with
+brief submission; otherwise it launches the agent CLI first. Existing immutable
+worker protocols are reused; missing protocols are generated before launch.
+Resume advances checkpoints from `pending` to `resources_ready` to
+`brief_submitted`. A run with no spawn-owned pending workers is an idempotent
+no-op with a clear message.
 
 ## 5. Report flow (push, not poll)
 
