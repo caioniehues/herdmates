@@ -137,6 +137,25 @@ pub fn msg_command(args: &[String]) -> Result<(), MsgError> {
     Ok(())
 }
 
+pub(crate) fn deliver_queued_message(
+    run: &RunBoard,
+    target_name: &str,
+    text: &str,
+    herdr: &HerdrClient,
+) -> Result<(), MsgError> {
+    let target = resolve_target(run, target_name)?;
+    let agent = target
+        .agent
+        .as_deref()
+        .ok_or_else(|| MsgError::MissingAgentKind {
+            target: target.name.clone(),
+            pane_id: target.pane_id.clone(),
+        })?;
+    let launchers = load_launchers()?;
+    let launcher = launcher_entry(&launchers, agent)?;
+    deliver_message(herdr, &target, text, launcher)
+}
+
 fn parse_msg_arguments(args: &[String]) -> Result<MsgArguments, MsgError> {
     let mut positional = Vec::new();
     let mut run_dir = None;

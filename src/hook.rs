@@ -1,9 +1,11 @@
-//! Push-based worker status report hook from `docs/spec.md` section 5.
+//! Push-based worker status report and outbox hook from `docs/spec.md` sections 5 and 11.
 
 use crate::herdr::HerdrClient;
+use crate::msg;
 use crate::run;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -20,6 +22,14 @@ pub enum HookError {
 
     #[error("failed to resolve an absolute report path: {0}")]
     CurrentDirectory(#[from] std::io::Error),
+
+    #[error("failed to {action} `{path}`: {source}")]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error(transparent)]
     Run(#[from] run::RunError),
@@ -66,6 +76,10 @@ impl AgentStatus {
     fn sends_pointer(self) -> bool {
         matches!(self, Self::Blocked | Self::Done)
     }
+
+    fn drains_outbox(self) -> bool {
+        matches!(self, Self::Idle | Self::Done)
+    }
 }
 
 pub fn hook_command() -> Result<(), HookError> {
@@ -92,6 +106,11 @@ pub fn on_agent_status(
     };
 
     run::append_event(&matched.run.dir, &raw_event)?;
+    if event.data.agent_status.drains_outbox() {
+        drain_outbox(&matched.run.dir, &matched.worker_name, |text| {
+            msg::deliver_queued_message(&matched.run, &matched.worker_name, text, herdr)
+        })?;
+    }
     if !event.data.agent_status.sends_pointer() {
         return Ok(());
     }
@@ -111,6 +130,115 @@ pub fn on_agent_status(
         report_path.display()
     );
     herdr.pane_run(&matched.run.state.god_pane_id, &pointer)?;
+    Ok(())
+}
+
+fn drain_outbox<E, F>(run_dir: &Path, target: &str, mut deliver: F) -> Result<(), HookError>
+where
+    E: Display,
+    F: FnMut(&str) -> Result<(), E>,
+{
+    for path in queued_message_paths(run_dir, target)? {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                append_delivery_event(
+                    run_dir,
+                    "delivery_failed",
+                    target,
+                    &path,
+                    Some(&error.to_string()),
+                )?;
+                break;
+            }
+        };
+
+        if let Err(error) = deliver(&text) {
+            append_delivery_event(
+                run_dir,
+                "delivery_failed",
+                target,
+                &path,
+                Some(&error.to_string()),
+            )?;
+            break;
+        }
+
+        if let Err(error) = std::fs::remove_file(&path) {
+            append_delivery_event(
+                run_dir,
+                "delivery_failed",
+                target,
+                &path,
+                Some(&error.to_string()),
+            )?;
+            break;
+        }
+        append_delivery_event(run_dir, "delivered", target, &path, None)?;
+    }
+    Ok(())
+}
+
+fn queued_message_paths(run_dir: &Path, target: &str) -> Result<Vec<PathBuf>, HookError> {
+    let outbox_dir = run_dir.join("outbox").join(target);
+    let entries = match std::fs::read_dir(&outbox_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(HookError::Io {
+                action: "read message outbox",
+                path: outbox_dir,
+                source,
+            })
+        }
+    };
+
+    let mut messages = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| HookError::Io {
+            action: "read message outbox entry",
+            path: outbox_dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|source| HookError::Io {
+            action: "inspect queued message",
+            path: path.clone(),
+            source,
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(sequence) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".msg"))
+            .and_then(|sequence| sequence.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        messages.push((sequence, path));
+    }
+    messages.sort_unstable();
+    Ok(messages.into_iter().map(|(_, path)| path).collect())
+}
+
+fn append_delivery_event(
+    run_dir: &Path,
+    kind: &str,
+    target: &str,
+    path: &Path,
+    error: Option<&str>,
+) -> Result<(), HookError> {
+    let mut event = json!({
+        "event": kind,
+        "target": target,
+        "path": path.display().to_string(),
+    });
+    if let Some(error) = error {
+        event["error"] = Value::String(error.to_owned());
+    }
+    run::append_event(run_dir, &event)?;
     Ok(())
 }
 
@@ -141,7 +269,6 @@ mod tests {
         GodSpec, RunLifecycle, RunState, TeamSpec, Topology, WorkerLifecycle, WorkerRunState,
         WorkerSpec,
     };
-    use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -191,7 +318,7 @@ mod tests {
             fs::write(
                 &binary,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '{{\"result\":{{\"type\":\"ok\"}}}}'\n",
+                    "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nif [ \"$1\" = 'agent' ] && [ \"$2\" = 'wait' ]; then\n  printf '{{\"event\":\"pane.agent_status_changed\",\"data\":{{\"pane_id\":\"%s\",\"agent_status\":\"working\"}}}}\\n' \"$3\"\nfi\n",
                     log.display()
                 ),
             )
@@ -268,6 +395,170 @@ mod tests {
                 "state_labels": {"phase": "verification"}
             }
         })
+    }
+
+    fn queue_message(run: &RunBoard, sequence: u64, text: &str) -> PathBuf {
+        let outbox = run.dir.join("outbox/builder");
+        fs::create_dir_all(&outbox).expect("create fixture outbox");
+        let path = outbox.join(format!("{sequence:020}.msg"));
+        fs::write(&path, text).expect("write queued fixture message");
+        path
+    }
+
+    fn read_events(run: &RunBoard) -> Vec<Value> {
+        fs::read_to_string(run.dir.join("inbox/events.jsonl"))
+            .expect("read durable event log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse durable event"))
+            .collect()
+    }
+
+    #[test]
+    fn only_idle_and_done_statuses_drain_outboxes() {
+        assert!(AgentStatus::Idle.drains_outbox());
+        assert!(AgentStatus::Done.drains_outbox());
+        assert!(!AgentStatus::Working.drains_outbox());
+        assert!(!AgentStatus::Blocked.drains_outbox());
+        assert!(!AgentStatus::Unknown.drains_outbox());
+    }
+
+    #[test]
+    fn drain_delivers_exact_content_in_sequence_order_then_removes_and_audits() {
+        let temp = TempDir::new();
+        let run = fixture_run(temp.path(), "worker-pane");
+        let later = queue_message(&run, 10, "second\nline");
+        let earlier = queue_message(&run, 2, "first");
+        let mut delivered = Vec::new();
+
+        drain_outbox(&run.dir, "builder", |text| {
+            delivered.push(text.to_owned());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .expect("drain queued messages");
+
+        assert_eq!(delivered, ["first", "second\nline"]);
+        assert!(!earlier.exists());
+        assert!(!later.exists());
+        let events = read_events(&run);
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| event["event"] == "delivered" && event["target"] == "builder"));
+        assert!(events[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("00000000000000000002.msg"));
+        assert!(events[1]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("00000000000000000010.msg"));
+    }
+
+    #[test]
+    fn failed_delivery_keeps_queue_logs_failure_and_stops_before_later_messages() {
+        let temp = TempDir::new();
+        let run = fixture_run(temp.path(), "worker-pane");
+        let first = queue_message(&run, 1, "first");
+        let second = queue_message(&run, 2, "second");
+        let mut attempts = Vec::new();
+
+        drain_outbox(&run.dir, "builder", |text| {
+            attempts.push(text.to_owned());
+            Err::<(), _>("delivery refused")
+        })
+        .expect("record failed drain without aborting the hook");
+
+        assert_eq!(attempts, ["first"]);
+        assert!(first.exists());
+        assert!(second.exists());
+        let events = read_events(&run);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "delivery_failed");
+        assert_eq!(events[0]["target"], "builder");
+        assert_eq!(events[0]["error"], "delivery refused");
+        assert!(events[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("00000000000000000001.msg"));
+    }
+
+    #[test]
+    fn done_drains_through_verified_delivery_before_injecting_report_pointer() {
+        let temp = TempDir::new();
+        let run = fixture_run(temp.path(), "worker-pane");
+        let first = queue_message(&run, 1, "first");
+        let second = queue_message(&run, 2, "second");
+        let fake = FakeHerdr::new(&temp);
+
+        on_agent_status(
+            &event("worker-pane", "done").to_string(),
+            temp.path(),
+            &fake.client,
+        )
+        .expect("drain done worker outbox");
+
+        assert!(!first.exists());
+        assert!(!second.exists());
+        let argv = fake.argv();
+        let call_position = |expected: &[&str]| {
+            argv.windows(expected.len())
+                .position(|window| {
+                    window
+                        .iter()
+                        .map(String::as_str)
+                        .eq(expected.iter().copied())
+                })
+                .expect("expected Herdr call")
+        };
+        let report_path = run.dir.join("inbox/builder.md");
+        let pointer = format!(
+            "[team alpha] builder is done — report: {}",
+            report_path.display()
+        );
+        let first_delivery = call_position(&["pane", "run", "worker-pane", "first"]);
+        let second_delivery = call_position(&["pane", "run", "worker-pane", "second"]);
+        let pointer_delivery = call_position(&["pane", "run", "god-pane", &pointer]);
+        assert!(first_delivery < second_delivery);
+        assert!(second_delivery < pointer_delivery);
+        assert_eq!(
+            argv.windows(2)
+                .filter(|window| window[0] == "agent" && window[1] == "wait")
+                .count(),
+            2
+        );
+        let events = read_events(&run);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["event"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["pane_agent_status_changed", "delivered", "delivered"]
+        );
+    }
+
+    #[test]
+    fn working_blocked_and_unknown_flips_leave_queued_messages_untouched() {
+        for status in ["working", "blocked", "unknown"] {
+            let temp = TempDir::new();
+            let run = fixture_run(temp.path(), "worker-pane");
+            let queued = queue_message(&run, 1, "queued message");
+            let fake = FakeHerdr::new(&temp);
+
+            on_agent_status(
+                &event("worker-pane", status).to_string(),
+                temp.path(),
+                &fake.client,
+            )
+            .expect("process non-draining status");
+
+            assert!(queued.exists(), "{status} must not drain the outbox");
+            if fake.log.exists() {
+                assert!(!fs::read_to_string(&fake.log)
+                    .expect("read fake Herdr log")
+                    .lines()
+                    .any(|argument| argument == "queued message"));
+            }
+        }
     }
 
     #[test]
