@@ -1,9 +1,8 @@
 //! Name-addressed worker messaging and deferred delivery from `docs/spec.md` section 11.
 
-use crate::herdr::{HerdrClient, HerdrError, PaneInfo, WaitOutcome};
+use crate::herdr::{HerdrApi, HerdrClient, HerdrError, WaitOutcome};
 use crate::launcher::{
-    conservative_adopted_launcher, default_launcher_table, launcher_entry, load_launcher_table,
-    LauncherError,
+    conservative_adopted_launcher, launcher_entry, load_from_env, LauncherError,
 };
 use crate::run::{
     list_active_runs, load_hook_metadata, load_run, save_run_with_hook, RunBoard, RunError,
@@ -112,41 +111,6 @@ enum MessageOutcome {
     Enqueued(PathBuf),
 }
 
-trait HerdrApi {
-    fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError>;
-    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError>;
-    fn agent_wait(
-        &self,
-        pane_id: &str,
-        status: &str,
-        timeout: Duration,
-    ) -> Result<WaitOutcome, HerdrError>;
-    fn notification_show(&self, title: &str, body: &str, sound: &str) -> Result<(), HerdrError>;
-}
-
-impl HerdrApi for HerdrClient {
-    fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
-        HerdrClient::pane_get(self, pane_id)
-    }
-
-    fn notification_show(&self, title: &str, body: &str, sound: &str) -> Result<(), HerdrError> {
-        HerdrClient::notification_show(self, title, body, sound)
-    }
-
-    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
-        HerdrClient::pane_run(self, pane_id, input)
-    }
-
-    fn agent_wait(
-        &self,
-        pane_id: &str,
-        status: &str,
-        timeout: Duration,
-    ) -> Result<WaitOutcome, HerdrError> {
-        HerdrClient::agent_wait(self, pane_id, status, timeout)
-    }
-}
-
 pub fn msg_command(args: &[String]) -> Result<(), MsgError> {
     let arguments = parse_msg_arguments(args)?;
     if arguments.attention && arguments.target != "god" {
@@ -162,11 +126,11 @@ pub fn msg_command(args: &[String]) -> Result<(), MsgError> {
     Ok(())
 }
 
-pub(crate) fn deliver_queued_message(
+pub(crate) fn deliver_queued_message<H: HerdrApi>(
     run: &RunBoard,
     target_name: &str,
     text: &str,
-    herdr: &HerdrClient,
+    herdr: &H,
 ) -> Result<(), MsgError> {
     let target = resolve_target(run, target_name)?;
     let agent = target
@@ -300,10 +264,7 @@ fn newest_active_run(state_dir: &Path) -> Result<RunBoard, MsgError> {
 }
 
 fn load_launchers() -> Result<LauncherTable, MsgError> {
-    match env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
-        Some(config_dir) => Ok(load_launcher_table(Path::new(&config_dir))?),
-        None => Ok(default_launcher_table()),
-    }
+    Ok(load_from_env()?)
 }
 
 fn send_message<H: HerdrApi>(
@@ -568,12 +529,15 @@ fn consume_control_string(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr::{
+        test_support::{FakeCall as Call, FakeHerdr},
+        PaneInfo,
+    };
     use crate::launcher::default_launcher_table;
     use crate::types::{
         GodSpec, RunState, TeamSpec, Topology, WorkerLifecycle, WorkerRunState, WorkerSpec,
     };
-    use std::cell::RefCell;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -602,92 +566,32 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Call {
-        PaneGet(String),
-        PaneRun(String, String),
-        AgentWait(String, String),
-        Notification(String, String, String),
+    trait FakeCalls {
+        fn typed_calls(&self) -> Vec<Call>;
     }
-
-    struct FakeHerdr {
-        agent: String,
-        status: Option<String>,
-        waits: RefCell<VecDeque<WaitOutcome>>,
-        calls: RefCell<Vec<Call>>,
-    }
-
-    impl FakeHerdr {
-        fn new(
-            agent: &str,
-            status: Option<&str>,
-            waits: impl IntoIterator<Item = WaitOutcome>,
-        ) -> Self {
-            Self {
-                agent: agent.to_owned(),
-                status: status.map(str::to_owned),
-                waits: RefCell::new(waits.into_iter().collect()),
-                calls: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn calls(&self) -> Vec<Call> {
-            self.calls.borrow().clone()
+    impl FakeCalls for FakeHerdr {
+        fn typed_calls(&self) -> Vec<Call> {
+            self.typed_calls.borrow().clone()
         }
     }
 
-    impl HerdrApi for FakeHerdr {
-        fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
-            self.calls
-                .borrow_mut()
-                .push(Call::PaneGet(pane_id.to_owned()));
-            Ok(PaneInfo {
-                pane_id: pane_id.to_owned(),
-                workspace_id: "workspace".to_owned(),
-                agent: Some(self.agent.clone()),
-                agent_id: Some("session".to_owned()),
-                agent_session: None,
-                agent_status: self.status.clone(),
-                cwd: None,
-            })
-        }
-
-        fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
-            self.calls
-                .borrow_mut()
-                .push(Call::PaneRun(pane_id.to_owned(), input.to_owned()));
-            Ok(())
-        }
-
-        fn agent_wait(
-            &self,
-            pane_id: &str,
-            status: &str,
-            _timeout: Duration,
-        ) -> Result<WaitOutcome, HerdrError> {
-            self.calls
-                .borrow_mut()
-                .push(Call::AgentWait(pane_id.to_owned(), status.to_owned()));
-            Ok(self
-                .waits
-                .borrow_mut()
-                .pop_front()
-                .unwrap_or(WaitOutcome::Reached))
-        }
-
-        fn notification_show(
-            &self,
-            title: &str,
-            body: &str,
-            sound: &str,
-        ) -> Result<(), HerdrError> {
-            self.calls.borrow_mut().push(Call::Notification(
-                title.to_owned(),
-                body.to_owned(),
-                sound.to_owned(),
-            ));
-            Ok(())
-        }
+    fn fake_herdr(
+        agent: &str,
+        status: Option<&str>,
+        waits: impl IntoIterator<Item = WaitOutcome>,
+    ) -> FakeHerdr {
+        let fake = FakeHerdr::default();
+        *fake.pane.borrow_mut() = Some(PaneInfo {
+            pane_id: "worker-pane".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            agent: Some(agent.to_owned()),
+            agent_id: Some("session".to_owned()),
+            agent_session: None,
+            agent_status: status.map(str::to_owned),
+            cwd: None,
+        });
+        *fake.waits.borrow_mut() = waits.into_iter().collect();
+        fake
     }
 
     fn conservative_table() -> LauncherTable {
@@ -764,14 +668,14 @@ mod tests {
     fn queues_midturn_target_delivers_immediately_and_verifies() {
         let temp = TempDir::new();
         let run = fixture_run(temp.path(), "builder", "claude");
-        let herdr = FakeHerdr::new("claude", Some("working"), [WaitOutcome::Reached]);
+        let herdr = fake_herdr("claude", Some("working"), [WaitOutcome::Reached]);
 
         let outcome = send_message(&run, &default_launcher_table(), "builder", "hello", &herdr)
             .expect("deliver message");
 
         assert_eq!(outcome, MessageOutcome::Delivered);
         assert_eq!(
-            herdr.calls(),
+            herdr.typed_calls(),
             [
                 Call::PaneRun("worker-pane".to_owned(), "hello".to_owned()),
                 Call::AgentWait("worker-pane".to_owned(), "working".to_owned()),
@@ -784,14 +688,14 @@ mod tests {
         let temp = TempDir::new();
         let mut run = fixture_run(temp.path(), "borrowed", "opencode");
         run.state.workers.get_mut("borrowed").unwrap().adopted = true;
-        let herdr = FakeHerdr::new("opencode", Some("idle"), [WaitOutcome::Reached]);
+        let herdr = fake_herdr("opencode", Some("idle"), [WaitOutcome::Reached]);
 
         let outcome = send_message(&run, &default_launcher_table(), "borrowed", "hello", &herdr)
             .expect("synthetic adopted policy should support msg");
 
         assert_eq!(outcome, MessageOutcome::Delivered);
         assert_eq!(
-            herdr.calls(),
+            herdr.typed_calls(),
             [
                 Call::PaneGet("worker-pane".to_owned()),
                 Call::PaneRun("worker-pane".to_owned(), "hello".to_owned()),
@@ -804,7 +708,7 @@ mod tests {
     fn non_queueing_working_target_writes_increasing_outbox_files_without_delivery() {
         let temp = TempDir::new();
         let run = fixture_run(temp.path(), "builder", "codex");
-        let herdr = FakeHerdr::new("codex", Some("working"), []);
+        let herdr = fake_herdr("codex", Some("working"), []);
 
         let first = send_message(&run, &conservative_table(), "builder", "first", &herdr)
             .expect("queue first message");
@@ -828,7 +732,7 @@ mod tests {
         assert_eq!(fs::read_to_string(first_path).unwrap(), "first");
         assert_eq!(fs::read_to_string(second_path).unwrap(), "second");
         assert_eq!(
-            herdr.calls(),
+            herdr.typed_calls(),
             [
                 Call::PaneGet("worker-pane".to_owned()),
                 Call::PaneGet("worker-pane".to_owned()),
@@ -841,7 +745,7 @@ mod tests {
         for status in [Some("idle"), Some("done"), Some("unknown"), None] {
             let temp = TempDir::new();
             let run = fixture_run(temp.path(), "builder", "codex");
-            let herdr = FakeHerdr::new("codex", status, [WaitOutcome::Reached]);
+            let herdr = fake_herdr("codex", status, [WaitOutcome::Reached]);
 
             assert_eq!(
                 send_message(&run, &conservative_table(), "builder", "ready", &herdr,)
@@ -849,7 +753,7 @@ mod tests {
                 MessageOutcome::Delivered
             );
             assert!(herdr
-                .calls()
+                .typed_calls()
                 .iter()
                 .any(|call| matches!(call, Call::PaneRun(_, text) if text == "ready")));
         }
@@ -859,7 +763,7 @@ mod tests {
     fn timed_out_submission_gets_one_empty_retry_and_second_verification() {
         let temp = TempDir::new();
         let run = fixture_run(temp.path(), "builder", "codex");
-        let herdr = FakeHerdr::new(
+        let herdr = fake_herdr(
             "codex",
             Some("idle"),
             [WaitOutcome::TimedOut, WaitOutcome::Reached],
@@ -869,7 +773,7 @@ mod tests {
             .expect("deliver with retry");
 
         assert_eq!(
-            herdr.calls(),
+            herdr.typed_calls(),
             [
                 Call::PaneGet("worker-pane".to_owned()),
                 Call::PaneRun("worker-pane".to_owned(), "hello".to_owned()),
@@ -889,7 +793,7 @@ mod tests {
 
         let temp = TempDir::new();
         let run = fixture_run(temp.path(), "builder", "claude");
-        let herdr = FakeHerdr::new("claude", Some("working"), [WaitOutcome::Reached]);
+        let herdr = fake_herdr("claude", Some("working"), [WaitOutcome::Reached]);
         send_message(
             &run,
             &default_launcher_table(),
@@ -898,7 +802,7 @@ mod tests {
             &herdr,
         )
         .expect("deliver sanitized message");
-        assert!(herdr.calls().contains(&Call::PaneRun(
+        assert!(herdr.typed_calls().contains(&Call::PaneRun(
             "worker-pane".to_owned(),
             "helloworld".to_owned()
         )));
@@ -938,7 +842,7 @@ mod tests {
             fixture_run(temp.path(), "builder", "claude").state,
         )
         .expect("persist attention fixture");
-        let herdr = FakeHerdr::new("claude", Some("working"), []);
+        let herdr = fake_herdr("claude", Some("working"), []);
 
         request_attention_from_pane(&run, "please review", "worker-pane", &herdr)
             .expect("first attention request");
@@ -947,7 +851,7 @@ mod tests {
 
         assert_eq!(
             herdr
-                .calls()
+                .typed_calls()
                 .iter()
                 .filter(|call| matches!(call, Call::Notification(..)))
                 .count(),

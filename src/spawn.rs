@@ -1,8 +1,8 @@
 //! Team preflight and worker launch flow from `docs/spec.md` section 4.
 
 use crate::agents_md::{render_agents_md, AgentsMdError};
-use crate::herdr::{HerdrClient, HerdrError, PaneInfo, WaitOutcome, WorkspaceRef, WorktreeRef};
-use crate::launcher::{default_launcher_table, launcher_entry, load_launcher_table, LauncherError};
+use crate::herdr::{HerdrApi, HerdrClient, HerdrError, PaneInfo, WaitOutcome};
+use crate::launcher::{launcher_entry, load_from_env, LauncherError};
 use crate::run::{create_run, save_run, RunBoard, RunError};
 use crate::spec::{
     load_team_spec, spawn_command as dry_run_command, team_spec_from_agents, validate_team_spec,
@@ -119,51 +119,6 @@ struct SpawnContext {
     launchers: LauncherTable,
     state_dir: PathBuf,
     god_pane_id: String,
-}
-
-pub(crate) trait HerdrApi {
-    fn health_check(&self) -> Result<(), HerdrError>;
-    fn worktree_create(&self, repo: &Path, branch: &str) -> Result<WorktreeRef, HerdrError>;
-    fn workspace_create(&self, cwd: &Path, label: &str) -> Result<WorkspaceRef, HerdrError>;
-    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError>;
-    fn agent_wait(
-        &self,
-        pane_id: &str,
-        status: &str,
-        timeout: Duration,
-    ) -> Result<WaitOutcome, HerdrError>;
-    fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError>;
-}
-
-impl HerdrApi for HerdrClient {
-    fn health_check(&self) -> Result<(), HerdrError> {
-        self.agent_list().map(|_| ())
-    }
-
-    fn worktree_create(&self, repo: &Path, branch: &str) -> Result<WorktreeRef, HerdrError> {
-        HerdrClient::worktree_create(self, repo, branch)
-    }
-
-    fn workspace_create(&self, cwd: &Path, label: &str) -> Result<WorkspaceRef, HerdrError> {
-        self.workspace_create(cwd, label)
-    }
-
-    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
-        HerdrClient::pane_run(self, pane_id, input)
-    }
-
-    fn agent_wait(
-        &self,
-        pane_id: &str,
-        status: &str,
-        timeout: Duration,
-    ) -> Result<WaitOutcome, HerdrError> {
-        HerdrClient::agent_wait(self, pane_id, status, timeout)
-    }
-
-    fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
-        self.pane_get(pane_id)
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -285,10 +240,7 @@ fn load_context(
         ));
     }
 
-    let launchers = match env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
-        Some(path) => load_launcher_table(&absolutize(Path::new(&path), current_dir))?,
-        None => default_launcher_table(),
-    };
+    let launchers = load_from_env()?;
 
     let (mut spec, spec_base) = match agents {
         Some(agents) => (
@@ -943,9 +895,11 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::herdr::test_support::FakeHerdr;
+    use crate::launcher::default_launcher_table;
     use crate::run::load_run;
     use crate::types::{GodSpec, Topology};
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -976,153 +930,6 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeHerdr {
-        calls: RefCell<Vec<String>>,
-        workspace_count: Cell<usize>,
-        worktree_count: Cell<usize>,
-        protocols_state_dir: RefCell<Option<PathBuf>>,
-        protocol_snapshots: RefCell<Vec<BTreeMap<PathBuf, String>>>,
-        fail_launch_pane: RefCell<Option<String>>,
-        fail_worktree_branch: RefCell<Option<String>>,
-        fail_health: Cell<bool>,
-        omit_agent: Cell<bool>,
-        omit_agent_id: Cell<bool>,
-        wait_timeouts: Cell<usize>,
-        agent_id_delays: Cell<usize>,
-        require_empty_submit: Cell<bool>,
-        empty_submit_seen: Cell<bool>,
-    }
-
-    impl FakeHerdr {
-        fn calls(&self) -> Vec<String> {
-            self.calls.borrow().clone()
-        }
-
-        fn protocol_snapshots(&self) -> Vec<BTreeMap<PathBuf, String>> {
-            self.protocol_snapshots.borrow().clone()
-        }
-
-        fn command_error() -> HerdrError {
-            HerdrError::Command {
-                argv: "fake pane run".to_owned(),
-                status: Some(1),
-                stderr: "injected failure".to_owned(),
-            }
-        }
-    }
-
-    impl HerdrApi for FakeHerdr {
-        fn health_check(&self) -> Result<(), HerdrError> {
-            self.calls.borrow_mut().push("health_check".to_owned());
-            if self.fail_health.get() {
-                return Err(Self::command_error());
-            }
-            Ok(())
-        }
-
-        fn worktree_create(&self, repo: &Path, branch: &str) -> Result<WorktreeRef, HerdrError> {
-            self.calls
-                .borrow_mut()
-                .push(format!("worktree_create:{branch}:{}", repo.display()));
-            if self.fail_worktree_branch.borrow().as_deref() == Some(branch) {
-                return Err(Self::command_error());
-            }
-            let number = self.worktree_count.get() + 1;
-            self.worktree_count.set(number);
-            Ok(WorktreeRef {
-                path: repo.join(format!("worktree-{number}")),
-            })
-        }
-
-        fn workspace_create(&self, cwd: &Path, label: &str) -> Result<WorkspaceRef, HerdrError> {
-            let number = self.workspace_count.get() + 1;
-            self.workspace_count.set(number);
-            self.calls
-                .borrow_mut()
-                .push(format!("workspace_create:{label}:{}", cwd.display()));
-            Ok(WorkspaceRef {
-                workspace_id: format!("workspace-{number}"),
-                pane_id: format!("pane-{number}"),
-            })
-        }
-
-        fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
-            if input.starts_with('\'') {
-                if let Some(state_dir) = self.protocols_state_dir.borrow().as_ref() {
-                    let snapshot = read_protocol_snapshot(state_dir);
-                    assert!(!snapshot.is_empty(), "protocols must predate agent launch");
-                    self.protocol_snapshots.borrow_mut().push(snapshot);
-                }
-            }
-            self.calls
-                .borrow_mut()
-                .push(format!("pane_run:{pane_id}:{input}"));
-            if self.fail_launch_pane.borrow().as_deref() == Some(pane_id) && input.starts_with('\'')
-            {
-                return Err(Self::command_error());
-            }
-            if input.is_empty() {
-                self.empty_submit_seen.set(true);
-            }
-            Ok(())
-        }
-
-        fn agent_wait(
-            &self,
-            pane_id: &str,
-            status: &str,
-            _timeout: Duration,
-        ) -> Result<WaitOutcome, HerdrError> {
-            self.calls
-                .borrow_mut()
-                .push(format!("agent_wait:{pane_id}:{status}"));
-            if self.wait_timeouts.get() > 0 {
-                self.wait_timeouts.set(self.wait_timeouts.get() - 1);
-                return Ok(WaitOutcome::TimedOut);
-            }
-            if status == "working"
-                && self.require_empty_submit.get()
-                && !self.empty_submit_seen.get()
-            {
-                return Ok(WaitOutcome::TimedOut);
-            }
-            Ok(WaitOutcome::Reached)
-        }
-
-        fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
-            self.calls.borrow_mut().push(format!("pane_get:{pane_id}"));
-            let delayed = self.agent_id_delays.get() > 0;
-            if delayed {
-                self.agent_id_delays.set(self.agent_id_delays.get() - 1);
-            }
-            let agent_detected = !self.omit_agent.get();
-            Ok(PaneInfo {
-                pane_id: pane_id.to_owned(),
-                workspace_id: pane_id.replace("pane", "workspace"),
-                agent: agent_detected.then(|| {
-                    if pane_id == "pane-1" {
-                        "claude".to_owned()
-                    } else {
-                        "codex".to_owned()
-                    }
-                }),
-                agent_id: (agent_detected && !self.omit_agent_id.get() && !delayed)
-                    .then(|| format!("agent-session-{pane_id}")),
-                agent_session: (agent_detected && !self.omit_agent_id.get() && !delayed).then(
-                    || crate::herdr::AgentSession {
-                        source: "herdr:test".to_owned(),
-                        agent: "claude".to_owned(),
-                        kind: "id".to_owned(),
-                        value: format!("agent-session-{pane_id}"),
-                    },
-                ),
-                agent_status: Some("idle".to_owned()),
-                cwd: None,
-            })
         }
     }
 
