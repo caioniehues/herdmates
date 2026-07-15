@@ -88,6 +88,26 @@ cargo build --release
 herdr plugin link .
 ```
 
+### Upgrade or relink after manifest changes
+
+Herdr caches `herdr-plugin.toml` when a plugin is linked. After **any** manifest
+change, `herdr plugin disable` followed by `herdr plugin enable` still serves
+the cached manifest. The failure signature is a stale reported version and new
+events or panes that are missing or never fire.
+
+Force Herdr to read the manifest again:
+
+```bash
+herdr plugin unlink caioniehues.agent-team
+herdr plugin link /absolute/path/to/herdr-agent-team
+```
+
+Use that relink as the mandatory post-release smoke test, then read the linked
+plugin's reported version back and confirm it matches the release. This is a
+documentation workaround for current Herdr cache invalidation; if upstream
+later reloads changed manifests automatically, retain it as historical release
+guidance.
+
 For direct terminal use, put the linked or installed binary on `PATH` once:
 
 ```bash
