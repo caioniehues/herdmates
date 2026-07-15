@@ -12,6 +12,38 @@ Last updated 2026-07-15 (post research wave + docs overhaul).
 3. `CONTEXT.md` — vocabulary. `docs/agents/research.md` — research rules
    (ctx7 first; never assume; verify inherited claims).
 
+## Skills to invoke (coordinator session)
+
+Invoke these Claude Code skills at the named moments — don't rediscover them:
+
+- **`/planning-with-files`** — FIRST action of any wave/multi-step session:
+  restores `task_plan.md`/`findings.md`/`progress.md` context, then keep the
+  plan current per phase. Rewrite `task_plan.md` for the new wave (old
+  completed plans get overwritten, not appended).
+- **`/herdr`** — before any pane/workspace/wait/`pane run` operation:
+  current CLI contract (check `HERDR_ENV=1`, read IDs from JSON, `--no-focus`
+  splits, paste-Enter nudge = empty `pane run ""`). Pair with
+  **`/herdr-plugins`** when a flow touches other installed plugins
+  (worktree.created races, stray shell workspaces).
+- **`skills/god/SKILL.md`** (this repo, shipped v0.8.0) — the coordination
+  playbook: wait/inbox/report/msg verbs with exit codes, brief-as-contract
+  template, monitoring discipline, failure triage, merge/release flow. It is
+  the distilled form of the memory rules; follow it over ad-hoc habit.
+- **`/find-docs`** (ctx7) — before implementing against ANY external
+  API/repo (herdr upstream verbs, crates). Never train-data guessing;
+  upstream source second, live behavior decisive.
+- **`/code-review`** — coordinator-side review of a branch/PR when a pane
+  reviewer isn't warranted; for worker PRs prefer a claude pane reviewer
+  (memory rule: no Agent-tool teammates in this repo).
+- **`/verify`** — before committing any coordinator-authored nontrivial
+  change: drive the real flow (the post-release `plugin unlink`+`link` IS
+  the release smoke test).
+- Workers are NOT skill-driven: they get briefs (`briefs/*.md`) + generated
+  worker protocols. Skills above are for the god session only. Delegation
+  substrate: this plugin's `spawn`/`msg` + herdr panes — for implementation
+  work do NOT use `/implement`/`/tdd` inline; the coordinator never writes
+  code (memory rule delegate-to-codex-workers).
+
 ## State
 
 - **v1 SHIPPED + PUBLISHED** (2026-07-15, Caio's go-ahead):
