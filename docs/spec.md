@@ -173,6 +173,14 @@ no-op with a clear message.
   turn completion: upstream can report background-wait panes as `idle`/`done`
   while work remains (`ogulcancelik/herdr#1217`). The durable report and its
   sentinel remain the completion truth.
+- Manifest registrations are cached at link time. After any
+  `herdr-plugin.toml` change, `herdr plugin disable` plus `enable` is
+  insufficient: a stale reported version and missing/non-firing events or panes
+  mean Herdr is still serving the cached manifest. Run
+  `herdr plugin unlink caioniehues.agent-team`, then
+  `herdr plugin link <absolute-plugin-path>`. Every post-release smoke test must
+  relink and read the reported version back. If upstream later invalidates this
+  cache automatically, this remains historical release guidance.
 
 ## 6. `team status` / `team kill`
 
