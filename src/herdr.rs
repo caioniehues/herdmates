@@ -482,7 +482,30 @@ impl HerdrApi for HerdrClient {
 pub(crate) mod test_support {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
-    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard};
+
+    pub(crate) struct BriefOrder {
+        remaining: Mutex<VecDeque<String>>,
+        changed: Condvar,
+    }
+
+    impl BriefOrder {
+        pub fn new(panes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            Self {
+                remaining: Mutex::new(panes.into_iter().map(Into::into).collect()),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn wait_turn(&self, pane_id: &str) {
+            let mut remaining = self.remaining.lock().expect("brief order lock");
+            while remaining.front().map(String::as_str) != Some(pane_id) {
+                remaining = self.changed.wait(remaining).expect("brief order wait");
+            }
+            remaining.pop_front();
+            self.changed.notify_all();
+        }
+    }
 
     #[derive(Default)]
     pub(crate) struct SyncCell<T>(Mutex<T>);
@@ -530,6 +553,7 @@ pub(crate) mod test_support {
         pub fail_worktree_branch: SyncRefCell<Option<String>>,
         pub missing_panes: SyncRefCell<BTreeSet<String>>,
         pub launch_barrier: SyncRefCell<Option<Arc<Barrier>>>,
+        pub brief_order: SyncRefCell<Option<Arc<BriefOrder>>>,
         pub fail_health: SyncCell<bool>,
         pub omit_agent: SyncCell<bool>,
         pub omit_agent_id: SyncCell<bool>,
@@ -637,6 +661,12 @@ pub(crate) mod test_support {
                 let barrier = self.launch_barrier.borrow().clone();
                 if let Some(barrier) = barrier {
                     barrier.wait();
+                }
+            }
+            if input.starts_with("Read your brief") {
+                let order = self.brief_order.borrow().clone();
+                if let Some(order) = order {
+                    order.wait_turn(pane_id);
                 }
             }
             self.calls

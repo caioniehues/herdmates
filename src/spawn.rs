@@ -1105,7 +1105,7 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::test_support::FakeHerdr;
+    use crate::herdr::test_support::{BriefOrder, FakeHerdr};
     use crate::launcher::default_launcher_table;
     use crate::run::load_run;
     use crate::types::{GodSpec, Topology};
@@ -1987,6 +1987,7 @@ mod tests {
         fs::write(&authored_agents, "# Authored repository instructions\n")
             .expect("write authored AGENTS.md");
         let fake = FakeHerdr::default();
+        *fake.brief_order.borrow_mut() = Some(Arc::new(BriefOrder::new(["pane-2", "pane-1"])));
         let spec = team(
             temp.path(),
             vec![
@@ -2016,21 +2017,24 @@ mod tests {
             .into_iter()
             .filter_map(|call| {
                 let (_, path) = call.split_once(marker)?;
-                Some(PathBuf::from(path.strip_suffix('.').unwrap_or(path)))
+                let path = PathBuf::from(path.strip_suffix('.').unwrap_or(path));
+                let worker_name = path.file_stem()?.to_str()?.to_owned();
+                Some((worker_name, path))
             })
-            .collect::<Vec<_>>();
+            .collect::<BTreeMap<_, _>>();
         assert_eq!(
             protocol_paths.len(),
             2,
             "every launcher mode needs a pointer"
         );
-        assert_ne!(protocol_paths[0], protocol_paths[1]);
+        assert_ne!(
+            protocol_paths["pointer-worker"],
+            protocol_paths["native-worker"]
+        );
         let running_binary = env::current_exe().expect("resolve test executable");
 
-        for (path, worker_name) in protocol_paths
-            .iter()
-            .zip(["pointer-worker", "native-worker"])
-        {
+        for worker_name in ["pointer-worker", "native-worker"] {
+            let path = &protocol_paths[worker_name];
             assert!(path.is_absolute());
             assert!(path.starts_with(&run.dir));
             let protocol = fs::read_to_string(path).expect("read generated protocol");
