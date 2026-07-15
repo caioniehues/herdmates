@@ -265,6 +265,15 @@ feature.
 7. **Direct socket backend behind `HerdrApi`** (ADR-0011): `SocketClient`
    adapter; board + `team wait` collectors swap to snapshot/subscribe with
    no interface change; CLI stays default/fallback.
+
+   Selection is explicit: set `HERDR_TEAM_BACKEND=socket`. The adapter uses
+   only the public NDJSON socket named by `HERDR_SOCKET_PATH`, validates a
+   protocol-16 `ping` handshake and the checked-in schema baseline, and falls
+   back cleanly to the CLI collector if the path is absent, connection fails,
+   or the handshake is unsupported. Mutating `HerdrApi` calls always delegate
+   to the CLI backend. Frames are capped at 1 MiB and response IDs/result
+   shapes are validated. Set `HERDR_TEAM_SOCKET_TRACE=<path>` for redacted
+   JSONL diagnostics (request ID, method, result type, latency, and error only).
 8. **Bounded previews + conservative restart** (broadcast moved to the god
    toolkit):
    `team msg --all` loops run members with per-target results; board
