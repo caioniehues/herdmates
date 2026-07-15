@@ -2,7 +2,9 @@
 
 use crate::herdr::{HerdrApi, HerdrClient, HerdrError, PaneInfo};
 use crate::launcher::{conservative_adopted_launcher, load_from_env, LauncherError};
-use crate::run::{create_run, list_active_runs, load_run, save_run, RunBoard, RunError};
+use crate::run::{
+    create_run, list_active_runs, load_run, update_run_with_hook, RunBoard, RunError,
+};
 use crate::spawn::{
     adoption_prompt, is_safe_worker_filename, submit_worker_prompt, worker_protocol_path,
     write_worker_protocol, SpawnError,
@@ -101,6 +103,14 @@ enum RunTarget {
 struct AdoptOutcome {
     run: RunBoard,
     unknown_agent: Option<String>,
+    disposition: AdoptDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptDisposition {
+    Adopted,
+    Recovered,
+    NothingToDo,
 }
 
 pub fn adopt_command(args: &[String]) -> Result<(), AdoptError> {
@@ -148,10 +158,20 @@ pub fn adopt_command(args: &[String]) -> Result<(), AdoptError> {
     if let Some(agent) = outcome.unknown_agent.as_deref() {
         eprintln!("{}", unknown_agent_warning(agent));
     }
-    println!(
-        "worker adopted into team run: {}",
-        outcome.run.dir.display()
-    );
+    match outcome.disposition {
+        AdoptDisposition::Adopted => println!(
+            "worker adopted into team run: {}",
+            outcome.run.dir.display()
+        ),
+        AdoptDisposition::Recovered => println!(
+            "pending adopted worker recovered in team run: {}",
+            outcome.run.dir.display()
+        ),
+        AdoptDisposition::NothingToDo => println!(
+            "adopted worker is already healthy; nothing to do: {}",
+            outcome.run.dir.display()
+        ),
+    }
     Ok(())
 }
 
@@ -308,7 +328,7 @@ fn adopt_resolved<H: HerdrApi>(
         })?
         .to_owned();
     let (launcher, unknown_agent) = adoption_launcher(launchers, &agent);
-    let worker = WorkerSpec {
+    let requested_worker = WorkerSpec {
         name: arguments.name,
         agent,
         role: arguments.role,
@@ -318,19 +338,55 @@ fn adopt_resolved<H: HerdrApi>(
         brief: arguments.brief.clone().unwrap_or_default(),
     };
 
-    let mut run = match target {
-        RunTarget::Existing(run) => prepare_existing_run(*run, &worker, &pane)?,
+    let (mut run, worker, mut disposition) = match target {
+        RunTarget::Existing(run) => prepare_existing_run(*run, requested_worker, &pane)?,
         RunTarget::Bootstrap => bootstrap_run(
             state_dir,
             arguments.team.as_deref().unwrap_or(DEFAULT_TEAM),
             god_pane_id,
-            &worker,
+            &requested_worker,
             &pane,
-        )?,
+        )
+        .map(|run| (run, requested_worker, AdoptDisposition::Adopted))?,
     };
-    run.state.herdr_session = current_herdr_session_identity();
-
-    save_run(&run)?;
+    if disposition == AdoptDisposition::NothingToDo {
+        return Ok(AdoptOutcome {
+            run,
+            unknown_agent,
+            disposition,
+        });
+    }
+    let session = current_herdr_session_identity();
+    let (fresh, should_submit) =
+        update_run_with_hook(&run.dir, |fresh, _| -> Result<bool, AdoptError> {
+            fresh.state.herdr_session = session;
+            if disposition == AdoptDisposition::Adopted
+                && !fresh.state.workers.contains_key(&worker.name)
+            {
+                validate_new_worker(fresh, &worker, &pane)?;
+                insert_adopted_worker(&mut fresh.state, &worker, &pane);
+            }
+            if disposition == AdoptDisposition::Recovered {
+                return match fresh.state.workers[&worker.name].lifecycle {
+                    WorkerLifecycle::Pending => Ok(true),
+                    WorkerLifecycle::Running => Ok(false),
+                    _ => Err(AdoptError::DuplicateWorker {
+                        worker: worker.name.clone(),
+                        run_dir: fresh.dir.clone(),
+                    }),
+                };
+            }
+            Ok(true)
+        })?;
+    run = fresh;
+    if !should_submit {
+        disposition = AdoptDisposition::NothingToDo;
+        return Ok(AdoptOutcome {
+            run,
+            unknown_agent,
+            disposition,
+        });
+    }
     let mut protocol_team = run.state.spec.clone();
     if let Some(cwd) = pane.cwd.clone() {
         protocol_team.cwd = cwd;
@@ -351,32 +407,22 @@ fn adopt_resolved<H: HerdrApi>(
         &prompt,
         launcher.submit_verify,
     ) {
-        run.state
-            .workers
-            .get_mut(&worker.name)
-            .expect("adopted worker was inserted before protocol generation")
-            .lifecycle = WorkerLifecycle::Failed;
-        save_run(&run)?;
+        update_adopted_lifecycle(&mut run, &worker.name, WorkerLifecycle::Failed)?;
         return Err(error.into());
     }
-
-    run.state
-        .workers
-        .get_mut(&worker.name)
-        .expect("adopted worker was inserted before protocol generation")
-        .lifecycle = WorkerLifecycle::Running;
-    save_run(&run)?;
-
-    // Keep the in-memory return value synchronized with the final persisted state.
-    run = load_run(&run.dir)?;
-    Ok(AdoptOutcome { run, unknown_agent })
+    update_adopted_lifecycle(&mut run, &worker.name, WorkerLifecycle::Running)?;
+    Ok(AdoptOutcome {
+        run,
+        unknown_agent,
+        disposition,
+    })
 }
 
 fn prepare_existing_run(
-    mut run: RunBoard,
-    worker: &WorkerSpec,
+    run: RunBoard,
+    worker: WorkerSpec,
     pane: &PaneInfo,
-) -> Result<RunBoard, AdoptError> {
+) -> Result<(RunBoard, WorkerSpec, AdoptDisposition), AdoptError> {
     if run.state.lifecycle != RunLifecycle::Active {
         return Err(AdoptError::InactiveRun {
             run_dir: run.dir.clone(),
@@ -387,6 +433,59 @@ fn prepare_existing_run(
             run_dir: run.dir.clone(),
         });
     }
+    if let (Some(state), Some(existing)) = (
+        run.state.workers.get(&worker.name),
+        run.state
+            .spec
+            .workers
+            .iter()
+            .find(|existing| existing.name == worker.name)
+            .cloned(),
+    ) {
+        if state.adopted && state.pane_id.as_deref() == Some(&pane.pane_id) {
+            return match state.lifecycle {
+                WorkerLifecycle::Pending => Ok((run, existing, AdoptDisposition::Recovered)),
+                WorkerLifecycle::Running => Ok((run, existing, AdoptDisposition::NothingToDo)),
+                _ => Err(AdoptError::DuplicateWorker {
+                    worker: worker.name,
+                    run_dir: run.dir.clone(),
+                }),
+            };
+        }
+    }
+    if run.state.workers.contains_key(&worker.name)
+        || run
+            .state
+            .spec
+            .workers
+            .iter()
+            .any(|existing| existing.name == worker.name)
+    {
+        return Err(AdoptError::DuplicateWorker {
+            worker: worker.name,
+            run_dir: run.dir.clone(),
+        });
+    }
+    if run
+        .state
+        .workers
+        .values()
+        .any(|existing| existing.pane_id.as_deref() == Some(&pane.pane_id))
+    {
+        return Err(AdoptError::DuplicatePane {
+            pane_id: pane.pane_id.clone(),
+            run_dir: run.dir.clone(),
+        });
+    }
+
+    Ok((run, worker, AdoptDisposition::Adopted))
+}
+
+fn validate_new_worker(
+    run: &RunBoard,
+    worker: &WorkerSpec,
+    pane: &PaneInfo,
+) -> Result<(), AdoptError> {
     if run.state.workers.contains_key(&worker.name)
         || run
             .state
@@ -411,9 +510,27 @@ fn prepare_existing_run(
             run_dir: run.dir.clone(),
         });
     }
+    Ok(())
+}
 
-    insert_adopted_worker(&mut run.state, worker, pane);
-    Ok(run)
+fn update_adopted_lifecycle(
+    run: &mut RunBoard,
+    worker_name: &str,
+    lifecycle: WorkerLifecycle,
+) -> Result<(), AdoptError> {
+    let (fresh, ()) = update_run_with_hook(&run.dir, |fresh, _| -> Result<(), AdoptError> {
+        let worker = fresh
+            .state
+            .workers
+            .get_mut(worker_name)
+            .expect("adopted worker exists in persisted run state");
+        if worker.lifecycle == WorkerLifecycle::Pending {
+            worker.lifecycle = lifecycle;
+        }
+        Ok(())
+    })?;
+    *run = fresh;
+    Ok(())
 }
 
 fn bootstrap_run(
@@ -739,6 +856,152 @@ mod tests {
         assert!(calls
             .iter()
             .any(|call| call == "agent_wait:pane-adopted:working"));
+    }
+
+    #[test]
+    fn pending_adoptee_rerun_recovers_without_launching_agent_cli() {
+        let temp = TempDir::new();
+        let mut run = existing_run(temp.path(), Topology::Star);
+        let fake = fake_herdr(temp.path(), Some("codex"));
+        let worker = WorkerSpec {
+            name: "newcomer".to_owned(),
+            agent: "codex".to_owned(),
+            role: DEFAULT_ROLE.to_owned(),
+            task: None,
+            worktree: false,
+            branch: None,
+            brief: PathBuf::new(),
+        };
+        insert_adopted_worker(
+            &mut run.state,
+            &worker,
+            fake.pane.borrow().as_ref().unwrap(),
+        );
+        crate::run::save_run(&run).unwrap();
+
+        let outcome = adopt_resolved(
+            adopted_arguments("newcomer"),
+            RunTarget::Existing(Box::new(run)),
+            temp.path(),
+            "god-pane",
+            &default_launcher_table(),
+            &fake,
+        )
+        .expect("pending adoptee should recover");
+
+        assert_eq!(outcome.disposition, AdoptDisposition::Recovered);
+        assert_eq!(
+            outcome.run.state.workers["newcomer"].lifecycle,
+            WorkerLifecycle::Running
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("pane_run:pane-adopted:The repository")));
+        assert!(!fake
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("pane_run:pane-adopted:'")));
+    }
+
+    #[test]
+    fn healthy_adoptee_rerun_is_a_no_op() {
+        let temp = TempDir::new();
+        let run = existing_run(temp.path(), Topology::Star);
+        let fake = fake_herdr(temp.path(), Some("codex"));
+        let first = adopt_resolved(
+            adopted_arguments("newcomer"),
+            RunTarget::Existing(Box::new(run)),
+            temp.path(),
+            "god-pane",
+            &default_launcher_table(),
+            &fake,
+        )
+        .unwrap();
+        let second_fake = fake_herdr(temp.path(), Some("codex"));
+        let second = adopt_resolved(
+            adopted_arguments("newcomer"),
+            RunTarget::Existing(Box::new(first.run)),
+            temp.path(),
+            "god-pane",
+            &default_launcher_table(),
+            &second_fake,
+        )
+        .unwrap();
+
+        assert_eq!(second.disposition, AdoptDisposition::NothingToDo);
+        assert_eq!(second_fake.calls(), ["pane_get:pane-adopted"]);
+    }
+
+    #[test]
+    fn adopt_saves_preserve_fresher_hook_state() {
+        let temp = TempDir::new();
+        let stale = existing_run(temp.path(), Topology::Star);
+        crate::run::update_run_with_hook(&stale.dir, |fresh, hook| -> Result<(), AdoptError> {
+            fresh.state.workers.get_mut("existing").unwrap().lifecycle = WorkerLifecycle::Orphaned;
+            hook.attention_pending.insert("existing".to_owned(), true);
+            Ok(())
+        })
+        .unwrap();
+        let run_dir = stale.dir.clone();
+        let fake = fake_herdr(temp.path(), Some("codex"));
+
+        adopt_resolved(
+            adopted_arguments("newcomer"),
+            RunTarget::Existing(Box::new(stale)),
+            temp.path(),
+            "god-pane",
+            &default_launcher_table(),
+            &fake,
+        )
+        .unwrap();
+
+        let persisted = load_run(&run_dir).unwrap();
+        assert_eq!(
+            persisted.state.workers["existing"].lifecycle,
+            WorkerLifecycle::Orphaned
+        );
+        assert_eq!(
+            crate::run::load_hook_metadata(&persisted.dir)
+                .unwrap()
+                .attention_pending
+                .get("existing"),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn adopt_lifecycle_save_preserves_a_fresher_hook_lifecycle() {
+        let temp = TempDir::new();
+        let mut run = existing_run(temp.path(), Topology::Star);
+        let worker = WorkerSpec {
+            name: "newcomer".to_owned(),
+            agent: "codex".to_owned(),
+            role: DEFAULT_ROLE.to_owned(),
+            task: None,
+            worktree: false,
+            branch: None,
+            brief: PathBuf::new(),
+        };
+        let pane = fake_herdr(temp.path(), Some("codex"))
+            .pane
+            .borrow()
+            .clone()
+            .unwrap();
+        insert_adopted_worker(&mut run.state, &worker, &pane);
+        crate::run::save_run(&run).unwrap();
+        crate::run::update_run_with_hook(&run.dir, |fresh, _| -> Result<(), AdoptError> {
+            fresh.state.workers.get_mut("newcomer").unwrap().lifecycle = WorkerLifecycle::Orphaned;
+            Ok(())
+        })
+        .unwrap();
+
+        update_adopted_lifecycle(&mut run, "newcomer", WorkerLifecycle::Running).unwrap();
+
+        assert_eq!(
+            run.state.workers["newcomer"].lifecycle,
+            WorkerLifecycle::Orphaned
+        );
     }
 
     #[test]

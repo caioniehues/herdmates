@@ -135,6 +135,8 @@ Given a spec (file or shorthand):
       advisory file lock around a fresh load, narrow mutation/reconciliation,
       and the existing atomic temp-file rename. Spawn threads and separate hook
       processes therefore cannot overwrite one another with stale snapshots.
+      All later `run.toml` mutations, including adopt, attention, and kill,
+      use this same transaction; unlocked save helpers are test-only.
 6. After brief submission, poll lazily for each optional Herdr `agent_session`.
    Persist it when available; missing identity does not delay this or another
    worker's brief and does not fail an otherwise running worker.
@@ -508,6 +510,11 @@ herdr-agent-team adopt <pane-id> --name <worker> [--role <text>]
   `agents.toml` entry to add. No detected agent → refuse.
 - **Brief:** `--brief` injects brief + protocol pointers in one line
   (launch-prompt style); otherwise protocol pointer only.
+- **Crash recovery:** rerunning `adopt` with the same worker name and pane
+  completes a persisted `pending` adoptee through protocol generation and
+  prompt submission, then marks it `running`. It never runs a launcher command
+  in the existing pane. Rerunning it for an already-running adoptee is an
+  idempotent no-op with a clear message; other duplicate names remain errors.
 - **Kill semantics:** `team kill` closes only plugin-created workspaces.
   Adopted workers are marked `released` in `run.toml` and receive one
   injected release notice; their panes and workspaces survive.
