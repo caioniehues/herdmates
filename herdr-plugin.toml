@@ -32,3 +32,27 @@ command = ["target/release/herdr-agent-team", "kill"]
 [[events]]
 on = "pane.agent_status_changed"
 command = ["target/release/herdr-agent-team", "on-agent-status"]
+
+[[events]]
+on = "pane.moved"
+command = ["target/release/herdr-agent-team", "on-agent-status"]
+
+[[events]]
+on = "pane.exited"
+command = ["target/release/herdr-agent-team", "on-agent-status"]
+
+[[events]]
+on = "pane.closed"
+command = ["target/release/herdr-agent-team", "on-agent-status"]
+
+[[events]]
+on = "workspace.closed"
+command = ["target/release/herdr-agent-team", "on-agent-status"]
+
+[[events]]
+on = "worktree.removed"
+command = ["target/release/herdr-agent-team", "on-agent-status"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["target/release/herdr-agent-team", "on-agent-status"]
