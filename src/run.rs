@@ -298,6 +298,7 @@ mod tests {
         workers.insert(
             worker_name.clone(),
             WorkerRunState {
+                task: None,
                 workspace_id: Some("workspace-1".to_owned()),
                 pane_id: Some(pane_id.to_owned()),
                 agent_id: Some("agent-1".to_owned()),
@@ -320,6 +321,7 @@ mod tests {
                     name: worker_name,
                     agent: "codex".to_owned(),
                     role: "builder".to_owned(),
+                    task: None,
                     worktree: true,
                     branch: Some("ticket-06".to_owned()),
                     brief: PathBuf::from("brief.md"),
@@ -413,6 +415,8 @@ lifecycle = "running"
             Some("opaque-id")
         );
         assert_eq!(state.workers["builder"].agent_session, None);
+        assert_eq!(state.spec.workers[0].task, None);
+        assert_eq!(state.workers["builder"].task, None);
     }
 
     #[test]

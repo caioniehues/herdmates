@@ -7,6 +7,7 @@ description = "Herdr plugin: heterogeneous coding-agent teams under a coordinati
 repository = "https://github.com/caioniehues/herdr-agent-team"
 
 [dependencies]
+crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

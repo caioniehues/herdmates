@@ -40,6 +40,8 @@ pub struct WorkerSpec {
     pub name: String,
     pub agent: String,
     pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     pub worktree: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -92,6 +94,8 @@ pub struct RunState {
 /// Live identifiers and lifecycle for one worker in a run (spec section 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerRunState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

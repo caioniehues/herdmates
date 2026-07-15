@@ -704,6 +704,7 @@ mod tests {
             name: worker_name.to_owned(),
             agent: agent.to_owned(),
             role: "builder".to_owned(),
+            task: None,
             worktree: false,
             branch: None,
             brief: PathBuf::from("brief.md"),
@@ -724,6 +725,7 @@ mod tests {
                 workers: BTreeMap::from([(
                     worker_name.to_owned(),
                     WorkerRunState {
+                        task: None,
                         workspace_id: Some("workspace".to_owned()),
                         pane_id: Some("worker-pane".to_owned()),
                         agent_id: Some("session".to_owned()),

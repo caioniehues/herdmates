@@ -444,6 +444,7 @@ mod tests {
                     name: "builder".to_owned(),
                     agent: "codex".to_owned(),
                     role: "build".to_owned(),
+                    task: None,
                     worktree: true,
                     branch: None,
                     brief: PathBuf::from("brief.md"),
@@ -455,6 +456,7 @@ mod tests {
             workers: BTreeMap::from([(
                 "builder".to_owned(),
                 WorkerRunState {
+                    task: None,
                     workspace_id: Some("workspace-1".to_owned()),
                     pane_id: Some("pane-1".to_owned()),
                     agent_id: None,
@@ -721,6 +723,7 @@ mod tests {
             name: "reviewer".to_owned(),
             agent: "claude".to_owned(),
             role: "review".to_owned(),
+            task: None,
             worktree: false,
             branch: None,
             brief: PathBuf::from("review.md"),
@@ -728,6 +731,7 @@ mod tests {
         two_workers.workers.insert(
             "reviewer".to_owned(),
             WorkerRunState {
+                task: None,
                 workspace_id: Some("workspace-2".to_owned()),
                 pane_id: Some("pane-2".to_owned()),
                 agent_id: None,

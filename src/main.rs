@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 pub mod adopt;
 pub mod agents_md;
+pub mod board;
 pub mod herdr;
 pub mod hook;
 pub mod launcher;
@@ -27,13 +28,17 @@ fn main() -> ExitCode {
 
     match command.as_str() {
         "adopt" => exit(adopt::adopt_command(&args)),
+        "board" => exit(board::board_command(&args)),
+        "open-report" => exit(board::open_report_command(&args)),
         "spawn" => exit(spawn::spawn_command(&args)),
         "status" => exit(status_kill::status_command(&args)),
         "kill" => exit(status_kill::kill_command(&args)),
         "msg" => exit(msg::msg_command(&args)),
         "on-agent-status" => exit(hook::hook_command()),
         "" | "help" | "--help" | "-h" => {
-            eprintln!("herdr-agent-team <adopt|spawn|status|kill|msg|on-agent-status>");
+            eprintln!(
+                "herdr-agent-team <adopt|board|spawn|status|kill|msg|open-report|on-agent-status>"
+            );
             ExitCode::SUCCESS
         }
         other => {

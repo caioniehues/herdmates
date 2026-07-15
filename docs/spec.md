@@ -162,14 +162,20 @@ Given a spec (file or shorthand):
   kind, herdr status, last report time. `--json` for the god.
 - `kill`: close team workspaces (`herdr workspace close`), optionally
   `--remove-worktrees` (refuses if worktree dirty — salvage rule), mark run
-  ended in `run.toml`.
+  ended in `run.toml`. `kill <run-dir> --worker <name>` tears down only that
+  owned workspace (or releases an adopted pane), retains the run while other
+  workers remain, and keeps the same dirty-worktree refusal.
 
-## 7. Manifest surface (v1)
+## 7. Manifest surface
 
-- `[[actions]]`: `spawn` (context: workspace), `status`, `kill` — thin wrappers
-  over the binary for keybinding/palette use. The god calls the binary directly.
+- `[[actions]]`: `spawn` (context: workspace), `status`, `kill`, and
+  `open-board` — thin wrappers over the binary for keybinding/palette use.
 - `[[events]]`: agent status change → `<binary> on-agent-status`.
-- No `[[panes]]` in v1 (dashboard is v1.1+), no link handlers.
+- `[[panes]] board`: a durable tab control deck; callers may override placement
+  to `overlay` for a quick popup. `[[link_handlers]] report` routes `report:`
+  pointers to `open-report` using `HERDR_PLUGIN_CLICKED_URL`.
+- A user keybind uses `type = "plugin_action"` and command
+  `caioniehues.agent-team.open-board`.
 
 ## 8. Post-v1 roadmap (rewritten 2026-07-15 from the research wave)
 
@@ -205,18 +211,19 @@ feature.
    ordinary status flip. `HERDR_AGENT_TEAM_BLOCKED_THRESHOLD_MS` configures
    the blocked-duration policy (default: five minutes; checked on subsequent
    lifecycle/status events because this plugin has no daemon).
-4. **Native board pane — repurposed 2026-07-15 (issue #7 comment, after
+4. **Native board pane — SHIPPED (#7, 2026-07-15): repurposed 2026-07-15 (issue #7 comment, after
    prototype round 1): the human's CONTROL DECK for the god's team, not a
    status dashboard.** Per-worker row actions are first-class — msg worker,
    ack/answer attention, kill worker, adopt pane, open report — issued from
    the board without interrupting the god session (`[[panes]]` entrypoint
    with durable tab + popup variant, `open-board` action, `plugin_action`
    keybinds, link handler making report/task pointers hot). Informational
-   core = run-scoped facts nothing else renders: tasks, dependencies (source
-   to be defined by the ticket — the run holds none today), report links,
+   core = run-scoped facts nothing else renders: optional tasks stored in the
+   worker spec and run state, report links,
    mailbox state. Status rendering stays minimal: one team strip; per-pane
    status belongs to the sidebar via step-3 metadata — never a generic
-   agent list.
+   agent list. Dependencies remain deferred. Collection is CLI polling behind
+   a small collector seam; #8 replaces it with socket snapshots/subscription.
 5. **Direct socket backend behind `HerdrApi`** (ADR-0011): snapshot +
    subscription for the board and aggregate `team wait
    [--until all|any|blocked|report]`; CLI stays default/fallback.
