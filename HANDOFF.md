@@ -39,11 +39,15 @@ Last updated 2026-07-15 (post research wave + docs overhaul).
 
 ## NEXT steps (in order)
 
-1. **Issue #4 (bug, priority; not roadmap): lifecycle-event reconciliation** —
-   `pane.moved` assigns a new public pane id and silently stales the run
-   board; also `pane.exited`/`pane.closed`/`workspace.closed`/
-   `worktree.removed`. Fix before feature work.
-2. **Roadmap step 2 / Issue #5:** persist full `agent_session
+0. **Hook-correctness wave DONE on `integration/hook-wave`** (2026-07-15,
+   PRs #12 + #13, gate green 114 tests, v0.3.0, all four issues live-verified
+   incl. the exact #10 watched-worker injection scenario) — **awaiting Caio's
+   word to merge to main/push/tag/close #4 #10 #11 #3**. Follow-up issue
+   candidates in task_plan.md observations: spawn dies midway leaving
+   `pending` lifecycles; generated protocol still says workers-never-git
+   (conflicts with 2026-07-15 git contract: workers commit/push/PR, god
+   merges); manifest changes need plugin unlink+link (disable/enable caches).
+1. **Roadmap step 2 / Issue #5:** persist full `agent_session
    {source,agent,kind,value}` + herdr session identity.
 3. **Roadmap step 3 / Issue #6:** schema-gated metadata tokens (spec §8 step
    3) + aggregate notifications.
