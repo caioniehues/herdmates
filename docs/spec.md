@@ -128,18 +128,25 @@ Given a spec (file or shorthand):
 
 ## 5. Report flow (push, not poll)
 
-- Manifest event hook on agent status change (`on =
-  "pane.agent_status_changed"` — verified `[live 2026-07-14]` and against the
-  upstream event allowlist `[source 2026-07-15]`, spec §9).
+- Manifest hooks reconcile `pane.agent_status_changed`, `pane.moved`,
+  `pane.exited`, `pane.closed`, `workspace.closed`, `worktree.removed`, and
+  `pane.agent_detected` against `run.toml` (dot-form manifest names; JSON uses
+  underscore form). Reconciliation persists atomically: move migrates the
+  public pane ID, exit/close orphan the worker, workspace/worktree removal
+  ends the affected run, and agent detection binds the optional identity.
 - Hook receives `HERDR_PLUGIN_EVENT_JSON`; plugin matches the pane against
   active runs (ignores non-team panes — cheap exit).
-- On a team worker flipping `blocked` or `done`:
+- On a team worker flipping `blocked`, or completing as `working -> idle|done`:
   1. Append an entry to `<run>/inbox/events.jsonl` (durable).
   2. Inject **one line** into the god's pane:
      `[team <name>] <worker> is <status> — report: <abs path>` — pointer only,
      never report content (keeps god context lean).
 - Workers are briefed to write their actual report to
   `<run>/inbox/<worker>.md` *before* going idle/done.
+- Pointer injection is an at-most-once attention notification, not proof of
+  turn completion: upstream can report background-wait panes as `idle`/`done`
+  while work remains (`ogulcancelik/herdr#1217`). The durable report and its
+  sentinel remain the completion truth.
 
 ## 6. `team status` / `team kill`
 
@@ -245,6 +252,11 @@ reference detail lives in `docs/research/` (ADR-0010 §3), not here.
 - **Event payload may add optional fields** `[source 2026-07-15]`: `agent`
   is omitted when none; `title`, `display_agent`, `state_labels` may appear.
   Parsers must tolerate unknown/absent optional fields.
+- **Lifecycle reconciliation wins over waits** `[source 2026-07-15]`:
+  `pane.moved` carries `previous_pane_id` and a replacement `PaneInfo`;
+  `pane.exited`/`pane.closed`, `workspace.closed`, and `worktree.removed` are
+  hookable lifecycle truth. Do not trust a hanging status wait when a pane
+  vanishes (`ogulcancelik/herdr#1439`).
 - **`done` is an attention state** `[source 2026-07-15]`: derived from
   internal `Idle` when the pane is unseen; the detector knows only
   idle/working/blocked/unknown. Explains why `agent wait` rejects `done`
