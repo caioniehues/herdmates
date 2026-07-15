@@ -87,7 +87,9 @@ pub fn on_agent_status(
                 ReconciliationAction::RecordEvent
                 | ReconciliationAction::TrackAgentStatus { .. }
                 | ReconciliationAction::MigratePane { .. }
+                | ReconciliationAction::MigrateGodPane
                 | ReconciliationAction::MarkWorkerOrphaned { .. }
+                | ReconciliationAction::EndWorker { .. }
                 | ReconciliationAction::BindAgentIdentity { .. }
                 | ReconciliationAction::EndRun => {}
             }
@@ -841,6 +843,60 @@ mod tests {
                 .state
                 .lifecycle,
             RunLifecycle::Ended
+        );
+    }
+
+    #[test]
+    fn one_worker_workspace_close_ends_only_that_workers_allocation() {
+        let temp = TempDir::new();
+        let mut run = fixture_run(temp.path(), "worker-pane");
+        run.state.workers.insert(
+            "reviewer".to_owned(),
+            WorkerRunState {
+                workspace_id: Some("reviewer-workspace".to_owned()),
+                pane_id: Some("reviewer-pane".to_owned()),
+                agent_id: Some("agent-2".to_owned()),
+                worktree_path: None,
+                adopted: false,
+                lifecycle: WorkerLifecycle::Running,
+            },
+        );
+        run::save_run(&run).expect("persist two-worker fixture");
+        let fake = FakeHerdr::new(&temp);
+        let fixture = json!({"event":"workspace_closed","data":{"type":"workspace_closed","workspace_id":"worker-workspace"}});
+
+        on_agent_status(&fixture.to_string(), temp.path(), &fake.client)
+            .expect("reconcile one worker workspace close");
+
+        let persisted = run::load_run(&run.dir).expect("load reconciled run");
+        assert_eq!(persisted.state.lifecycle, RunLifecycle::Active);
+        assert_eq!(
+            persisted.state.workers["builder"].lifecycle,
+            WorkerLifecycle::Ended
+        );
+        assert_eq!(
+            persisted.state.workers["reviewer"].lifecycle,
+            WorkerLifecycle::Running
+        );
+    }
+
+    #[test]
+    fn god_pane_moved_fixture_persists_god_pane_id() {
+        let temp = TempDir::new();
+        let run = fixture_run(temp.path(), "worker-pane");
+        let fake = FakeHerdr::new(&temp);
+        let fixture = json!({"event":"pane_moved","data":{"type":"pane_moved","previous_pane_id":"god-pane","previous_workspace_id":"god-workspace","previous_tab_id":"god-tab","pane":{"pane_id":"new-god-pane","workspace_id":"new-god-workspace"}}});
+
+        on_agent_status(&fixture.to_string(), temp.path(), &fake.client).expect("migrate god pane");
+
+        let persisted = run::load_run(&run.dir).expect("load migrated run");
+        assert_eq!(persisted.state.god_pane_id, "new-god-pane");
+        assert_eq!(
+            run::load_hook_metadata(&run.dir)
+                .expect("load hook metadata")
+                .god_workspace_id
+                .as_deref(),
+            Some("new-god-workspace")
         );
     }
 

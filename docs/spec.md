@@ -132,8 +132,10 @@ Given a spec (file or shorthand):
   `pane.exited`, `pane.closed`, `workspace.closed`, `worktree.removed`, and
   `pane.agent_detected` against `run.toml` (dot-form manifest names; JSON uses
   underscore form). Reconciliation persists atomically: move migrates the
-  public pane ID, exit/close orphan the worker, workspace/worktree removal
-  ends the affected run, and agent detection binds the optional identity.
+  public pane ID (including the god pane), exit/close orphan the worker, and
+  workspace/worktree removal ends only the affected worker allocation. The run
+  ends when its god allocation vanishes or no non-terminal workers remain;
+  agent detection binds the optional identity.
 - Hook receives `HERDR_PLUGIN_EVENT_JSON`; plugin matches the pane against
   active runs (ignores non-team panes — cheap exit).
 - On a team worker flipping `blocked`, or completing as `working -> idle|done`:

@@ -42,7 +42,9 @@ pub enum ReconciliationAction {
     InjectPointer { worker_name: String, status: String },
     DrainOutbox { worker_name: String },
     MigratePane { worker_name: String },
+    MigrateGodPane,
     MarkWorkerOrphaned { worker_name: String },
+    EndWorker { worker_name: String },
     BindAgentIdentity { worker_name: String },
     EndRun,
 }
@@ -54,6 +56,8 @@ pub struct HookMetadata {
     pub worker_status: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub worker_agent_identity: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub god_workspace_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,28 +74,38 @@ pub fn reconcile(
     mut metadata: HookMetadata,
 ) -> Reconciliation {
     let mut actions = Vec::new();
-    let worker_name = match event {
+    let target = match event {
         IncomingEvent::AgentStatusChanged { pane_id, .. }
         | IncomingEvent::PaneExited { pane_id }
         | IncomingEvent::PaneClosed { pane_id }
-        | IncomingEvent::PaneAgentDetected { pane_id, .. } => worker_for_pane(&state, pane_id),
+        | IncomingEvent::PaneAgentDetected { pane_id, .. } => target_for_pane(&state, pane_id),
         IncomingEvent::PaneMoved {
             previous_pane_id, ..
-        } => worker_for_pane(&state, previous_pane_id),
+        } => target_for_pane(&state, previous_pane_id),
         IncomingEvent::WorkspaceClosed { workspace_id } => {
             worker_for_workspace(&state, workspace_id)
+                .map(Target::Worker)
+                .or_else(|| {
+                    (metadata.god_workspace_id.as_deref() == Some(workspace_id))
+                        .then_some(Target::God)
+                })
         }
         IncomingEvent::WorktreeRemoved {
             workspace_id,
             worktree_path,
-        } => worker_for_workspace(&state, workspace_id).or_else(|| {
-            worktree_path
-                .as_ref()
-                .and_then(|path| worker_for_worktree(&state, path))
-        }),
+        } => worker_for_workspace(&state, workspace_id)
+            .or_else(|| {
+                worktree_path
+                    .as_ref()
+                    .and_then(|path| worker_for_worktree(&state, path))
+            })
+            .map(Target::Worker)
+            .or_else(|| {
+                (metadata.god_workspace_id.as_deref() == Some(workspace_id)).then_some(Target::God)
+            }),
     };
 
-    let Some(worker_name) = worker_name else {
+    let Some(target) = target else {
         return Reconciliation {
             state,
             metadata,
@@ -102,6 +116,13 @@ pub fn reconcile(
 
     match event {
         IncomingEvent::AgentStatusChanged { status, .. } => {
+            let Target::Worker(worker_name) = target else {
+                return Reconciliation {
+                    state,
+                    metadata,
+                    actions,
+                };
+            };
             let previous = metadata
                 .worker_status
                 .insert(worker_name.clone(), status.clone());
@@ -128,30 +149,58 @@ pub fn reconcile(
             pane_id,
             workspace_id,
             ..
-        } => {
-            let worker = state
-                .workers
-                .get_mut(&worker_name)
-                .expect("matched worker exists");
-            worker.pane_id = Some(pane_id.clone());
-            if let Some(workspace_id) = workspace_id {
-                worker.workspace_id = Some(workspace_id.clone());
+        } => match target {
+            Target::Worker(worker_name) => {
+                let worker = state
+                    .workers
+                    .get_mut(&worker_name)
+                    .expect("matched worker exists");
+                worker.pane_id = Some(pane_id.clone());
+                if let Some(workspace_id) = workspace_id {
+                    worker.workspace_id = Some(workspace_id.clone());
+                }
+                actions.push(ReconciliationAction::MigratePane { worker_name });
             }
-            actions.push(ReconciliationAction::MigratePane { worker_name });
-        }
-        IncomingEvent::PaneExited { .. } | IncomingEvent::PaneClosed { .. } => {
-            state
-                .workers
-                .get_mut(&worker_name)
-                .expect("matched worker exists")
-                .lifecycle = WorkerLifecycle::Orphaned;
-            actions.push(ReconciliationAction::MarkWorkerOrphaned { worker_name });
-        }
+            Target::God => {
+                state.god_pane_id = pane_id.clone();
+                metadata.god_workspace_id = workspace_id.clone();
+                actions.push(ReconciliationAction::MigrateGodPane);
+            }
+        },
+        IncomingEvent::PaneExited { .. } | IncomingEvent::PaneClosed { .. } => match target {
+            Target::Worker(worker_name) => {
+                state
+                    .workers
+                    .get_mut(&worker_name)
+                    .expect("matched worker exists")
+                    .lifecycle = WorkerLifecycle::Orphaned;
+                actions.push(ReconciliationAction::MarkWorkerOrphaned { worker_name });
+                end_run_if_no_live_workers(&mut state, &mut actions);
+            }
+            Target::God => end_run(&mut state, &mut actions),
+        },
         IncomingEvent::WorkspaceClosed { .. } | IncomingEvent::WorktreeRemoved { .. } => {
-            state.lifecycle = RunLifecycle::Ended;
-            actions.push(ReconciliationAction::EndRun);
+            match target {
+                Target::Worker(worker_name) => {
+                    state
+                        .workers
+                        .get_mut(&worker_name)
+                        .expect("matched worker exists")
+                        .lifecycle = WorkerLifecycle::Ended;
+                    actions.push(ReconciliationAction::EndWorker { worker_name });
+                    end_run_if_no_live_workers(&mut state, &mut actions);
+                }
+                Target::God => end_run(&mut state, &mut actions),
+            }
         }
         IncomingEvent::PaneAgentDetected { agent, .. } => {
+            let Target::Worker(worker_name) = target else {
+                return Reconciliation {
+                    state,
+                    metadata,
+                    actions,
+                };
+            };
             if let Some(agent) = agent {
                 metadata
                     .worker_agent_identity
@@ -166,6 +215,39 @@ pub fn reconcile(
         metadata,
         actions,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    Worker(String),
+    God,
+}
+
+fn target_for_pane(state: &RunState, pane_id: &str) -> Option<Target> {
+    if state.god_pane_id == pane_id {
+        Some(Target::God)
+    } else {
+        worker_for_pane(state, pane_id).map(Target::Worker)
+    }
+}
+
+fn end_run_if_no_live_workers(state: &mut RunState, actions: &mut Vec<ReconciliationAction>) {
+    if state.workers.values().all(|worker| {
+        matches!(
+            worker.lifecycle,
+            WorkerLifecycle::Failed
+                | WorkerLifecycle::Ended
+                | WorkerLifecycle::Released
+                | WorkerLifecycle::Orphaned
+        )
+    }) {
+        end_run(state, actions);
+    }
+}
+
+fn end_run(state: &mut RunState, actions: &mut Vec<ReconciliationAction>) {
+    state.lifecycle = RunLifecycle::Ended;
+    actions.push(ReconciliationAction::EndRun);
 }
 
 fn worker_for_pane(state: &RunState, pane_id: &str) -> Option<String> {

@@ -107,6 +107,13 @@ pub fn load_hook_metadata(run_dir: &Path) -> Result<HookMetadata, RunError> {
 pub fn save_run_with_hook(run: &RunBoard, hook: &HookMetadata) -> Result<(), RunError> {
     let mut contents = toml::to_string_pretty(&run.state)?;
     if hook != &HookMetadata::default() {
+        if let Some(god_workspace_id) = &hook.god_workspace_id {
+            contents.push_str("\n[hook]\n");
+            contents.push_str(&toml::to_string(&std::collections::BTreeMap::from([(
+                "god_workspace_id",
+                god_workspace_id,
+            )]))?);
+        }
         if !hook.worker_status.is_empty() {
             contents.push_str("\n[hook.worker_status]\n");
             contents.push_str(&toml::to_string(&hook.worker_status)?);
