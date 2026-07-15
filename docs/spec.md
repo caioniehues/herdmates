@@ -277,9 +277,14 @@ feature.
    aggregate wait bootstrap with `session.snapshot`, then retain one multiplexed
    `events.subscribe` connection for the durable run's worker pane IDs across
    refresh cycles. Ordinary read timeouts preserve that stream; transport loss
-   drops it, re-snapshots, and reconnects. An immediate subscription failure
-   spends only the remaining wait budget in bounded CLI polling. Completion
-   truth remains `run.toml` and inbox state.
+   drops it and enters a capped, backed-off, overall-deadline reconnect state.
+   Every replacement subscription is gated on a successful fresh snapshot.
+   Protocol/typed-validation errors are terminal and never reconnect. An
+   immediate subscription failure spends only the remaining wait budget in
+   bounded CLI polling. One shared collector socket controller owns these
+   transitions for board and aggregate wait; their wrappers only map outcomes
+   to UI refresh versus CLI fallback. Completion truth remains `run.toml` and
+   inbox state.
    Set `HERDR_TEAM_SOCKET_TRACE=<path>` for redacted JSONL diagnostics (request
    ID, method, result type, latency, and a fixed error category only; server
    text is never written).

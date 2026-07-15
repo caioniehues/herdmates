@@ -1,7 +1,7 @@
 //! Process-edge adapters for the experimental public-socket transport.
 //!
-//! Socket events only wake durable collectors. Completion and board truth
-//! remain in `run.toml` and the inbox.
+//! One controller owns snapshot/subscription/reconnect lifecycle. Board and
+//! God wrappers only map its outcomes onto their distinct fallback policies.
 
 use crate::board::{BoardCollector, BoardError, BoardSnapshot};
 use crate::god_cli::{GodCliError, GodCollector, GodSnapshot};
@@ -9,24 +9,180 @@ use crate::herdr::{
     AgentInfo, HerdrApi, HerdrError, PaneInfo, WaitOutcome, WorkspaceRef, WorktreeRef,
 };
 use crate::metadata::MetadataUpdate;
-use crate::socket::{SocketClient, SubscriptionPoll, SubscriptionStream};
+use crate::socket::{
+    SocketClient, SubscriptionPoll, SubscriptionStream, DEFAULT_IO_TIMEOUT, MAX_RECONNECTS,
+    RECONNECT_BACKOFF,
+};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-struct CollectorSocketState {
-    subscription: Option<SubscriptionStream>,
-    snapshot_pending: bool,
+enum LifecyclePhase {
+    NeedSnapshot,
+    Ready,
+    Subscribed(SubscriptionStream),
+    Terminal,
+    Exhausted,
 }
 
-impl Default for CollectorSocketState {
+struct LifecycleState {
+    phase: LifecyclePhase,
+    reconnect_attempts: usize,
+    reconnect_deadline: Option<Instant>,
+    retry_not_before: Option<Instant>,
+}
+
+impl Default for LifecycleState {
     fn default() -> Self {
         Self {
-            subscription: None,
-            snapshot_pending: true,
+            phase: LifecyclePhase::NeedSnapshot,
+            reconnect_attempts: 0,
+            reconnect_deadline: None,
+            retry_not_before: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControllerPoll {
+    Event,
+    Timeout,
+    ReconnectPending,
+    Terminal,
+}
+
+struct CollectorSocketController<C> {
+    socket: SocketClient<C>,
+    state: Mutex<LifecycleState>,
+}
+
+impl<C: HerdrApi> CollectorSocketController<C> {
+    fn new(socket: SocketClient<C>) -> Self {
+        Self {
+            socket,
+            state: Mutex::new(LifecycleState::default()),
+        }
+    }
+
+    fn refresh_snapshot(&self) -> ControllerPoll {
+        let mut state = lock(&self.state);
+        self.ensure_snapshot(&mut state)
+    }
+
+    fn poll(&self, panes: Vec<String>, budget: Duration) -> ControllerPoll {
+        if budget.is_zero() {
+            return ControllerPoll::Timeout;
+        }
+        let started = Instant::now();
+        let mut state = lock(&self.state);
+        match self.ensure_snapshot(&mut state) {
+            ControllerPoll::Timeout => {}
+            other => return other,
+        }
+        if matches!(state.phase, LifecyclePhase::Ready) {
+            let wanted = subscriptions(panes);
+            if wanted.is_empty() {
+                return ControllerPoll::Terminal;
+            }
+            let remaining = remaining(started, budget);
+            if remaining.is_zero() {
+                return ControllerPoll::Timeout;
+            }
+            match self.socket.subscribe(&wanted, remaining) {
+                Ok(subscription) => state.phase = LifecyclePhase::Subscribed(subscription),
+                Err(error) => return self.transition_error(&mut state, error),
+            }
+        }
+        let remaining = remaining(started, budget);
+        if remaining.is_zero() {
+            return ControllerPoll::Timeout;
+        }
+        let result = match &mut state.phase {
+            LifecyclePhase::Subscribed(subscription) => subscription.poll(remaining),
+            LifecyclePhase::Terminal | LifecyclePhase::Exhausted => {
+                return ControllerPoll::Terminal
+            }
+            LifecyclePhase::NeedSnapshot => return ControllerPoll::ReconnectPending,
+            LifecyclePhase::Ready => unreachable!("subscription established above"),
+        };
+        match result {
+            Ok(SubscriptionPoll::Event(event)) => {
+                drop(event);
+                healthy(&mut state);
+                ControllerPoll::Event
+            }
+            Ok(SubscriptionPoll::Timeout) => {
+                healthy(&mut state);
+                ControllerPoll::Timeout
+            }
+            Ok(SubscriptionPoll::Closed) => self.transition_loss(&mut state),
+            Err(error) => self.transition_error(&mut state, error),
+        }
+    }
+
+    fn ensure_snapshot(&self, state: &mut LifecycleState) -> ControllerPoll {
+        match state.phase {
+            LifecyclePhase::Ready | LifecyclePhase::Subscribed(_) => {
+                return ControllerPoll::Timeout
+            }
+            LifecyclePhase::Terminal | LifecyclePhase::Exhausted => {
+                return ControllerPoll::Terminal
+            }
+            LifecyclePhase::NeedSnapshot => {}
+        }
+        let now = Instant::now();
+        if state
+            .reconnect_deadline
+            .is_some_and(|deadline| now >= deadline)
+            || state.reconnect_attempts > MAX_RECONNECTS
+        {
+            state.phase = LifecyclePhase::Exhausted;
+            return ControllerPoll::Terminal;
+        }
+        if state.retry_not_before.is_some_and(|retry| now < retry) {
+            return ControllerPoll::ReconnectPending;
+        }
+        match self.socket.snapshot() {
+            Ok(_) => {
+                state.phase = LifecyclePhase::Ready;
+                state.retry_not_before = None;
+                ControllerPoll::Timeout
+            }
+            Err(error) => self.transition_error(state, error),
+        }
+    }
+
+    fn transition_error(&self, state: &mut LifecycleState, error: HerdrError) -> ControllerPoll {
+        if matches!(error, HerdrError::Transport { .. }) {
+            self.transition_loss(state)
+        } else {
+            state.phase = LifecyclePhase::Terminal;
+            ControllerPoll::Terminal
+        }
+    }
+
+    fn transition_loss(&self, state: &mut LifecycleState) -> ControllerPoll {
+        let now = Instant::now();
+        state.reconnect_attempts += 1;
+        state.reconnect_deadline.get_or_insert_with(|| {
+            now + DEFAULT_IO_TIMEOUT.saturating_mul((MAX_RECONNECTS as u32 + 1) * 3)
+        });
+        if state.reconnect_attempts > MAX_RECONNECTS {
+            state.phase = LifecyclePhase::Exhausted;
+            return ControllerPoll::Terminal;
+        }
+        state.retry_not_before =
+            Some(now + RECONNECT_BACKOFF.saturating_mul(state.reconnect_attempts as u32));
+        state.phase = LifecyclePhase::NeedSnapshot;
+        ControllerPoll::ReconnectPending
+    }
+}
+
+fn healthy(state: &mut LifecycleState) {
+    state.reconnect_attempts = 0;
+    state.reconnect_deadline = None;
+    state.retry_not_before = None;
 }
 
 fn subscriptions(panes: Vec<String>) -> Vec<Value> {
@@ -35,158 +191,79 @@ fn subscriptions(panes: Vec<String>) -> Vec<Value> {
         .map(|pane_id| json!({"type":"pane.agent_status_changed","pane_id":pane_id}))
         .collect()
 }
-
 fn remaining(started: Instant, budget: Duration) -> Duration {
     budget.saturating_sub(started.elapsed())
 }
-
-fn lock(state: &Mutex<CollectorSocketState>) -> MutexGuard<'_, CollectorSocketState> {
+fn lock(state: &Mutex<LifecycleState>) -> MutexGuard<'_, LifecycleState> {
     state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub struct SocketGodCollector<C, G> {
-    socket: SocketClient<C>,
+    controller: CollectorSocketController<C>,
     fallback: G,
-    state: Mutex<CollectorSocketState>,
 }
-
-impl<C, G> SocketGodCollector<C, G> {
+impl<C: HerdrApi, G> SocketGodCollector<C, G> {
     pub fn new(socket: SocketClient<C>, fallback: G) -> Self {
         Self {
-            socket,
+            controller: CollectorSocketController::new(socket),
             fallback,
-            state: Mutex::new(CollectorSocketState::default()),
         }
     }
 }
-
 impl<C: HerdrApi, G: GodCollector> GodCollector for SocketGodCollector<C, G> {
     fn collect(&self) -> Result<GodSnapshot, GodCliError> {
-        let mut state = lock(&self.state);
-        if state.snapshot_pending && self.socket.snapshot().is_ok() {
-            state.snapshot_pending = false;
-        }
-        drop(state);
+        let _ = self.controller.refresh_snapshot();
         self.fallback.collect()
     }
-
     fn wait_for_change(&self, timeout: Duration) {
         let started = Instant::now();
-        let mut state = lock(&self.state);
-        if state.subscription.is_none() {
-            let wanted = subscriptions(self.fallback.subscription_panes());
-            if wanted.is_empty() {
-                drop(state);
-                self.fallback.wait_for_change(remaining(started, timeout));
-                return;
+        match self
+            .controller
+            .poll(self.fallback.subscription_panes(), timeout)
+        {
+            ControllerPoll::Event | ControllerPoll::Timeout => {}
+            ControllerPoll::ReconnectPending | ControllerPoll::Terminal => {
+                self.fallback.wait_for_change(remaining(started, timeout))
             }
-            let budget = remaining(started, timeout);
-            if budget.is_zero() {
-                return;
-            }
-            match self.socket.subscribe(&wanted, budget) {
-                Ok(subscription) => state.subscription = Some(subscription),
-                Err(_) => {
-                    state.snapshot_pending = true;
-                    drop(state);
-                    self.fallback.wait_for_change(remaining(started, timeout));
-                    return;
-                }
-            }
-        }
-        let budget = remaining(started, timeout);
-        if budget.is_zero() {
-            return;
-        }
-        let poll = state
-            .subscription
-            .as_mut()
-            .expect("subscription initialized")
-            .poll(budget);
-        if matches!(poll, Ok(SubscriptionPoll::Closed) | Err(_)) {
-            state.subscription = None;
-            state.snapshot_pending = true;
-            drop(state);
-            self.fallback.wait_for_change(remaining(started, timeout));
         }
     }
-
     fn subscription_panes(&self) -> Vec<String> {
         self.fallback.subscription_panes()
     }
 }
 
 pub struct SocketBoardCollector<C, B> {
-    socket: SocketClient<C>,
+    controller: CollectorSocketController<C>,
     fallback: B,
-    state: Mutex<CollectorSocketState>,
 }
-
-impl<C, B> SocketBoardCollector<C, B> {
+impl<C: HerdrApi, B> SocketBoardCollector<C, B> {
     pub fn new(socket: SocketClient<C>, fallback: B) -> Self {
         Self {
-            socket,
+            controller: CollectorSocketController::new(socket),
             fallback,
-            state: Mutex::new(CollectorSocketState::default()),
         }
     }
 }
-
 impl<C: HerdrApi, B: BoardCollector> BoardCollector for SocketBoardCollector<C, B> {
     fn collect(&self) -> Result<BoardSnapshot, BoardError> {
-        let mut state = lock(&self.state);
-        if state.snapshot_pending && self.socket.snapshot().is_ok() {
-            state.snapshot_pending = false;
-        }
-        drop(state);
+        let _ = self.controller.refresh_snapshot();
         self.fallback.collect()
     }
-
     fn wait_for_change(&self, timeout: Duration) -> bool {
         let started = Instant::now();
-        let mut state = lock(&self.state);
-        if state.subscription.is_none() {
-            let wanted = subscriptions(self.fallback.subscription_panes());
-            if wanted.is_empty() {
-                return false;
-            }
-            let budget = remaining(started, timeout);
-            if budget.is_zero() {
-                return false;
-            }
-            match self.socket.subscribe(&wanted, budget) {
-                Ok(subscription) => state.subscription = Some(subscription),
-                Err(_) => {
-                    state.snapshot_pending = true;
-                    return true;
-                }
-            }
-        }
-        let budget = remaining(started, timeout);
-        if budget.is_zero() {
-            return false;
-        }
-        match state
-            .subscription
-            .as_mut()
-            .expect("subscription initialized")
-            .poll(budget)
+        match self
+            .controller
+            .poll(self.fallback.subscription_panes(), timeout)
         {
-            Ok(SubscriptionPoll::Event(event)) => {
-                drop(event);
-                true
-            }
-            Ok(SubscriptionPoll::Timeout) => false,
-            Ok(SubscriptionPoll::Closed) | Err(_) => {
-                state.subscription = None;
-                state.snapshot_pending = true;
-                true
+            ControllerPoll::Event => true,
+            ControllerPoll::Timeout => false,
+            ControllerPoll::ReconnectPending | ControllerPoll::Terminal => {
+                self.fallback.wait_for_change(remaining(started, timeout))
             }
         }
     }
-
     fn subscription_panes(&self) -> Vec<String> {
         self.fallback.subscription_panes()
     }

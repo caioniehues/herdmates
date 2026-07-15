@@ -18,7 +18,7 @@ pub const SUPPORTED_PROTOCOL: u32 = 16;
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_millis(100);
 pub const MAX_RECONNECTS: usize = 3;
-const RECONNECT_BACKOFF: Duration = Duration::from_millis(10);
+pub(crate) const RECONNECT_BACKOFF: Duration = Duration::from_millis(10);
 const BACKEND_ENV: &str = "HERDR_TEAM_BACKEND";
 const TRACE_ENV: &str = "HERDR_TEAM_SOCKET_TRACE";
 const SCHEMA_BASELINE: &str = include_str!("../docs/herdr-api-schema.snapshot.json");
@@ -1068,5 +1068,138 @@ mod tests {
         assert!(!source.contains(&["crate", "::god_cli"].concat()));
         assert!(!source.contains(&["impl Board", "Collector"].concat()));
         assert!(!source.contains(&["impl God", "Collector"].concat()));
+    }
+
+    #[test]
+    fn failed_resnapshot_never_allows_replacement_subscription() {
+        let malformed_snapshot="{\"id\":\"herdr-agent-team:3\",\"result\":{\"type\":\"session_snapshot\",\"snapshot\":{}}}\n";
+        let replacement="{\"id\":\"herdr-agent-team:4\",\"result\":{\"type\":\"subscription_started\"}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"p1\",\"workspace_id\":\"w1\",\"agent_status\":\"blocked\"}}\n";
+        let (path, h, requests) = recording_fake(vec![
+            pong("herdr-agent-team:0", 16),
+            snapshot("herdr-agent-team:1"),
+            "{\"id\":\"herdr-agent-team:2\",\"result\":{\"type\":\"subscription_started\"}}\n"
+                .into(),
+            malformed_snapshot.into(),
+            replacement.into(),
+        ]);
+        let socket = SocketClient::connect_validated(path.clone(), FakeHerdr::default()).unwrap();
+        let durable = BoardSnapshot {
+            team: "wave8".into(),
+            run_dir: "/run".into(),
+            lifecycle: "active".into(),
+            workers: vec![],
+            mailbox_events: 0,
+        };
+        let collector = SocketBoardCollector::new(socket, FixtureBoard(durable));
+        collector.collect().unwrap();
+        assert!(collector.wait_for_change(Duration::from_millis(10)));
+        thread::sleep(RECONNECT_BACKOFF + Duration::from_millis(2));
+        collector.collect().unwrap();
+        let _ = collector.wait_for_change(Duration::from_millis(10));
+        drop(collector);
+        drop(h);
+        let methods = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "ping".to_owned(),
+                "session.snapshot".to_owned(),
+                "events.subscribe".to_owned(),
+                "session.snapshot".to_owned()
+            ]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_typed_event_error_never_reconnects() {
+        let malformed_event="{\"id\":\"herdr-agent-team:2\",\"result\":{\"type\":\"subscription_started\"}}\n{\"event\":\"pane.agent_status_changed\",\"data\":{\"pane_id\":\"p1\"}}\n";
+        let (path, h, requests) = recording_fake(vec![
+            pong("herdr-agent-team:0", 16),
+            snapshot("herdr-agent-team:1"),
+            malformed_event.into(),
+            snapshot("herdr-agent-team:3"),
+            "{\"id\":\"herdr-agent-team:4\",\"result\":{\"type\":\"subscription_started\"}}\n"
+                .into(),
+        ]);
+        let socket = SocketClient::connect_validated(path.clone(), FakeHerdr::default()).unwrap();
+        let durable = BoardSnapshot {
+            team: "wave8".into(),
+            run_dir: "/run".into(),
+            lifecycle: "active".into(),
+            workers: vec![],
+            mailbox_events: 0,
+        };
+        let collector = SocketBoardCollector::new(socket, FixtureBoard(durable));
+        collector.collect().unwrap();
+        assert!(collector.wait_for_change(Duration::from_millis(10)));
+        collector.collect().unwrap();
+        let _ = collector.wait_for_change(Duration::from_millis(10));
+        drop(collector);
+        drop(h);
+        let methods = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "ping".to_owned(),
+                "session.snapshot".to_owned(),
+                "events.subscribe".to_owned()
+            ]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn production_reconnects_are_capped_and_backed_off() {
+        let mut responses = vec![pong("herdr-agent-team:0", 16)];
+        for attempt in 0..6 {
+            responses.push(snapshot(&format!("herdr-agent-team:{}", attempt * 2 + 1)));
+            responses.push(format!("{{\"id\":\"herdr-agent-team:{}\",\"result\":{{\"type\":\"subscription_started\"}}}}\n",attempt*2+2));
+        }
+        let (path, _h, requests) = recording_fake(responses);
+        let socket = SocketClient::connect_validated(path.clone(), FakeHerdr::default()).unwrap();
+        let durable = BoardSnapshot {
+            team: "wave8".into(),
+            run_dir: "/run".into(),
+            lifecycle: "active".into(),
+            workers: vec![],
+            mailbox_events: 0,
+        };
+        let collector = SocketBoardCollector::new(socket, FixtureBoard(durable));
+        let started = Instant::now();
+        for _ in 0..6 {
+            collector.collect().unwrap();
+            let _ = collector.wait_for_change(Duration::from_millis(20));
+        }
+        let subscribe_count = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "events.subscribe")
+            .count();
+        assert!(subscribe_count <= MAX_RECONNECTS + 1);
+        assert!(started.elapsed() >= RECONNECT_BACKOFF * MAX_RECONNECTS as u32);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn board_and_god_adapters_share_one_lifecycle_controller() {
+        let source = include_str!("socket_backend.rs");
+        assert_eq!(
+            source.matches("struct CollectorSocketController").count(),
+            1
+        );
+        assert_eq!(source.matches("snapshot_pending").count(), 0);
+        assert!(!source.contains("struct CollectorSocketState"));
     }
 }
