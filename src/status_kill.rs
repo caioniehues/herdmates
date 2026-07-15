@@ -2,7 +2,7 @@
 
 use crate::herdr::{AgentInfo, HerdrClient, HerdrError};
 use crate::run::{load_run, mark_ended, RunBoard, RunError};
-use crate::types::RunLifecycle;
+use crate::types::{RunLifecycle, WorkerLifecycle};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -309,6 +309,9 @@ fn kill_run_with_backend(
 ) -> Result<(), StatusKillError> {
     let mut run = load_run(run_dir)?;
     if run.state.lifecycle == RunLifecycle::Ended {
+        if end_non_failed_workers(&mut run) {
+            mark_ended(&mut run)?;
+        }
         return Ok(());
     }
 
@@ -339,12 +342,27 @@ fn kill_run_with_backend(
         }
     }
 
+    end_non_failed_workers(&mut run);
     mark_ended(&mut run)?;
     if dirty_paths.is_empty() {
         Ok(())
     } else {
         Err(StatusKillError::DirtyWorktrees { paths: dirty_paths })
     }
+}
+
+fn end_non_failed_workers(run: &mut RunBoard) -> bool {
+    let mut changed = false;
+    for worker in run.state.workers.values_mut() {
+        if !matches!(
+            worker.lifecycle,
+            WorkerLifecycle::Failed | WorkerLifecycle::Ended
+        ) {
+            worker.lifecycle = WorkerLifecycle::Ended;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn worktree_is_dirty(path: &Path) -> Result<bool, StatusKillError> {
@@ -582,13 +600,64 @@ mod tests {
             vec!["workspace-builder", "workspace-reviewer"]
         );
         assert!(backend.removed.into_inner().is_empty());
+        let ended = load_run(&run.dir).expect("load ended run");
+        assert_eq!(ended.state.lifecycle, RunLifecycle::Ended);
         assert_eq!(
-            load_run(&run.dir).expect("load ended run").state.lifecycle,
-            RunLifecycle::Ended
+            ended
+                .state
+                .workers
+                .values()
+                .map(|worker| worker.lifecycle)
+                .collect::<Vec<_>>(),
+            [WorkerLifecycle::Ended, WorkerLifecycle::Ended]
         );
         assert!(match_pane(temp.path(), "pane-builder")
             .expect("match pane")
             .is_none());
+    }
+
+    #[test]
+    fn kill_preserves_failed_workers_while_ending_every_other_lifecycle() {
+        let temp = TempDir::new();
+        let mut state = run_state(temp.path());
+        state
+            .workers
+            .get_mut("reviewer")
+            .expect("reviewer runtime")
+            .lifecycle = WorkerLifecycle::Failed;
+        let run = create_run(temp.path(), state).expect("create run");
+        let backend = FakeTeardown::default();
+
+        kill_run_with_backend(&run.dir, false, &backend).expect("kill run");
+
+        let ended = load_run(&run.dir).expect("load ended run");
+        assert_eq!(ended.state.lifecycle, RunLifecycle::Ended);
+        assert_eq!(
+            ended.state.workers["builder"].lifecycle,
+            WorkerLifecycle::Ended
+        );
+        assert_eq!(
+            ended.state.workers["reviewer"].lifecycle,
+            WorkerLifecycle::Failed
+        );
+    }
+
+    #[test]
+    fn kill_repairs_stale_worker_lifecycles_without_repeating_ended_run_teardown() {
+        let temp = TempDir::new();
+        let mut run = create_run(temp.path(), run_state(temp.path())).expect("create run");
+        mark_ended(&mut run).expect("create legacy ended run");
+        let backend = FakeTeardown::default();
+
+        kill_run_with_backend(&run.dir, false, &backend).expect("repair ended run");
+
+        assert!(backend.closed.into_inner().is_empty());
+        assert!(load_run(&run.dir)
+            .expect("load repaired run")
+            .state
+            .workers
+            .values()
+            .all(|worker| worker.lifecycle == WorkerLifecycle::Ended));
     }
 
     #[test]
@@ -610,9 +679,16 @@ mod tests {
         ));
         assert_eq!(backend.inspected.into_inner(), vec![clean.clone(), dirty]);
         assert_eq!(backend.removed.into_inner(), vec![clean]);
+        let ended = load_run(&run.dir).expect("load ended run");
+        assert_eq!(ended.state.lifecycle, RunLifecycle::Ended);
         assert_eq!(
-            load_run(&run.dir).expect("load ended run").state.lifecycle,
-            RunLifecycle::Ended
+            ended
+                .state
+                .workers
+                .values()
+                .map(|worker| worker.lifecycle)
+                .collect::<Vec<_>>(),
+            [WorkerLifecycle::Ended, WorkerLifecycle::Ended]
         );
     }
 

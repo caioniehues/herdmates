@@ -5,8 +5,10 @@ teams** — Claude Code and Codex side by side as first-class teammates — unde
 single coordinating "god" agent session, with push-based status reporting instead
 of polling.
 
-> **Status: pre-v1 scaffold.** Design is locked (see [docs/spec.md](docs/spec.md)
-> and [docs/adr/](docs/adr/)); implementation has not started.
+> **Status: v1 complete.** All spec §10 acceptance checks passed live on a
+> real 2-worker heterogeneous team (2026-07-15): worktree isolation, brief
+> injection, push reporting into the god pane, a worker→god `msg` round-trip,
+> and clean teardown preserving the dirty worktree.
 
 ## What it does (v1)
 
@@ -22,9 +24,14 @@ of polling.
   pane. The god never polls.
 - **`team status` / `team kill`** — run-state inspection and teardown, backed by
   a durable run-state file in the plugin state dir.
+- **`msg` verb** — the one messaging channel workers are ever briefed on:
+  `herdr-agent-team msg <god|worker> "<text>"` resolves the target from the
+  run, delivers with a single verified `pane run`, and — for agents that can't
+  safely receive mid-turn — queues to a per-target **outbox** that the status
+  hook drains the moment the target goes idle. Sender never blocks, no daemon.
 - **Star or mesh topology** — per-team flag. Star (default): workers report only
-  to the god. Mesh: workers also get a peer table and can message each other via
-  `herdr agent send`.
+  to the god. Mesh: workers also get a peer table and message each other through
+  the same `msg` verb with a structured envelope.
 
 ## Why
 
@@ -38,8 +45,8 @@ control plane (agent status machine, blocking waits, native worktrees).
 
 | Agent | Status |
 |---|---|
-| Claude Code (`claude`) | first-class, live-tested |
-| Codex (`codex`) | first-class, live-tested with pane-run-only submission |
+| Claude Code (`claude`) | first-class, live-tested (mid-turn message queueing verified) |
+| Codex (`codex`) | first-class, live-tested (mid-turn queueing verified; note: codex's default sandbox blocks worker→god `msg` without approval — see `examples/agents.toml` for the permissive-entry trade-off) |
 | others | add via the data-driven launcher table in plugin config — no code changes |
 
 Every launch prompt is injected and submitted with one `herdr pane run` call.
@@ -47,7 +54,7 @@ For launchers with `submit_verify = true`, the plugin waits for status
 `working`; if that times out, it performs one empty `pane run` to submit the
 existing composer without duplicating the prompt, then verifies again.
 
-## Install (once released)
+## Install
 
 ```bash
 herdr plugin install caioniehues/herdr-agent-team
