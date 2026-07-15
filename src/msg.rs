@@ -139,12 +139,17 @@ fn send_to_targets<H: HerdrApi>(
     herdr: &H,
 ) -> Result<(), MsgError> {
     let names = if target == "all" {
-        run.state
+        let names = run
+            .state
             .workers
             .iter()
             .filter(|(_, worker)| !terminal_lifecycle(worker.lifecycle))
             .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Err(arguments("no live workers to message"));
+        }
+        names
     } else if target.contains(',') {
         let names = target
             .split(',')
@@ -896,6 +901,21 @@ mod tests {
     fn attention_rejects_non_singular_god_before_run_resolution() {
         let error = msg_command(&["all".into(), "text".into(), "--attention".into()]).unwrap_err();
         assert!(matches!(error, MsgError::Arguments(_)));
+    }
+
+    #[test]
+    fn fanout_all_rejects_a_run_with_no_live_workers() {
+        let temp = TempDir::new();
+        let mut run = fixture_run(temp.path(), "dead", "codex");
+        run.state.workers.get_mut("dead").unwrap().lifecycle = WorkerLifecycle::Ended;
+        let herdr = fake_herdr("codex", Some("idle"), []);
+
+        let error =
+            send_to_targets(&run, &default_launcher_table(), "all", "text", &herdr).unwrap_err();
+
+        assert!(matches!(error, MsgError::Arguments(_)));
+        assert!(error.to_string().contains("no live workers to message"));
+        assert!(herdr.typed_calls().is_empty());
     }
 
     #[test]
