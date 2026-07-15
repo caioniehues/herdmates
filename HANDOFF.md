@@ -39,7 +39,16 @@ Last updated 2026-07-15 (post research wave + docs overhaul).
 
 ## NEXT steps (in order)
 
-0. **v0.4.0 RELEASED 2026-07-15** (same day as v0.3.0 hook-correctness
+0. **v0.5.0 RELEASED 2026-07-15** (third release today): #6 schema-gated
+   metadata tokens (`src/metadata.rs` maps team facts onto the REAL 0.7.3
+   tokens — title/display_agent/custom_status/state_label; runtime
+   `api schema --json` gate with fallback; probe results on issue #6) +
+   aggregate notifications (once-only team-complete / blocked-beyond-threshold
+   with all-event sweep / worker-exit / explicit `msg --attention`).
+   123 tests. NEXT: #7 board pane — /prototype the layout FIRST (Caio's
+   instruction), then ticket. Then #8 socket backend (consider architecture
+   pass before it: HerdrApi duplicate, FakeHerdr x4, hook.rs seam).
+1. **v0.4.0 RELEASED 2026-07-15** (same day as v0.3.0 hook-correctness
    wave): #5 full `agent_session {source,agent,kind,value}` +
    `HerdrSessionIdentity` (HERDR_SOCKET_PATH/HERDR_SESSION) persisted per
    run at spawn/adopt, legacy run.toml still loads; #15 generated protocols
@@ -48,8 +57,6 @@ Last updated 2026-07-15 (post research wave + docs overhaul).
    no-git). 117 tests. Open follow-ups: #14 spawn dies midway (pending
    lifecycles), #16 manifest changes need plugin unlink+link, #17 serial
    90s agent-info timeout delays worker N+1.
-3. **Roadmap step 3 / Issue #6:** schema-gated metadata tokens (spec §8 step
-   3) + aggregate notifications.
 4. **Roadmap step 4 / Issue #7:** native board pane (`[[panes]]` + action +
    keybinds + link handler).
 5. **Roadmap step 5 / Issue #8:** direct socket backend behind `HerdrApi`
