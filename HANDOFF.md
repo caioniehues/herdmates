@@ -39,14 +39,13 @@ Last updated 2026-07-15 (post research wave + docs overhaul).
 
 ## NEXT steps (in order)
 
-0. **Hook-correctness wave DONE on `integration/hook-wave`** (2026-07-15,
-   PRs #12 + #13, gate green 114 tests, v0.3.0, all four issues live-verified
-   incl. the exact #10 watched-worker injection scenario) — **awaiting Caio's
-   word to merge to main/push/tag/close #4 #10 #11 #3**. Follow-up issue
-   candidates in task_plan.md observations: spawn dies midway leaving
-   `pending` lifecycles; generated protocol still says workers-never-git
-   (conflicts with 2026-07-15 git contract: workers commit/push/PR, god
-   merges); manifest changes need plugin unlink+link (disable/enable caches).
+0. **v0.3.0 RELEASED 2026-07-15** — hook-correctness wave shipped (PRs #12 +
+   #13 merged, tag pushed, #4 #10 #11 #3 closed; 114 tests; all fixes
+   live-verified incl. the exact #10 watched-worker injection scenario).
+   Follow-ups filed: #14 spawn dies midway leaving `pending` lifecycles;
+   #15 generated protocol still says workers-never-git (new contract:
+   workers commit/push/PR on own branch, god reviews/merges); #16 manifest
+   event changes need plugin unlink+link (disable/enable serves cache).
 1. **Roadmap step 2 / Issue #5:** persist full `agent_session
    {source,agent,kind,value}` + herdr session identity.
 3. **Roadmap step 3 / Issue #6:** schema-gated metadata tokens (spec §8 step
