@@ -205,11 +205,18 @@ feature.
    ordinary status flip. `HERDR_AGENT_TEAM_BLOCKED_THRESHOLD_MS` configures
    the blocked-duration policy (default: five minutes; checked on subsequent
    lifecycle/status events because this plugin has no daemon).
-4. **Native board pane**: `[[panes]]` entrypoint (durable tab placement +
-   popup variant), `open-board` action, `plugin_action` keybinds, link
-   handler making report/task pointers clickable. Board shows team
-   membership, tasks, dependencies, reports, mailbox state — never a
-   generic agent list (herdr's sidebar owns that).
+4. **Native board pane — repurposed 2026-07-15 (issue #7 comment, after
+   prototype round 1): the human's CONTROL DECK for the god's team, not a
+   status dashboard.** Per-worker row actions are first-class — msg worker,
+   ack/answer attention, kill worker, adopt pane, open report — issued from
+   the board without interrupting the god session (`[[panes]]` entrypoint
+   with durable tab + popup variant, `open-board` action, `plugin_action`
+   keybinds, link handler making report/task pointers hot). Informational
+   core = run-scoped facts nothing else renders: tasks, dependencies (source
+   to be defined by the ticket — the run holds none today), report links,
+   mailbox state. Status rendering stays minimal: one team strip; per-pane
+   status belongs to the sidebar via step-3 metadata — never a generic
+   agent list.
 5. **Direct socket backend behind `HerdrApi`** (ADR-0011): snapshot +
    subscription for the board and aggregate `team wait
    [--until all|any|blocked|report]`; CLI stays default/fallback.
