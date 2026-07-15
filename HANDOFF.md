@@ -17,10 +17,19 @@ and core wave are committed; docs remain the contract.
 - 2026-07-15: docs+ADR-0008 `2cd4e31`; waves 2+2.5 `15cd171` (spawn, hook,
   status/kill, `msg` verb, `queues_midturn`, msg-only protocols); ticket 15
   outbox drain `9e2f613`; ticket 10 worktree workers `20b8633`.
-- Central gate green: build, fmt, Clippy `-D warnings`, 82 tests. Release
-  binary pre-built. Manifest carries spawn/status/kill actions + the event
-  hook. **Everything before the DoD is code-complete; only the human-watched
-  DoD run (spec §10) remains.**
+- Ticket 16 (agent-start tolerance, found by DoD run 1): `051c1dc`.
+- Central gate green: build, fmt, Clippy `-D warnings`, 83 tests.
+- **DoD (spec §10) PASSED 2026-07-15, run 2 on the limux repo**, plugin
+  linked+enabled live: worktree+setup+pane-cwd correct (ADR-0004), both
+  workers briefed and started, status-flip pointer injections landed in the
+  god pane within seconds, `msg` round-trip god→builder→god verified
+  (PONG), durable reports in the run inbox, `team kill` closed workspaces
+  and preserved the dirty worktree. Evidence: run dir
+  `dod-demo-1784075553674` under the plugin state dir; dirty worktree
+  `~/.herdr/worktrees/limux/dod-builder-1` kept for inspection.
+- Open: ticket 17 (workers need PATH/env to invoke the briefed `msg` verb —
+  claude improvised, codex would fail) + cosmetic worker-lifecycle-after-kill
+  bookkeeping. Ticket 17 is the last blocker before the publish conversation.
 - Local git only — **NOT on GitHub yet.** Publishing = create public repo
   `caioniehues/herdr-agent-team` + topic `herdr-plugin` (marketplace auto-lists
   in ~30 min). Ask Caio before pushing.
