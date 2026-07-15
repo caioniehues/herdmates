@@ -374,7 +374,13 @@ fn release_adopted_workers(run: &mut RunBoard, backend: &impl TeardownBackend) {
         .state
         .workers
         .iter()
-        .filter(|(_, worker)| worker.adopted && worker.lifecycle != WorkerLifecycle::Released)
+        .filter(|(_, worker)| {
+            worker.adopted
+                && !matches!(
+                    worker.lifecycle,
+                    WorkerLifecycle::Failed | WorkerLifecycle::Released
+                )
+        })
         .map(|(name, worker)| (name.clone(), worker.pane_id.clone()))
         .collect::<Vec<_>>();
     let notice = release_notice(&run.state.spec.name);
@@ -409,6 +415,9 @@ fn log_teardown_note(resource: &str, identifier: &str, error: &StatusKillError) 
 fn end_worker_lifecycles(run: &mut RunBoard) -> bool {
     let mut changed = false;
     for worker in run.state.workers.values_mut() {
+        if worker.lifecycle == WorkerLifecycle::Failed {
+            continue;
+        }
         let terminal = if worker.adopted {
             WorkerLifecycle::Released
         } else {
@@ -740,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn kill_ends_failed_workers_with_every_other_owned_worker() {
+    fn kill_preserves_failed_workers_while_ending_every_other_lifecycle() {
         let temp = TempDir::new();
         let mut state = run_state(temp.path());
         state
@@ -761,8 +770,30 @@ mod tests {
         );
         assert_eq!(
             ended.state.workers["reviewer"].lifecycle,
-            WorkerLifecycle::Ended
+            WorkerLifecycle::Failed
         );
+    }
+
+    #[test]
+    fn kill_preserves_failed_adopted_workers_without_releasing_them() {
+        let temp = TempDir::new();
+        let mut state = run_state(temp.path());
+        let adopted = state.workers.get_mut("reviewer").expect("reviewer runtime");
+        adopted.adopted = true;
+        adopted.pane_id = Some("pane-failed".to_owned());
+        adopted.lifecycle = WorkerLifecycle::Failed;
+        let run = create_run(temp.path(), state).expect("create failed adopted run");
+        let backend = FakeTeardown::default();
+
+        kill_run_with_backend(&run.dir, false, &backend).expect("kill run");
+
+        let ended = load_run(&run.dir).expect("load ended run");
+        assert_eq!(ended.state.lifecycle, RunLifecycle::Ended);
+        assert_eq!(
+            ended.state.workers["reviewer"].lifecycle,
+            WorkerLifecycle::Failed
+        );
+        assert!(backend.notices.into_inner().is_empty());
     }
 
     #[test]
