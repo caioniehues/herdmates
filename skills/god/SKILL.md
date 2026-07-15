@@ -84,11 +84,12 @@ Use the narrowest condition that unlocks the next coordinator action. Always spe
 Exit codes:
 
 - `0`: condition reached.
-- `1`: usage, I/O, or configuration error.
+- `1`: usage, I/O, configuration, or explicitly selected inactive-run error.
 - `2`: timeout; inspect, communicate, then wait again with a fresh bound.
-- `3`: a required worker failed or became orphaned without a report; triage immediately.
+- `3`: the condition became unsatisfiable because required workers failed or became orphaned; triage immediately.
+- `4`: the run became inactive while polling.
 
-Never key coordination on `done`: it is an idle-plus-unseen attention presentation. Report-file existence is completion truth. `blocked` and `attention` come from durable hook metadata; `all-terminal` comes from worker lifecycle and does not mean every report exists.
+An unknown worker in `report:<worker>` fails before polling. Never key coordination on `done`: it is an idle-plus-unseen attention presentation. Report-file existence is completion truth. `blocked` and `attention` come from durable hook metadata. `all-terminal` comes from worker lifecycle, counts failed and orphaned workers as terminal, and does not mean every report exists. If every worker is terminal before `blocked` or `attention` can be reached, wait exits `3` with the dead-worker verdict.
 
 ## Inbox
 
@@ -112,7 +113,7 @@ Without `--head`, print the absolute report path. With `--head N`, print at most
 herdr-agent-team msg <god|worker|all|a,b> <text> [--attention] [--run <dir>]
 ```
 
-From the god, target one worker, every worker with `all`, or a comma-separated worker list. Multi-target delivery deduplicates names. Each target retains its launcher readiness gate and outbox discipline: a successful exit can mean safely enqueued for later delivery. Use `--attention` only for the singular `god` target; workers use it to request explicit god attention. Exit `0` means every target was delivered or enqueued; exit `1` means validation, resolution, or delivery failed.
+From the god, target one worker, every non-terminal worker with `all`, or a comma-separated worker list. Multi-target delivery deduplicates names and prevalidates the complete target set before delivering anything, so an invalid target causes no partial send. After validation, it attempts every target and aggregates any failures instead of stopping at the first one. Each target retains its launcher readiness gate and outbox discipline: a successful exit can mean safely enqueued for later delivery. Use `--attention` only with the singular `god` target; every other form is a usage error. Workers use it to request explicit god attention. Exit `0` means every target was delivered or enqueued; exit `1` means validation, resolution, or one or more deliveries failed.
 
 Use the msg verb only. Never brief workers to use raw `herdr agent send`. The msg verb uses `pane run`, honors `queues_midturn`, and puts messages for unsafe busy targets into the outbox until a later status flip drains them.
 
