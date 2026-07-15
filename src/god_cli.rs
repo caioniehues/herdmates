@@ -61,6 +61,12 @@ pub struct GodSnapshot {
 /// Polling seam intentionally mirrors `BoardCollector`; #8 can replace it.
 pub trait GodCollector {
     fn collect(&self) -> Result<GodSnapshot, GodCliError>;
+    fn wait_for_change(&self, timeout: Duration) {
+        thread::sleep(timeout);
+    }
+    fn subscription_panes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 pub struct RunGodCollector {
@@ -70,6 +76,17 @@ pub struct RunGodCollector {
 impl GodCollector for RunGodCollector {
     fn collect(&self) -> Result<GodSnapshot, GodCliError> {
         collect_snapshot(&self.run_dir)
+    }
+    fn subscription_panes(&self) -> Vec<String> {
+        load_run(&self.run_dir)
+            .map(|run| {
+                run.state
+                    .workers
+                    .values()
+                    .filter_map(|worker| worker.pane_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -177,9 +194,15 @@ pub fn report_command(args: &[String]) -> Result<(), GodCliError> {
 pub fn wait_command(args: &[String]) -> Result<WaitVerdict, GodCliError> {
     let (run_dir, until, timeout, json) = parse_wait(args)?;
     let run_dir = select_wait_run(run_dir.as_deref())?;
-    let collector = RunGodCollector { run_dir };
+    let fallback = RunGodCollector { run_dir };
+    let collector: Box<dyn GodCollector> = match crate::socket::SocketClient::try_from_env() {
+        Some(socket) => Box::new(crate::socket_backend::SocketGodCollector::new(
+            socket, fallback,
+        )),
+        None => Box::new(fallback),
+    };
     validate_until(&collector.collect()?, &until)?;
-    let verdict = wait_with(&collector, &until, timeout)?;
+    let verdict = wait_with(collector.as_ref(), &until, timeout)?;
     if json {
         println!("{}", serde_json::to_string(&verdict)?);
     } else {
@@ -189,12 +212,18 @@ pub fn wait_command(args: &[String]) -> Result<WaitVerdict, GodCliError> {
 }
 
 pub fn wait_with(
-    collector: &impl GodCollector,
+    collector: &(impl GodCollector + ?Sized),
     until: &Until,
     timeout: Duration,
 ) -> Result<WaitVerdict, GodCliError> {
     let start = Instant::now();
+    let deadline = start + timeout;
+    let mut first = true;
     loop {
+        if !first && Instant::now() >= deadline {
+            return Ok(verdict(VerdictKind::Timeout, until, None, start));
+        }
+        first = false;
         let snapshot = collector.collect()?;
         if snapshot.lifecycle != RunLifecycle::Active {
             return Ok(verdict(VerdictKind::InactiveRun, until, None, start));
@@ -205,10 +234,11 @@ pub fn wait_with(
         if condition_met(&snapshot, until) {
             return Ok(verdict(VerdictKind::Reached, until, None, start));
         }
-        if start.elapsed() >= timeout {
+        if Instant::now() >= deadline {
             return Ok(verdict(VerdictKind::Timeout, until, None, start));
         }
-        thread::sleep(POLL_INTERVAL.min(timeout.saturating_sub(start.elapsed())));
+        collector
+            .wait_for_change(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -525,6 +555,23 @@ mod tests {
             worker_lifecycles: vec![("a".into(), life)],
             statuses: vec![("a".into(), status.into())],
         }
+    }
+    struct DeadlineCollector;
+    impl GodCollector for DeadlineCollector {
+        fn collect(&self) -> Result<GodSnapshot, GodCliError> {
+            Ok(snap(false, "working", WorkerLifecycle::Running))
+        }
+        fn wait_for_change(&self, timeout: Duration) {
+            std::thread::sleep(timeout);
+        }
+    }
+    #[test]
+    fn wait_preserves_total_deadline_without_second_fallback_sleep() {
+        let timeout = Duration::from_millis(40);
+        let started = Instant::now();
+        let verdict = wait_with(&DeadlineCollector, &Until::AnyReport, timeout).unwrap();
+        assert_eq!(verdict.verdict, VerdictKind::Timeout);
+        assert!(started.elapsed() < Duration::from_millis(80));
     }
     #[test]
     fn every_until_mode_resolves() {
