@@ -3,9 +3,10 @@
 use crate::herdr::{HerdrApi, HerdrClient};
 use crate::metadata::{map_facts, MetadataCapabilities, MetadataFacts};
 use crate::msg;
-use crate::reconcile::{reconcile_at, IncomingEvent, ReconciliationAction};
+use crate::reconcile::{reconcile_at_with_reports, IncomingEvent, ReconciliationAction};
 use crate::run;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,10 +76,23 @@ pub fn on_agent_status<H: HerdrApi>(
             .unwrap_or(300_000);
         let (run, reconciliation) =
             run::update_run_with_hook(&listed_run.dir, |run, metadata| -> Result<_, HookError> {
-                let mut reconciliation = reconcile_at(
+                let reports_present = run
+                    .state
+                    .workers
+                    .keys()
+                    .filter(|worker_name| {
+                        run.dir
+                            .join("inbox")
+                            .join(format!("{worker_name}.md"))
+                            .is_file()
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let mut reconciliation = reconcile_at_with_reports(
                     &event,
                     run.state.clone(),
                     metadata.clone(),
+                    &reports_present,
                     now_ms,
                     blocked_threshold_ms,
                 );
@@ -869,6 +883,8 @@ mod tests {
         let temp = TempDir::new();
         let run = fixture_run(temp.path(), "worker-pane");
         let fake = FakeHerdr::new(&temp);
+        // Team-complete requires the durable report, not just terminal status.
+        fs::write(run.dir.join("inbox/builder.md"), "# report\n").expect("write fixture report");
 
         for status in ["blocked", "done"] {
             on_agent_status(

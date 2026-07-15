@@ -449,7 +449,7 @@ herdr primitives; they get one plugin verb.
 ### `msg` subcommand
 
 ```
-herdr-agent-team msg <target> <text> [--attention] [--run <run-dir>]
+herdr-agent-team msg <target> <text> [--attention] [--ack] [--run <run-dir>]
 ```
 
 - `<target>`: `god` or a worker name from the active run. Resolution: name →
@@ -475,6 +475,25 @@ herdr-agent-team msg <target> <text> [--attention] [--run <run-dir>]
   pending transient metadata ping, and `notification show` is emitted only
   once for that worker. This is the explicit attention channel; agent status
   values remain Herdr's fixed enum.
+
+### Attention lifecycle (raise / observe / clear — decided 2026-07-15)
+
+Attention has an **owned lifecycle** in durable run state
+(`[hook] attention_pending` in `run.toml`); it is never consumed as a side
+effect of unrelated activity.
+
+- **Raise** — worker-owned: `msg god <text> --attention` sets
+  `attention_pending[<worker>] = true` and emits one `notification show`
+  per raise cycle (gated by `aggregate_notifications["attention:<w>"]`).
+- **Observe** — read-only, everywhere: the inbox row (`attention=true`),
+  `team wait --until attention`, and every hook metadata publish carry the
+  pending flag. Status flips (idle/working/blocked/done/unknown) re-publish
+  it but MUST NOT clear it.
+- **Clear** — god-owned: `msg <worker> <text> --ack` answers the worker and
+  clears `attention_pending[<worker>]` plus the raise-notification gate, so
+  a later raise notifies again. `--ack` is valid only for a god message to
+  a single worker (never `god`, `all`, comma lists, or with `--attention`).
+  The board's `[g] ack` row action issues exactly this verb.
 
 ### Outbox + hook drain
 

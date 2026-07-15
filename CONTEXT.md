@@ -43,6 +43,12 @@ drift here first.
   distinct from the repository's authored `AGENTS.md`, which remains untouched.
 - **Status flip** — a Herdr agent-status transition (idle/working/blocked/
   done/unknown). Flips to `blocked`/`done` trigger the report flow.
+- **Attention lifecycle** — the owned raise/observe/clear cycle of a worker's
+  explicit attention request. Raised by the worker (`msg god <text>
+  --attention`), persisted in durable run state (`attention_pending`),
+  observable on the inbox/board and every metadata publish, and cleared only
+  by an explicit god-side ack (`msg <worker> <text> --ack`). Status flips
+  never consume it.
 - **Evidence hierarchy / authority tags** — claim authority labels: `live`
   (current observed behavior), `source` (local upstream source), and `preview`
   (runtime schema probe required), per ADR-0010.

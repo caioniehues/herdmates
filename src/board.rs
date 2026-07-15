@@ -163,6 +163,7 @@ pub fn action_args(
             "msg".into(),
             worker.clone(),
             "acknowledged".into(),
+            "--ack".into(),
             "--run".into(),
             run,
         ]),
@@ -490,7 +491,7 @@ mod tests {
                 None
             ),
             Some(
-                vec!["msg", "f", "acknowledged", "--run", "/runs/team"]
+                vec!["msg", "f", "acknowledged", "--ack", "--run", "/runs/team"]
                     .into_iter()
                     .map(String::from)
                     .collect()
