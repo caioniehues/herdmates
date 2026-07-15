@@ -527,15 +527,25 @@ herdr-agent-team report <worker> [--run <dir>] [--head N]
 - `wait` polls through `GodCollector`, a small snapshot seam intended for the
   future socket backend. Default timeout is 300 seconds and is always bounded.
   Reached exits 0, timeout exits 2, and an orphaned/failed required worker
-  without its report exits 3. `--json` emits one stable single-line verdict.
+  without its report exits 3. A run that becomes inactive during the wait
+  returns the distinct `inactive_run` verdict and exits 4; an explicitly
+  selected inactive run is rejected before polling. Usage, resolution, and I/O
+  errors exit 1. `--json` emits one stable single-line verdict.
 - Report-file existence is completion truth. `blocked` and `attention` come
   from durable hook metadata; `all-terminal` comes from worker lifecycle.
+  `all-terminal` is literal: failed and orphaned workers count as terminal and
+  the condition exits 0. For `blocked`/`attention`, an all-terminal team that
+  cannot satisfy the condition returns the dead-worker verdict instead.
 - `inbox` emits one worker row with report presence/mtime, attention, read
   state, and `STOPPED-NOT-DONE` when an idle/done pointer state has no report.
   `--unread` retains missing reports and reports newer than their read mark.
 - `report` prints the absolute report path, or at most `N` lines with
   `--head`, then transactionally persists the report mtime as its read mark in
   `run.toml` so the mark survives process and agent-context restarts.
+  Printing the durable path is an intentional pointer handoff and counts as
+  read even when `--head` is omitted.
 - When `HERDR_PLUGIN_STATE_DIR` / `HERDR_PLUGIN_CONFIG_DIR` are absent, the
   executable derives Herdr's stable XDG/home plugin layout using its manifest
   id `caioniehues.agent-team`. Explicit environment always wins.
+  This fallback targets release Herdr's `herdr/` app directory; debug Herdr's
+  `herdr-dev/` layout requires explicit injected environment.

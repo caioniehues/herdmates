@@ -50,53 +50,86 @@ fn resolve_dir(
     home_suffix: &str,
     herdr_suffix: PathBuf,
 ) -> Result<PathBuf, PathError> {
-    if let Some(path) = env::var_os(explicit) {
+    resolve_dir_values(
+        explicit,
+        env::var_os(explicit),
+        env::var_os(xdg),
+        env::var_os("HOME"),
+        home_suffix,
+        herdr_suffix,
+    )
+}
+
+fn resolve_dir_values(
+    explicit_name: &'static str,
+    explicit: Option<std::ffi::OsString>,
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    home_suffix: &str,
+    herdr_suffix: PathBuf,
+) -> Result<PathBuf, PathError> {
+    if let Some(path) = explicit {
         return Ok(PathBuf::from(path));
     }
-    let base = env::var_os(xdg)
+    let base = xdg
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(home_suffix)))
-        .ok_or(PathError::Unresolved { name: explicit })?;
+        .or_else(|| home.map(|home| PathBuf::from(home).join(home_suffix)))
+        .ok_or(PathError::Unresolved {
+            name: explicit_name,
+        })?;
     Ok(base.join(herdr_suffix))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn explicit_environment_wins_and_well_known_layout_is_fallback() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        env::set_var("HERDR_PLUGIN_STATE_DIR", "/explicit/state");
-        env::set_var("XDG_STATE_HOME", "/xdg/state");
-        assert_eq!(state_dir().unwrap(), PathBuf::from("/explicit/state"));
-        env::remove_var("HERDR_PLUGIN_STATE_DIR");
         assert_eq!(
-            state_dir().unwrap(),
+            resolve_dir_values(
+                "HERDR_PLUGIN_STATE_DIR",
+                Some("/explicit/state".into()),
+                Some("/xdg/state".into()),
+                None,
+                ".local/state",
+                Path::new("herdr/plugins").join(PLUGIN_ID),
+            )
+            .unwrap(),
+            PathBuf::from("/explicit/state")
+        );
+        assert_eq!(
+            resolve_dir_values(
+                "HERDR_PLUGIN_STATE_DIR",
+                None,
+                Some("/xdg/state".into()),
+                None,
+                ".local/state",
+                Path::new("herdr/plugins").join(PLUGIN_ID),
+            )
+            .unwrap(),
             PathBuf::from("/xdg/state/herdr/plugins").join(PLUGIN_ID)
         );
-        env::remove_var("XDG_STATE_HOME");
     }
 
     #[test]
     fn missing_environment_has_a_clear_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = ["HERDR_PLUGIN_CONFIG_DIR", "XDG_CONFIG_HOME", "HOME"]
-            .map(|key| (key, env::var_os(key)));
-        for (key, _) in &saved {
-            env::remove_var(key);
-        }
-        assert!(config_dir()
-            .unwrap_err()
-            .to_string()
-            .contains("HERDR_PLUGIN_CONFIG_DIR"));
-        for (key, value) in saved {
-            if let Some(value) = value {
-                env::set_var(key, value);
-            }
-        }
+        assert!(resolve_dir_values(
+            "HERDR_PLUGIN_CONFIG_DIR",
+            None,
+            None,
+            None,
+            ".config",
+            Path::new("herdr/plugins/config").join(PLUGIN_ID),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("HERDR_PLUGIN_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn plugin_id_matches_the_authored_manifest() {
+        let manifest: toml::Value = toml::from_str(include_str!("../herdr-plugin.toml")).unwrap();
+        assert_eq!(manifest["id"].as_str(), Some(PLUGIN_ID));
     }
 }

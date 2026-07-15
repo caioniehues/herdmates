@@ -27,6 +27,10 @@ pub enum GodCliError {
     NoActiveRun(PathBuf),
     #[error("unknown worker `{0}`")]
     UnknownWorker(String),
+    #[error("unknown worker `{worker}`; candidates: {candidates}")]
+    UnknownWaitWorker { worker: String, candidates: String },
+    #[error("run is not active: {0}")]
+    InactiveRun(PathBuf),
     #[error("report is not present for worker `{0}`")]
     MissingReport(String),
     #[error("report I/O failed: {0}")]
@@ -84,6 +88,7 @@ pub enum Until {
 pub enum VerdictKind {
     Reached,
     DeadWorker,
+    InactiveRun,
     Timeout,
 }
 
@@ -102,6 +107,7 @@ impl WaitVerdict {
             VerdictKind::Reached => 0,
             VerdictKind::Timeout => 2,
             VerdictKind::DeadWorker => 3,
+            VerdictKind::InactiveRun => 4,
         }
     }
 }
@@ -170,9 +176,9 @@ pub fn report_command(args: &[String]) -> Result<(), GodCliError> {
 
 pub fn wait_command(args: &[String]) -> Result<WaitVerdict, GodCliError> {
     let (run_dir, until, timeout, json) = parse_wait(args)?;
-    let collector = RunGodCollector {
-        run_dir: select_run(run_dir.as_deref())?,
-    };
+    let run_dir = select_wait_run(run_dir.as_deref())?;
+    let collector = RunGodCollector { run_dir };
+    validate_until(&collector.collect()?, &until)?;
     let verdict = wait_with(&collector, &until, timeout)?;
     if json {
         println!("{}", serde_json::to_string(&verdict)?);
@@ -190,6 +196,9 @@ pub fn wait_with(
     let start = Instant::now();
     loop {
         let snapshot = collector.collect()?;
+        if snapshot.lifecycle != RunLifecycle::Active {
+            return Ok(verdict(VerdictKind::InactiveRun, until, None, start));
+        }
         if let Some(worker) = dead_worker(&snapshot, until) {
             return Ok(verdict(VerdictKind::DeadWorker, until, Some(worker), start));
         }
@@ -235,15 +244,42 @@ fn dead_worker(s: &GodSnapshot, until: &Until) -> Option<String> {
     let required = |name: &str| match until {
         Until::Report(w) => w == name,
         Until::AnyReport => !s.rows.iter().any(|r| r.report_present),
-        Until::AllReports | Until::AllTerminal => true,
-        _ => false,
+        Until::AllReports => true,
+        Until::Blocked | Until::Attention => all_terminal_without_reports(s),
+        Until::AllTerminal => false,
     };
     s.worker_lifecycles.iter().find_map(|(name, state)| {
-        (required(name)
-            && matches!(state, WorkerLifecycle::Failed | WorkerLifecycle::Orphaned)
-            && !s.rows.iter().any(|r| r.worker == *name && r.report_present))
-        .then(|| name.clone())
+        let dead = matches!(state, WorkerLifecycle::Failed | WorkerLifecycle::Orphaned)
+            || (matches!(until, Until::Blocked | Until::Attention) && terminal(*state));
+        (required(name) && dead && !s.rows.iter().any(|r| r.worker == *name && r.report_present))
+            .then(|| name.clone())
     })
+}
+
+fn all_terminal_without_reports(snapshot: &GodSnapshot) -> bool {
+    !snapshot.worker_lifecycles.is_empty()
+        && snapshot
+            .worker_lifecycles
+            .iter()
+            .all(|(_, lifecycle)| terminal(*lifecycle))
+        && snapshot.rows.iter().all(|row| !row.report_present)
+}
+
+fn validate_until(snapshot: &GodSnapshot, until: &Until) -> Result<(), GodCliError> {
+    if let Until::Report(worker) = until {
+        if !snapshot.rows.iter().any(|row| row.worker == *worker) {
+            return Err(GodCliError::UnknownWaitWorker {
+                worker: worker.clone(),
+                candidates: snapshot
+                    .rows
+                    .iter()
+                    .map(|row| row.worker.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn terminal(state: WorkerLifecycle) -> bool {
@@ -319,6 +355,14 @@ fn select_run(explicit: Option<&Path>) -> Result<PathBuf, GodCliError> {
         .pop()
         .map(|r| r.dir)
         .ok_or(GodCliError::NoActiveRun(state))
+}
+
+fn select_wait_run(explicit: Option<&Path>) -> Result<PathBuf, GodCliError> {
+    let path = select_run(explicit)?;
+    if load_run(&path)?.state.lifecycle != RunLifecycle::Active {
+        return Err(GodCliError::InactiveRun(path));
+    }
+    Ok(path)
 }
 
 fn parse_inbox(args: &[String]) -> Result<(Option<PathBuf>, bool, bool), GodCliError> {
@@ -543,6 +587,28 @@ mod tests {
                 .exit_code(),
             2
         );
+    }
+
+    #[test]
+    fn inactive_run_unknown_report_and_terminal_conditions_are_distinct() {
+        let mut inactive = snap(false, "working", WorkerLifecycle::Running);
+        inactive.lifecycle = RunLifecycle::Ended;
+        let fake = Fake {
+            snapshots: std::sync::Mutex::new(vec![inactive]),
+        };
+        let verdict = wait_with(&fake, &Until::AnyReport, Duration::from_secs(1)).unwrap();
+        assert_eq!(verdict.verdict, VerdictKind::InactiveRun);
+        assert_eq!(verdict.exit_code(), 4);
+
+        let running = snap(false, "working", WorkerLifecycle::Running);
+        let error = validate_until(&running, &Until::Report("missing".into())).unwrap_err();
+        assert!(error.to_string().contains("candidates: a"));
+
+        let terminal = snap(false, "done", WorkerLifecycle::Orphaned);
+        assert!(condition_met(&terminal, &Until::AllTerminal));
+        assert_eq!(dead_worker(&terminal, &Until::AllTerminal), None);
+        assert_eq!(dead_worker(&terminal, &Until::Blocked), Some("a".into()));
+        assert_eq!(dead_worker(&terminal, &Until::Attention), Some("a".into()));
     }
 
     #[test]
