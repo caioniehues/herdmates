@@ -338,8 +338,9 @@ fn adopt_resolved<H: HerdrApi>(
         brief: arguments.brief.clone().unwrap_or_default(),
     };
 
-    let (mut run, worker, mut disposition) = match target {
-        RunTarget::Existing(run) => prepare_existing_run(*run, requested_worker, &pane)?,
+    let (mut run, worker, disposition, bootstrapped) = match target {
+        RunTarget::Existing(run) => prepare_existing_run(*run, requested_worker, &pane)
+            .map(|(run, worker, disposition)| (run, worker, disposition, false))?,
         RunTarget::Bootstrap => bootstrap_run(
             state_dir,
             arguments.team.as_deref().unwrap_or(DEFAULT_TEAM),
@@ -347,7 +348,7 @@ fn adopt_resolved<H: HerdrApi>(
             &requested_worker,
             &pane,
         )
-        .map(|run| (run, requested_worker, AdoptDisposition::Adopted))?,
+        .map(|run| (run, requested_worker, AdoptDisposition::Adopted, true))?,
     };
     if disposition == AdoptDisposition::NothingToDo {
         return Ok(AdoptOutcome {
@@ -360,16 +361,37 @@ fn adopt_resolved<H: HerdrApi>(
     let (fresh, should_submit) =
         update_run_with_hook(&run.dir, |fresh, _| -> Result<bool, AdoptError> {
             fresh.state.herdr_session = session;
-            if disposition == AdoptDisposition::Adopted
-                && !fresh.state.workers.contains_key(&worker.name)
-            {
-                validate_new_worker(fresh, &worker, &pane)?;
-                insert_adopted_worker(&mut fresh.state, &worker, &pane);
+            if disposition == AdoptDisposition::Adopted {
+                if bootstrapped {
+                    validate_recovery_worker(fresh, &worker, &pane)?;
+                } else {
+                    validate_new_worker(fresh, &worker, &pane)?;
+                    insert_adopted_worker(&mut fresh.state, &worker, &pane);
+                }
+            }
+            let state = fresh.state.workers.get_mut(&worker.name).ok_or_else(|| {
+                AdoptError::DuplicateWorker {
+                    worker: worker.name.clone(),
+                    run_dir: fresh.dir.clone(),
+                }
+            })?;
+            if state.pane_id.as_deref() != Some(&pane.pane_id) || !state.adopted {
+                return Err(AdoptError::DuplicateWorker {
+                    worker: worker.name.clone(),
+                    run_dir: fresh.dir.clone(),
+                });
             }
             if disposition == AdoptDisposition::Recovered {
-                return match fresh.state.workers[&worker.name].lifecycle {
-                    WorkerLifecycle::Pending => Ok(true),
-                    WorkerLifecycle::Running => Ok(false),
+                return match (state.lifecycle, state.launch_checkpoint) {
+                    (
+                        WorkerLifecycle::Pending,
+                        crate::types::WorkerLaunchCheckpoint::BriefSubmitted,
+                    ) => {
+                        state.lifecycle = WorkerLifecycle::Running;
+                        Ok(false)
+                    }
+                    (WorkerLifecycle::Pending, _) => Ok(true),
+                    (WorkerLifecycle::Running, _) => Ok(false),
                     _ => Err(AdoptError::DuplicateWorker {
                         worker: worker.name.clone(),
                         run_dir: fresh.dir.clone(),
@@ -380,7 +402,6 @@ fn adopt_resolved<H: HerdrApi>(
         })?;
     run = fresh;
     if !should_submit {
-        disposition = AdoptDisposition::NothingToDo;
         return Ok(AdoptOutcome {
             run,
             unknown_agent,
@@ -410,7 +431,7 @@ fn adopt_resolved<H: HerdrApi>(
         update_adopted_lifecycle(&mut run, &worker.name, WorkerLifecycle::Failed)?;
         return Err(error.into());
     }
-    update_adopted_lifecycle(&mut run, &worker.name, WorkerLifecycle::Running)?;
+    complete_adopted_submission(&mut run, &worker.name)?;
     Ok(AdoptOutcome {
         run,
         unknown_agent,
@@ -513,17 +534,60 @@ fn validate_new_worker(
     Ok(())
 }
 
+fn validate_recovery_worker(
+    run: &RunBoard,
+    worker: &WorkerSpec,
+    pane: &PaneInfo,
+) -> Result<(), AdoptError> {
+    let state = run
+        .state
+        .workers
+        .get(&worker.name)
+        .ok_or_else(|| AdoptError::DuplicateWorker {
+            worker: worker.name.clone(),
+            run_dir: run.dir.clone(),
+        })?;
+    if !state.adopted || state.pane_id.as_deref() != Some(&pane.pane_id) {
+        return Err(AdoptError::DuplicateWorker {
+            worker: worker.name.clone(),
+            run_dir: run.dir.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn complete_adopted_submission(run: &mut RunBoard, worker_name: &str) -> Result<(), AdoptError> {
+    let (fresh, ()) = update_run_with_hook(&run.dir, |fresh, _| -> Result<(), AdoptError> {
+        let run_dir = fresh.dir.clone();
+        let worker = fresh.state.workers.get_mut(worker_name).ok_or_else(|| {
+            AdoptError::DuplicateWorker {
+                worker: worker_name.to_owned(),
+                run_dir,
+            }
+        })?;
+        worker.launch_checkpoint = crate::types::WorkerLaunchCheckpoint::BriefSubmitted;
+        if worker.lifecycle == WorkerLifecycle::Pending {
+            worker.lifecycle = WorkerLifecycle::Running;
+        }
+        Ok(())
+    })?;
+    *run = fresh;
+    Ok(())
+}
+
 fn update_adopted_lifecycle(
     run: &mut RunBoard,
     worker_name: &str,
     lifecycle: WorkerLifecycle,
 ) -> Result<(), AdoptError> {
     let (fresh, ()) = update_run_with_hook(&run.dir, |fresh, _| -> Result<(), AdoptError> {
-        let worker = fresh
-            .state
-            .workers
-            .get_mut(worker_name)
-            .expect("adopted worker exists in persisted run state");
+        let run_dir = fresh.dir.clone();
+        let worker = fresh.state.workers.get_mut(worker_name).ok_or_else(|| {
+            AdoptError::DuplicateWorker {
+                worker: worker_name.to_owned(),
+                run_dir,
+            }
+        })?;
         if worker.lifecycle == WorkerLifecycle::Pending {
             worker.lifecycle = lifecycle;
         }
@@ -894,14 +958,64 @@ mod tests {
             outcome.run.state.workers["newcomer"].lifecycle,
             WorkerLifecycle::Running
         );
-        assert!(fake
-            .calls()
+        let pane_runs = fake
+            .typed_calls
+            .borrow()
             .iter()
-            .any(|call| call.starts_with("pane_run:pane-adopted:The repository")));
+            .filter(|call| matches!(call, crate::herdr::test_support::FakeCall::PaneRun(..)))
+            .count();
+        assert_eq!(
+            pane_runs, 1,
+            "recovery submits one prompt and no launcher command"
+        );
+    }
+
+    #[test]
+    fn recovered_brief_checkpoint_skips_duplicate_submission() {
+        let temp = TempDir::new();
+        let mut run = existing_run(temp.path(), Topology::Star);
+        let fake = fake_herdr(temp.path(), Some("codex"));
+        let worker = WorkerSpec {
+            name: "newcomer".to_owned(),
+            agent: "codex".to_owned(),
+            role: DEFAULT_ROLE.to_owned(),
+            task: None,
+            worktree: false,
+            branch: None,
+            brief: PathBuf::new(),
+        };
+        insert_adopted_worker(
+            &mut run.state,
+            &worker,
+            fake.pane.borrow().as_ref().unwrap(),
+        );
+        run.state
+            .workers
+            .get_mut("newcomer")
+            .unwrap()
+            .launch_checkpoint = crate::types::WorkerLaunchCheckpoint::BriefSubmitted;
+        crate::run::save_run(&run).unwrap();
+
+        let outcome = adopt_resolved(
+            adopted_arguments("newcomer"),
+            RunTarget::Existing(Box::new(run)),
+            temp.path(),
+            "god-pane",
+            &default_launcher_table(),
+            &fake,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.disposition, AdoptDisposition::Recovered);
+        assert_eq!(
+            outcome.run.state.workers["newcomer"].lifecycle,
+            WorkerLifecycle::Running
+        );
         assert!(!fake
-            .calls()
+            .typed_calls
+            .borrow()
             .iter()
-            .any(|call| call.starts_with("pane_run:pane-adopted:'")));
+            .any(|call| matches!(call, crate::herdr::test_support::FakeCall::PaneRun(..))));
     }
 
     #[test]

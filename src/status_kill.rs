@@ -481,14 +481,7 @@ fn kill_worker_with_backend(
     } else {
         WorkerLifecycle::Ended
     };
-    let ends_run = run.state.workers.iter().all(|(name, state)| {
-        name == worker_name
-            || matches!(
-                state.lifecycle,
-                WorkerLifecycle::Ended | WorkerLifecycle::Released | WorkerLifecycle::Failed
-            )
-    });
-    persist_kill_state(run_dir, Some((worker_name, terminal)), ends_run)?;
+    persist_kill_state(run_dir, Some((worker_name, terminal)), false)?;
     if dirty_paths.is_empty() {
         Ok(())
     } else {
@@ -509,6 +502,14 @@ fn persist_kill_state(
                 .get_mut(name)
                 .expect("kill target exists in persisted run state")
                 .lifecycle = lifecycle;
+            if fresh.state.workers.values().all(|state| {
+                matches!(
+                    state.lifecycle,
+                    WorkerLifecycle::Ended | WorkerLifecycle::Released | WorkerLifecycle::Failed
+                )
+            }) {
+                fresh.state.lifecycle = RunLifecycle::Ended;
+            }
         } else {
             end_worker_lifecycles(fresh);
         }
