@@ -27,9 +27,8 @@ contexts = ["workspace"]
 command = ["target/release/herdr-agent-team", "kill"]
 
 # Report flow: worker status flips -> inbox append + pointer injection into the
-# god pane (ADR-0002). Socket event is `pane.agent_status_changed`; the manifest
-# `on =` vocabulary for it is a build-time verification TODO (spec §9) — the
-# docs' example vocabulary shows names like `worktree.created`.
+# god pane (ADR-0002). The manifest uses the live-verified dot-form event name;
+# HERDR_PLUGIN_EVENT_JSON uses the underscore form (spec section 9).
 [[events]]
 on = "pane.agent_status_changed"
 command = ["target/release/herdr-agent-team", "on-agent-status"]

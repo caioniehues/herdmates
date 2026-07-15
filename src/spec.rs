@@ -7,11 +7,14 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const DEFAULT_SPEC_PATH: &str = "herdr-team.toml";
 const SHORTHAND_TEAM_NAME: &str = "adhoc";
 const SHORTHAND_ROLE: &str = "worker";
+static SHORTHAND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum SpecError {
@@ -29,6 +32,12 @@ pub enum SpecError {
     Cli(String),
     #[error("cannot determine the current directory: {0}")]
     CurrentDirectory(#[source] std::io::Error),
+    #[error("cannot create shorthand worker brief {path}: {source}")]
+    ShorthandBrief {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("team spawn is not implemented (ticket 07); use --dry-run")]
     SpawnNotImplemented,
 }
@@ -109,7 +118,7 @@ pub fn team_spec_from_agents(
         .map(|(index, agent)| {
             let name = format!("{agent}-{}", index + 1);
             WorkerSpec {
-                brief: PathBuf::from("briefs").join(format!("{name}.md")),
+                brief: PathBuf::new(),
                 name,
                 agent: agent.to_owned(),
                 role: SHORTHAND_ROLE.to_owned(),
@@ -119,7 +128,7 @@ pub fn team_spec_from_agents(
         })
         .collect();
 
-    let spec = TeamSpec {
+    let mut spec = TeamSpec {
         name: SHORTHAND_TEAM_NAME.to_owned(),
         topology: Topology::Star,
         cwd: cwd.to_path_buf(),
@@ -128,7 +137,42 @@ pub fn team_spec_from_agents(
         workers,
     };
     validate_team_spec(&spec, launchers)?;
+    materialize_shorthand_briefs(&mut spec.workers)?;
     Ok(spec)
+}
+
+fn materialize_shorthand_briefs(workers: &mut [WorkerSpec]) -> Result<(), SpecError> {
+    let sequence = SHORTHAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "herdr-agent-team-shorthand-{}-{nanos}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).map_err(|source| SpecError::ShorthandBrief {
+        path: directory.clone(),
+        source,
+    })?;
+
+    for (index, worker) in workers.iter_mut().enumerate() {
+        let path = directory.join(format!("worker-{}.md", index + 1));
+        let contents = format!(
+            "# Ad hoc worker brief\n\nYou are `{}`, an ad hoc `{}` worker. Follow the generated team protocol and wait for instructions from the coordinating god agent.\n",
+            worker.name, worker.agent
+        );
+        if let Err(source) = fs::write(&path, contents) {
+            let _ = fs::remove_dir_all(&directory);
+            return Err(SpecError::ShorthandBrief { path, source });
+        }
+        worker.brief = fs::canonicalize(&path).map_err(|source| {
+            let _ = fs::remove_dir_all(&directory);
+            SpecError::ShorthandBrief { path, source }
+        })?;
+    }
+
+    Ok(())
 }
 
 pub fn validate_team_spec(spec: &TeamSpec, launchers: &LauncherTable) -> Result<(), SpecError> {
@@ -364,13 +408,13 @@ brief = "briefs/reviewer-1.md"
                     agent.to_owned(),
                     LauncherEntry {
                         command: vec![agent.to_owned()],
-                        submit: vec!["Enter".to_owned()],
                         submit_verify: true,
                         reads_agents_md: if agent == "claude" {
                             AgentsMdMode::Pointer
                         } else {
                             AgentsMdMode::Native
                         },
+                        queues_midturn: agent == "claude",
                     },
                 )
             })
@@ -515,7 +559,7 @@ brief = "briefs/reviewer-1.md"
     }
 
     #[test]
-    fn agents_shorthand_builds_a_valid_throwaway_spec() {
+    fn agents_shorthand_builds_a_runnable_throwaway_spec() {
         let spec = team_spec_from_agents("claude,codex", Path::new("/project"), &launchers())
             .expect("shorthand should resolve");
 
@@ -525,11 +569,23 @@ brief = "briefs/reviewer-1.md"
         assert_eq!(spec.god.target, "self");
         assert_eq!(spec.workers.len(), 2);
         assert_eq!(spec.workers[0].name, "claude-1");
-        assert_eq!(spec.workers[0].brief, PathBuf::from("briefs/claude-1.md"));
         assert_eq!(spec.workers[1].name, "codex-2");
         assert!(spec.workers.iter().all(|worker| !worker.worktree));
         assert!(spec.workers.iter().all(|worker| worker.branch.is_none()));
+        for worker in &spec.workers {
+            assert!(worker.brief.is_absolute());
+            assert!(worker.brief.is_file());
+            assert_eq!(
+                fs::canonicalize(&worker.brief).expect("spawn canonicalization must succeed"),
+                worker.brief
+            );
+            let brief = fs::read_to_string(&worker.brief).expect("brief should be readable");
+            assert!(brief.contains(&worker.name));
+            assert!(brief.contains(&worker.agent));
+        }
         validate_team_spec(&spec, &launchers()).expect("shorthand spec should remain valid");
+        fs::remove_dir_all(spec.workers[0].brief.parent().unwrap())
+            .expect("remove shorthand test briefs");
     }
 
     #[test]

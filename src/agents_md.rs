@@ -1,4 +1,4 @@
-//! Generated worker communication protocol from `docs/spec.md` section 4.
+//! Generated worker communication protocol from `docs/spec.md` sections 4 and 11.
 
 use crate::types::{RunState, TeamSpec, Topology, WorkerRunState, WorkerSpec};
 use std::fmt::Write as _;
@@ -66,22 +66,10 @@ your status changes. Never print the sentinel before the report exists.\n\n",
     );
 
     out.push_str("## God contact\n\n");
-    writeln!(out, "- God pane: `{}`", run.god_pane_id).expect("writing to String cannot fail");
-    writeln!(
-        out,
-        "- The god reaches you with `herdr agent send {} \"...\"`.",
-        worker.name
-    )
-    .expect("writing to String cannot fail");
-    writeln!(
-        out,
-        "- Reply with `herdr agent send {} \"...\"`.",
-        run.god_pane_id
-    )
-    .expect("writing to String cannot fail");
+    out.push_str("- Reply with `herdr-agent-team msg god \"<text>\"`.\n");
 
     if team.topology == Topology::Mesh {
-        render_mesh_protocol(&mut out, team, worker, run);
+        render_mesh_protocol(&mut out, team, worker);
     }
 
     Ok(out)
@@ -93,25 +81,14 @@ fn workspace_label(state: Option<&WorkerRunState>) -> String {
         .unwrap_or_else(|| "pending".to_owned())
 }
 
-fn render_mesh_protocol(out: &mut String, team: &TeamSpec, worker: &WorkerSpec, run: &RunState) {
+fn render_mesh_protocol(out: &mut String, team: &TeamSpec, worker: &WorkerSpec) {
     out.push_str("\n## Peers in this team\n\n");
-    out.push_str("| Name | Workspace | How to message |\n");
-    out.push_str("|---|---|---|\n");
-    writeln!(
-        out,
-        "| `god` | god pane `{}` | `herdr agent send {} \"...\"` |",
-        run.god_pane_id, run.god_pane_id
-    )
-    .expect("writing to String cannot fail");
+    out.push_str("| Name |\n");
+    out.push_str("|---|\n");
+    out.push_str("| `god` |\n");
 
     for peer in team.workers.iter().filter(|peer| peer.name != worker.name) {
-        let workspace = workspace_label(run.workers.get(&peer.name));
-        writeln!(
-            out,
-            "| `{}` | `{workspace}` | `herdr agent send {} \"...\"` |",
-            peer.name, peer.name
-        )
-        .expect("writing to String cannot fail");
+        writeln!(out, "| `{}` |", peer.name).expect("writing to String cannot fail");
     }
 
     out.push_str("\n## Message envelope\n\n");
@@ -126,7 +103,7 @@ route, and reply to them:\n\n",
     )
     .expect("writing to String cannot fail");
     out.push_str("Send it with:\n\n");
-    out.push_str("```bash\nherdr agent send <name> \"<agent-msg>...</agent-msg>\"\n```\n\n");
+    out.push_str("```bash\nherdr-agent-team msg <peer> \"<agent-msg>...</agent-msg>\"\n```\n\n");
     out.push_str("Rules:\n");
     out.push_str("- `from` and `to` must name the sender and recipient from the table.\n");
     out.push_str("- Use a fresh UUID for `id` and ISO-8601 UTC for `ts`.\n");
@@ -169,7 +146,7 @@ mod tests {
         };
         let worker_state = |workspace_id: &str, worktree_path: Option<&str>| WorkerRunState {
             workspace_id: Some(workspace_id.to_owned()),
-            pane_id: None,
+            pane_id: Some(format!("{workspace_id}-pane")),
             agent_id: None,
             worktree_path: worktree_path.map(PathBuf::from),
             lifecycle: WorkerLifecycle::Running,
@@ -207,6 +184,16 @@ mod tests {
         assert_eq!(rendered, include_str!("../tests/golden/agents_md_star.md"));
         assert!(!rendered.contains("Peers in this team"));
         assert!(!rendered.contains("Message envelope"));
+        assert!([
+            "agent send",
+            "pane run",
+            run.god_pane_id.as_str(),
+            "workspace-builder-pane",
+            "workspace-reviewer-pane",
+            "workspace-tester-pane",
+        ]
+        .iter()
+        .all(|forbidden| !rendered.contains(forbidden)));
     }
 
     #[test]
@@ -222,6 +209,16 @@ mod tests {
 
         assert_eq!(rendered, include_str!("../tests/golden/agents_md_mesh.md"));
         assert!(!rendered.contains("| `builder` |"));
+        assert!([
+            "agent send",
+            "pane run",
+            run.god_pane_id.as_str(),
+            "workspace-builder-pane",
+            "workspace-reviewer-pane",
+            "workspace-tester-pane",
+        ]
+        .iter()
+        .all(|forbidden| !rendered.contains(forbidden)));
     }
 
     #[test]

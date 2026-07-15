@@ -46,7 +46,8 @@ stubs.
 - `herdr agent send` writes literal text WITHOUT submitting — never brief it
   as a messaging channel. Workers message only via the plugin `msg` verb
   (ADR-0008, spec §11); mid-turn queueing is per-agent (`queues_midturn`:
-  claude verified true, codex unverified → false).
+  claude AND codex both live-verified true 2026-07-15; outbox covers
+  launchers declaring false).
 - Mid-turn `pane run` into a working Claude Code pane queues as a user message
   and auto-submits when the turn ends (pointer injection is safe mid-turn).
 - Herdr agent status enum: idle/working/blocked/done/unknown.

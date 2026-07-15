@@ -10,6 +10,7 @@ pub mod agents_md;
 pub mod herdr;
 pub mod hook;
 pub mod launcher;
+pub mod msg;
 pub mod run;
 pub mod spawn;
 pub mod spec;
@@ -22,14 +23,13 @@ fn main() -> ExitCode {
     let args = args.collect::<Vec<_>>();
 
     match command.as_str() {
-        // Ticket 02 owns the dry-run implementation. Ticket 07 will replace
-        // this one dispatch edge when real spawning lands.
-        "spawn" => exit(spec::spawn_command(&args)),
+        "spawn" => exit(spawn::spawn_command(&args)),
         "status" => exit(status_kill::status_command(&args)),
         "kill" => exit(status_kill::kill_command(&args)),
+        "msg" => exit(msg::msg_command(&args)),
         "on-agent-status" => exit(hook::hook_command()),
         "" | "help" | "--help" | "-h" => {
-            eprintln!("herdr-agent-team <spawn|status|kill|on-agent-status>");
+            eprintln!("herdr-agent-team <spawn|status|kill|msg|on-agent-status>");
             ExitCode::SUCCESS
         }
         other => {

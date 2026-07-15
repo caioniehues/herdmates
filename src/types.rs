@@ -59,9 +59,12 @@ pub enum Topology {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LauncherEntry {
     pub command: Vec<String>,
-    pub submit: Vec<String>,
     pub submit_verify: bool,
     pub reads_agents_md: AgentsMdMode,
+    /// Whether a mid-turn `pane run` queues safely in this agent's TUI
+    /// (spec section 3; ADR-0008). Conservative default: `false`.
+    #[serde(default)]
+    pub queues_midturn: bool,
 }
 
 /// Whether an agent reads generated AGENTS.md natively or needs a pointer.

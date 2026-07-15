@@ -75,7 +75,7 @@ queues_midturn = true                # mid-turn pane run queues cleanly (live-ve
 command = ["codex"]
 submit_verify = true
 reads_agents_md = "native"           # codex reads AGENTS.md from cwd natively
-queues_midturn = false               # unverified — deliver only when idle/done (§11)
+queues_midturn = true                # mid-turn pane run queues cleanly (live-verified, §9)
 ```
 
 `reads_agents_md` describes how the agent consumes the repository's authored
@@ -168,6 +168,10 @@ Given a spec (file or shorthand):
 - limux backend (extract shared generator crate only when that becomes real).
 - Shared task-board files under the run dir (native-teammate TaskList parity:
   claimable tickets + blocked-by edges), if dogfooding demands it.
+- `team wait [--worker <name>] [--until blocked|done|report]` — blocking
+  god-side wait wrapping `herdr wait agent-status` + the completion
+  sentinel, so a god outside the event hook never hand-rolls poll monitors
+  (motivated by the 2026-07-15 silent-monitor incident during wave 2.5).
 - Worker progress pings via `pane report-metadata --custom-status` (pending
   the §9 coexistence verification).
 
@@ -205,12 +209,14 @@ Given a spec (file or shorthand):
       send-text/send-keys submission. Keep
       `herdr agent wait --status working` as the submission check; on timeout,
       issue one empty `pane run` and verify again (ADR-0006).
-- [ ] Live-verify codex **mid-turn** `pane run`: does input queue like Claude
-      Code's pending-message behavior, or interrupt/corrupt the active turn?
-      Third-party warning (aashishd/herdr-agent-messenger PROTOCOL.md): only
-      Claude Code is known to queue. Until verified, the codex launcher entry
-      ships `queues_midturn = false` and `msg` delivery to a working codex
-      pane goes via the outbox (§11, ADR-0008).
+- [x] Live-verify codex **mid-turn** `pane run` — RESOLVED 2026-07-15 (codex
+      TUI, gpt-5.6-sol, herdr 0.7.3): injected a second `pane run` 2 s into a
+      working turn; the active turn completed intact, the injected line
+      landed as a separate queued follow-up turn and was answered normally.
+      Codex queues mid-turn like Claude Code. Shipped codex entry flipped to
+      `queues_midturn = true` (third-party messenger warning was
+      over-conservative for current codex). Outbox path (§11) remains for
+      launcher entries that declare `false`.
 - [ ] Live-verify `pane report-metadata --custom-status` from a worker pane:
       does a plugin-sourced `--source` coexist with the claude/codex
       integration's own agent reporting, or fight it? If clean, workers can

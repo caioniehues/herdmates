@@ -1,16 +1,1387 @@
 //! Team preflight and worker launch flow from `docs/spec.md` section 4.
 
-use std::path::Path;
+use crate::agents_md::{render_agents_md, AgentsMdError};
+use crate::herdr::{HerdrClient, HerdrError, PaneInfo, WaitOutcome, WorkspaceRef};
+use crate::launcher::{default_launcher_table, launcher_entry, load_launcher_table, LauncherError};
+use crate::run::{create_run, save_run, RunBoard, RunError};
+use crate::spec::{
+    load_team_spec, spawn_command as dry_run_command, team_spec_from_agents, validate_team_spec,
+    SpecError,
+};
+use crate::types::{
+    AgentsMdMode, LauncherEntry, LauncherTable, RunLifecycle, RunState, TeamSpec, WorkerLifecycle,
+    WorkerRunState, WorkerSpec,
+};
+use std::collections::BTreeMap;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
-#[error("ticket 07: team spawning is not implemented")]
-pub struct SpawnError;
+const PROTOCOLS_DIR: &str = "protocols";
+const AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);
+const SUBMIT_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
+const SUBMIT_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn spawn_command(_args: &[String]) -> Result<(), SpawnError> {
-    todo!("ticket 07: implement team spawn")
+#[derive(Debug, Error)]
+pub enum SpawnError {
+    #[error(transparent)]
+    Spec(#[from] SpecError),
+    #[error(transparent)]
+    Launcher(#[from] LauncherError),
+    #[error(transparent)]
+    Herdr(#[from] HerdrError),
+    #[error(transparent)]
+    Run(#[from] RunError),
+    #[error(transparent)]
+    AgentsMd(#[from] AgentsMdError),
+    #[error("invalid spawn arguments: {0}")]
+    Arguments(String),
+    #[error("required environment variable {0} is not set")]
+    MissingEnvironment(&'static str),
+    #[error("team must contain at least one worker")]
+    EmptyTeam,
+    #[error("team cwd does not exist or is inaccessible `{path}`: {source}")]
+    TeamCwd {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("worker '{worker}' brief does not exist or is inaccessible `{path}`: {source}")]
+    Brief {
+        worker: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("worker '{worker}' launcher command is empty")]
+    EmptyLauncher { worker: String },
+    #[error("worker name '{worker}' must be a safe single filename component")]
+    UnsafeWorkerName { worker: String },
+    #[error("worker '{worker}' agent CLI is not executable on PATH: {command}")]
+    AgentCliMissing { worker: String, command: String },
+    #[error(
+        "worker '{worker}' requests a worktree; worktree workers are not implemented (ticket 10)"
+    )]
+    WorktreeNotImplemented { worker: String },
+    #[error("failed to {action} `{path}`: {source}")]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("worker '{worker}' failed during {step}: {source}")]
+    WorkerHerdr {
+        worker: String,
+        step: &'static str,
+        #[source]
+        source: HerdrError,
+    },
+    #[error("worker '{worker}' timed out waiting for agent status '{status}' during {step}")]
+    WorkerTimeout {
+        worker: String,
+        status: &'static str,
+        step: &'static str,
+    },
+    #[error("worker '{worker}' launched in pane '{pane_id}', but Herdr did not detect an agent")]
+    AgentNotDetected { worker: String, pane_id: String },
+    #[error("worker '{worker}' launched in pane '{pane_id}', but Herdr did not return agent_session.value")]
+    AgentIdNotAvailable { worker: String, pane_id: String },
 }
 
-pub fn spawn_team(_spec_path: Option<&Path>, _agents: Option<&str>) -> Result<(), SpawnError> {
-    todo!("ticket 07: preflight and spawn a resolved team")
+#[derive(Debug, PartialEq, Eq)]
+struct SpawnArguments {
+    spec_path: Option<PathBuf>,
+    agents: Option<String>,
+}
+
+struct SpawnContext {
+    spec: TeamSpec,
+    launchers: LauncherTable,
+    state_dir: PathBuf,
+    god_pane_id: String,
+}
+
+trait HerdrApi {
+    fn health_check(&self) -> Result<(), HerdrError>;
+    fn workspace_create(&self, cwd: &Path, label: &str) -> Result<WorkspaceRef, HerdrError>;
+    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError>;
+    fn agent_wait(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout: Duration,
+    ) -> Result<WaitOutcome, HerdrError>;
+    fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError>;
+}
+
+impl HerdrApi for HerdrClient {
+    fn health_check(&self) -> Result<(), HerdrError> {
+        self.agent_list().map(|_| ())
+    }
+
+    fn workspace_create(&self, cwd: &Path, label: &str) -> Result<WorkspaceRef, HerdrError> {
+        self.workspace_create(cwd, label)
+    }
+
+    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
+        HerdrClient::pane_run(self, pane_id, input)
+    }
+
+    fn agent_wait(
+        &self,
+        pane_id: &str,
+        status: &str,
+        timeout: Duration,
+    ) -> Result<WaitOutcome, HerdrError> {
+        HerdrClient::agent_wait(self, pane_id, status, timeout)
+    }
+
+    fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
+        self.pane_get(pane_id)
+    }
+}
+
+pub fn spawn_command(args: &[String]) -> Result<(), SpawnError> {
+    if args.iter().any(|argument| argument == "--dry-run") {
+        return dry_run_command(args).map_err(SpawnError::from);
+    }
+
+    let arguments = parse_spawn_arguments(args)?;
+    spawn_team(arguments.spec_path.as_deref(), arguments.agents.as_deref())
+}
+
+pub fn spawn_team(spec_path: Option<&Path>, agents: Option<&str>) -> Result<(), SpawnError> {
+    let current_dir = env::current_dir().map_err(|source| SpawnError::Io {
+        action: "read current directory",
+        path: PathBuf::from("."),
+        source,
+    })?;
+    let context = load_context(spec_path, agents, &current_dir)?;
+    let herdr = HerdrClient::from_env();
+    let run = spawn_resolved(
+        context.spec,
+        &context.launchers,
+        &context.state_dir,
+        context.god_pane_id,
+        &herdr,
+        command_exists,
+    )?;
+    println!("team run created: {}", run.dir.display());
+    Ok(())
+}
+
+fn parse_spawn_arguments(args: &[String]) -> Result<SpawnArguments, SpawnError> {
+    let mut spec_path = None;
+    let mut agents = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let argument = &args[index];
+        match argument.as_str() {
+            "--agents" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    SpawnError::Arguments("--agents requires a comma-separated value".to_owned())
+                })?;
+                set_agents(&mut agents, value)?;
+            }
+            value if value.starts_with("--agents=") => {
+                set_agents(&mut agents, &value["--agents=".len()..])?;
+            }
+            value if value.starts_with('-') => {
+                return Err(SpawnError::Arguments(format!("unknown option '{value}'")));
+            }
+            value => {
+                if spec_path.replace(PathBuf::from(value)).is_some() {
+                    return Err(SpawnError::Arguments(
+                        "only one team spec path may be supplied".to_owned(),
+                    ));
+                }
+            }
+        }
+        index += 1;
+    }
+
+    if agents.is_some() && spec_path.is_some() {
+        return Err(SpawnError::Arguments(
+            "--agents and a team spec path are mutually exclusive".to_owned(),
+        ));
+    }
+    Ok(SpawnArguments { spec_path, agents })
+}
+
+fn set_agents(slot: &mut Option<String>, value: &str) -> Result<(), SpawnError> {
+    if slot.replace(value.to_owned()).is_some() {
+        return Err(SpawnError::Arguments(
+            "--agents may only be supplied once".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_context(
+    spec_path: Option<&Path>,
+    agents: Option<&str>,
+    current_dir: &Path,
+) -> Result<SpawnContext, SpawnError> {
+    if spec_path.is_some() && agents.is_some() {
+        return Err(SpawnError::Arguments(
+            "--agents and a team spec path are mutually exclusive".to_owned(),
+        ));
+    }
+
+    let launchers = match env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
+        Some(path) => load_launcher_table(&absolutize(Path::new(&path), current_dir))?,
+        None => default_launcher_table(),
+    };
+
+    let (mut spec, spec_base) = match agents {
+        Some(agents) => (
+            team_spec_from_agents(agents, current_dir, &launchers)?,
+            current_dir.to_path_buf(),
+        ),
+        None => {
+            let path = spec_path.unwrap_or_else(|| Path::new("herdr-team.toml"));
+            let absolute_path = absolutize(path, current_dir);
+            let base = absolute_path.parent().unwrap_or(current_dir).to_path_buf();
+            (load_team_spec(&absolute_path, &launchers)?, base)
+        }
+    };
+    resolve_paths(&mut spec, &spec_base)?;
+
+    let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR")
+        .map(|path| absolutize(Path::new(&path), current_dir))
+        .ok_or(SpawnError::MissingEnvironment("HERDR_PLUGIN_STATE_DIR"))?;
+    let god_pane_id = if spec.god.target == "self" {
+        env::var("HERDR_PANE_ID").map_err(|_| SpawnError::MissingEnvironment("HERDR_PANE_ID"))?
+    } else {
+        spec.god.target.clone()
+    };
+
+    Ok(SpawnContext {
+        spec,
+        launchers,
+        state_dir,
+        god_pane_id,
+    })
+}
+
+fn resolve_paths(spec: &mut TeamSpec, spec_base: &Path) -> Result<(), SpawnError> {
+    let unresolved_cwd = absolutize(&spec.cwd, spec_base);
+    spec.cwd = fs::canonicalize(&unresolved_cwd).map_err(|source| SpawnError::TeamCwd {
+        path: unresolved_cwd,
+        source,
+    })?;
+
+    for worker in &mut spec.workers {
+        let unresolved_brief = absolutize(&worker.brief, &spec.cwd);
+        worker.brief = fs::canonicalize(&unresolved_brief).map_err(|source| SpawnError::Brief {
+            worker: worker.name.clone(),
+            path: unresolved_brief,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn absolutize(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn spawn_resolved<H, F>(
+    spec: TeamSpec,
+    launchers: &LauncherTable,
+    state_dir: &Path,
+    god_pane_id: String,
+    herdr: &H,
+    command_available: F,
+) -> Result<RunBoard, SpawnError>
+where
+    H: HerdrApi,
+    F: Fn(&str) -> bool,
+{
+    preflight(&spec, launchers, herdr, &command_available)?;
+
+    let workers = spec
+        .workers
+        .iter()
+        .map(|worker| {
+            (
+                worker.name.clone(),
+                WorkerRunState {
+                    workspace_id: None,
+                    pane_id: None,
+                    agent_id: None,
+                    worktree_path: None,
+                    lifecycle: WorkerLifecycle::Pending,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let state = RunState {
+        spec: spec.clone(),
+        god_pane_id,
+        workers,
+        lifecycle: RunLifecycle::Active,
+    };
+    let mut run = create_run(state_dir, state)?;
+
+    // Allocate every workspace first so immutable mesh protocols can contain
+    // the complete set of opaque live workspace IDs.
+    for worker in &spec.workers {
+        if let Err(error) = allocate_worker_workspace(&spec, worker, &mut run, herdr) {
+            if let Some(worker_state) = run.state.workers.get_mut(&worker.name) {
+                worker_state.lifecycle = WorkerLifecycle::Failed;
+            }
+            save_run(&run)?;
+            return Err(error);
+        }
+    }
+
+    // Keeping generated files in the run dir leaves an authored repository
+    // AGENTS.md intact. create_new in write_worker_protocol makes each snapshot
+    // immutable, and no agent is launched until all snapshots exist.
+    for worker in &spec.workers {
+        write_worker_protocol(&spec, worker, &run)?;
+    }
+
+    for worker in &spec.workers {
+        if let Err(error) = launch_worker(worker, launchers, &mut run, herdr) {
+            if let Some(worker_state) = run.state.workers.get_mut(&worker.name) {
+                worker_state.lifecycle = WorkerLifecycle::Failed;
+            }
+            save_run(&run)?;
+            return Err(error);
+        }
+    }
+
+    Ok(run)
+}
+
+fn preflight<H, F>(
+    spec: &TeamSpec,
+    launchers: &LauncherTable,
+    herdr: &H,
+    command_available: &F,
+) -> Result<(), SpawnError>
+where
+    H: HerdrApi,
+    F: Fn(&str) -> bool,
+{
+    validate_team_spec(spec, launchers)?;
+    if spec.workers.is_empty() {
+        return Err(SpawnError::EmptyTeam);
+    }
+    if !spec.cwd.is_dir() {
+        return Err(SpawnError::TeamCwd {
+            path: spec.cwd.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not a directory"),
+        });
+    }
+
+    for worker in &spec.workers {
+        if !is_safe_worker_filename(&worker.name) {
+            return Err(SpawnError::UnsafeWorkerName {
+                worker: worker.name.clone(),
+            });
+        }
+        if worker.worktree {
+            return Err(SpawnError::WorktreeNotImplemented {
+                worker: worker.name.clone(),
+            });
+        }
+        if !worker.brief.is_file() {
+            return Err(SpawnError::Brief {
+                worker: worker.name.clone(),
+                path: worker.brief.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "not a file"),
+            });
+        }
+        let launcher = launcher_entry(launchers, &worker.agent)?;
+        let command = launcher
+            .command
+            .first()
+            .ok_or_else(|| SpawnError::EmptyLauncher {
+                worker: worker.name.clone(),
+            })?;
+        if !command_available(command) {
+            return Err(SpawnError::AgentCliMissing {
+                worker: worker.name.clone(),
+                command: command.clone(),
+            });
+        }
+    }
+
+    // Read-only health check. This is deliberately the final preflight step.
+    herdr.health_check()?;
+    Ok(())
+}
+
+fn is_safe_worker_filename(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !Path::new(name).is_absolute()
+        && !name.contains('/')
+        && !name.contains('\\')
+}
+
+fn allocate_worker_workspace<H: HerdrApi>(
+    spec: &TeamSpec,
+    worker: &WorkerSpec,
+    run: &mut RunBoard,
+    herdr: &H,
+) -> Result<(), SpawnError> {
+    let workspace = herdr
+        .workspace_create(&spec.cwd, &worker.name)
+        .map_err(|source| worker_herdr(worker, "workspace create", source))?;
+    {
+        let state = run
+            .state
+            .workers
+            .get_mut(&worker.name)
+            .expect("run state is initialized from the same team spec");
+        state.workspace_id = Some(workspace.workspace_id.clone());
+        state.pane_id = Some(workspace.pane_id.clone());
+    }
+    save_run(run)?;
+    Ok(())
+}
+
+fn launch_worker<H: HerdrApi>(
+    worker: &WorkerSpec,
+    launchers: &LauncherTable,
+    run: &mut RunBoard,
+    herdr: &H,
+) -> Result<(), SpawnError> {
+    let pane_id = run
+        .state
+        .workers
+        .get(&worker.name)
+        .and_then(|state| state.pane_id.clone())
+        .expect("workspace allocation records a root pane before launch");
+    let launcher = launcher_entry(launchers, &worker.agent)?;
+    herdr
+        .pane_run(&pane_id, &shell_join(&launcher.command))
+        .map_err(|source| worker_herdr(worker, "agent launch", source))?;
+    wait_for(
+        herdr,
+        worker,
+        &pane_id,
+        "idle",
+        AGENT_START_TIMEOUT,
+        "agent startup",
+    )?;
+
+    let pane = wait_for_agent_info(herdr, worker, &pane_id, AGENT_START_TIMEOUT)?;
+    let agent_id = pane
+        .agent_id
+        .clone()
+        .expect("agent info wait only returns after receiving the opaque ID");
+    run.state
+        .workers
+        .get_mut(&worker.name)
+        .expect("run state is initialized from the same team spec")
+        .agent_id = Some(agent_id);
+    save_run(run)?;
+
+    let prompt = launch_prompt(worker, launcher, &worker_protocol_path(run, worker));
+    submit_prompt(
+        herdr,
+        worker,
+        &pane.pane_id,
+        &prompt,
+        launcher.submit_verify,
+        SUBMIT_GRACE_TIMEOUT,
+        SUBMIT_VERIFY_TIMEOUT,
+    )?;
+
+    run.state
+        .workers
+        .get_mut(&worker.name)
+        .expect("run state is initialized from the same team spec")
+        .lifecycle = WorkerLifecycle::Running;
+    save_run(run)?;
+    Ok(())
+}
+
+fn write_worker_protocol(
+    spec: &TeamSpec,
+    worker: &WorkerSpec,
+    run: &RunBoard,
+) -> Result<(), SpawnError> {
+    let protocols_dir = run.dir.join(PROTOCOLS_DIR);
+    fs::create_dir_all(&protocols_dir).map_err(|source| SpawnError::Io {
+        action: "create generated protocol directory",
+        path: protocols_dir,
+        source,
+    })?;
+    let path = worker_protocol_path(run, worker);
+    let contents = render_agents_md(spec, worker, &run.state, &run.dir)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|source| SpawnError::Io {
+            action: "create immutable generated protocol",
+            path: path.clone(),
+            source,
+        })?;
+    file.write_all(contents.as_bytes())
+        .map_err(|source| SpawnError::Io {
+            action: "write generated protocol",
+            path,
+            source,
+        })
+}
+
+fn worker_protocol_path(run: &RunBoard, worker: &WorkerSpec) -> PathBuf {
+    run.dir
+        .join(PROTOCOLS_DIR)
+        .join(format!("{}.md", worker.name))
+}
+
+fn launch_prompt(worker: &WorkerSpec, launcher: &LauncherEntry, protocol_path: &Path) -> String {
+    match launcher.reads_agents_md {
+        AgentsMdMode::Native => format!(
+            "Read your brief at {} and execute it fully. The repository's authored AGENTS.md remains in effect. Read the generated team protocol at {}.",
+            worker.brief.display(),
+            protocol_path.display()
+        ),
+        AgentsMdMode::Pointer => format!(
+            "Read your brief at {} and execute it fully. Read the generated team protocol at {}.",
+            worker.brief.display(),
+            protocol_path.display()
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_prompt<H: HerdrApi>(
+    herdr: &H,
+    worker: &WorkerSpec,
+    pane_id: &str,
+    prompt: &str,
+    verify: bool,
+    grace_timeout: Duration,
+    verify_timeout: Duration,
+) -> Result<(), SpawnError> {
+    herdr
+        .pane_run(pane_id, prompt)
+        .map_err(|source| worker_herdr(worker, "brief injection", source))?;
+    if !verify {
+        return Ok(());
+    }
+
+    match wait_for(
+        herdr,
+        worker,
+        pane_id,
+        "working",
+        grace_timeout,
+        "submission verification",
+    ) {
+        Ok(()) => Ok(()),
+        Err(SpawnError::WorkerTimeout { .. }) => {
+            // Some TUIs accept the pasted pointer but swallow pane-run's Enter.
+            // An empty pane-run submits the existing composer without duplicating it.
+            herdr
+                .pane_run(pane_id, "")
+                .map_err(|source| worker_herdr(worker, "submission fallback", source))?;
+            wait_for(
+                herdr,
+                worker,
+                pane_id,
+                "working",
+                verify_timeout,
+                "submission verification",
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn wait_for<H: HerdrApi>(
+    herdr: &H,
+    worker: &WorkerSpec,
+    pane_id: &str,
+    status: &'static str,
+    timeout: Duration,
+    step: &'static str,
+) -> Result<(), SpawnError> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(SpawnError::WorkerTimeout {
+                worker: worker.name.clone(),
+                status,
+                step,
+            });
+        }
+
+        match herdr
+            .agent_wait(pane_id, status, remaining)
+            .map_err(|source| worker_herdr(worker, step, source))?
+        {
+            WaitOutcome::Reached => return Ok(()),
+            WaitOutcome::TimedOut if started.elapsed() < timeout => {
+                // Immediately after `pane run`, Herdr may not yet resolve the
+                // pane as an agent target and exits 1 without waiting.
+                thread::sleep(Duration::from_millis(100).min(remaining));
+            }
+            WaitOutcome::TimedOut => {
+                return Err(SpawnError::WorkerTimeout {
+                    worker: worker.name.clone(),
+                    status,
+                    step,
+                });
+            }
+        }
+    }
+}
+
+fn wait_for_agent_info<H: HerdrApi>(
+    herdr: &H,
+    worker: &WorkerSpec,
+    pane_id: &str,
+    timeout: Duration,
+) -> Result<PaneInfo, SpawnError> {
+    let started = Instant::now();
+    loop {
+        let pane = herdr
+            .pane_get(pane_id)
+            .map_err(|source| worker_herdr(worker, "agent detection", source))?;
+        if pane.agent.is_some() && pane.agent_id.is_some() {
+            return Ok(pane);
+        }
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return if pane.agent.is_none() {
+                Err(SpawnError::AgentNotDetected {
+                    worker: worker.name.clone(),
+                    pane_id: pane_id.to_owned(),
+                })
+            } else {
+                Err(SpawnError::AgentIdNotAvailable {
+                    worker: worker.name.clone(),
+                    pane_id: pane_id.to_owned(),
+                })
+            };
+        }
+        thread::sleep(Duration::from_millis(100).min(remaining));
+    }
+}
+
+fn worker_herdr(worker: &WorkerSpec, step: &'static str, source: HerdrError) -> SpawnError {
+    SpawnError::WorkerHerdr {
+        worker: worker.name.clone(),
+        step,
+        source,
+    }
+}
+
+fn shell_join(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+}
+
+fn command_exists(command: &str) -> bool {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return is_executable(command_path);
+    }
+
+    env::var_os("PATH")
+        .map(|path| {
+            env::split_paths(&path).any(|directory| is_executable(&directory.join(command)))
+        })
+        .unwrap_or(false)
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::load_run;
+    use crate::types::{GodSpec, Topology};
+    use std::cell::{Cell, RefCell};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock should follow Unix epoch")
+                .as_nanos();
+            let path = env::temp_dir().join(format!(
+                "herdr-spawn-tests-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create spawn test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeHerdr {
+        calls: RefCell<Vec<String>>,
+        workspace_count: Cell<usize>,
+        protocols_state_dir: RefCell<Option<PathBuf>>,
+        protocol_snapshots: RefCell<Vec<BTreeMap<PathBuf, String>>>,
+        fail_launch_pane: RefCell<Option<String>>,
+        fail_health: Cell<bool>,
+        omit_agent_id: Cell<bool>,
+        wait_timeouts: Cell<usize>,
+        agent_id_delays: Cell<usize>,
+        require_empty_submit: Cell<bool>,
+        empty_submit_seen: Cell<bool>,
+    }
+
+    impl FakeHerdr {
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+
+        fn protocol_snapshots(&self) -> Vec<BTreeMap<PathBuf, String>> {
+            self.protocol_snapshots.borrow().clone()
+        }
+
+        fn command_error() -> HerdrError {
+            HerdrError::Command {
+                argv: "fake pane run".to_owned(),
+                status: Some(1),
+                stderr: "injected failure".to_owned(),
+            }
+        }
+    }
+
+    impl HerdrApi for FakeHerdr {
+        fn health_check(&self) -> Result<(), HerdrError> {
+            self.calls.borrow_mut().push("health_check".to_owned());
+            if self.fail_health.get() {
+                return Err(Self::command_error());
+            }
+            Ok(())
+        }
+
+        fn workspace_create(&self, cwd: &Path, label: &str) -> Result<WorkspaceRef, HerdrError> {
+            let number = self.workspace_count.get() + 1;
+            self.workspace_count.set(number);
+            self.calls
+                .borrow_mut()
+                .push(format!("workspace_create:{label}:{}", cwd.display()));
+            Ok(WorkspaceRef {
+                workspace_id: format!("workspace-{number}"),
+                pane_id: format!("pane-{number}"),
+            })
+        }
+
+        fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
+            if input.starts_with('\'') {
+                if let Some(state_dir) = self.protocols_state_dir.borrow().as_ref() {
+                    let snapshot = read_protocol_snapshot(state_dir);
+                    assert!(!snapshot.is_empty(), "protocols must predate agent launch");
+                    self.protocol_snapshots.borrow_mut().push(snapshot);
+                }
+            }
+            self.calls
+                .borrow_mut()
+                .push(format!("pane_run:{pane_id}:{input}"));
+            if self.fail_launch_pane.borrow().as_deref() == Some(pane_id) && input.starts_with('\'')
+            {
+                return Err(Self::command_error());
+            }
+            if input.is_empty() {
+                self.empty_submit_seen.set(true);
+            }
+            Ok(())
+        }
+
+        fn agent_wait(
+            &self,
+            pane_id: &str,
+            status: &str,
+            _timeout: Duration,
+        ) -> Result<WaitOutcome, HerdrError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("agent_wait:{pane_id}:{status}"));
+            if self.wait_timeouts.get() > 0 {
+                self.wait_timeouts.set(self.wait_timeouts.get() - 1);
+                return Ok(WaitOutcome::TimedOut);
+            }
+            if status == "working"
+                && self.require_empty_submit.get()
+                && !self.empty_submit_seen.get()
+            {
+                return Ok(WaitOutcome::TimedOut);
+            }
+            Ok(WaitOutcome::Reached)
+        }
+
+        fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
+            self.calls.borrow_mut().push(format!("pane_get:{pane_id}"));
+            let delayed = self.agent_id_delays.get() > 0;
+            if delayed {
+                self.agent_id_delays.set(self.agent_id_delays.get() - 1);
+            }
+            Ok(PaneInfo {
+                pane_id: pane_id.to_owned(),
+                workspace_id: pane_id.replace("pane", "workspace"),
+                agent: Some(if pane_id == "pane-1" {
+                    "claude".to_owned()
+                } else {
+                    "codex".to_owned()
+                }),
+                agent_id: (!self.omit_agent_id.get() && !delayed)
+                    .then(|| format!("agent-session-{pane_id}")),
+                agent_status: Some("idle".to_owned()),
+                cwd: None,
+            })
+        }
+    }
+
+    fn launchers() -> LauncherTable {
+        default_launcher_table()
+    }
+
+    fn worker(root: &Path, name: &str, agent: &str) -> WorkerSpec {
+        let brief = root.join(format!("{name}.md"));
+        fs::write(&brief, format!("brief for {name}")).expect("write worker brief");
+        WorkerSpec {
+            name: name.to_owned(),
+            agent: agent.to_owned(),
+            role: "reviewer".to_owned(),
+            worktree: false,
+            branch: None,
+            brief,
+        }
+    }
+
+    fn team(root: &Path, workers: Vec<WorkerSpec>) -> TeamSpec {
+        TeamSpec {
+            name: "spawn-test".to_owned(),
+            topology: Topology::Star,
+            cwd: root.to_path_buf(),
+            setup: Vec::new(),
+            god: GodSpec::default(),
+            workers,
+        }
+    }
+
+    fn only_run_dir(state_dir: &Path) -> PathBuf {
+        let entries = fs::read_dir(state_dir.join("runs"))
+            .expect("read runs")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read run entries");
+        assert_eq!(entries.len(), 1);
+        entries[0].path()
+    }
+
+    fn read_protocol_snapshot(state_dir: &Path) -> BTreeMap<PathBuf, String> {
+        let protocols_dir = only_run_dir(state_dir).join(PROTOCOLS_DIR);
+        fs::read_dir(protocols_dir)
+            .expect("read generated protocols")
+            .map(|entry| {
+                let path = entry.expect("read protocol entry").path();
+                let contents = fs::read_to_string(&path).expect("read generated protocol");
+                (path, contents)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parses_real_spawn_arguments_without_changing_the_fixed_seam() {
+        assert_eq!(
+            parse_spawn_arguments(&["--agents=claude,codex".to_owned()]).unwrap(),
+            SpawnArguments {
+                spec_path: None,
+                agents: Some("claude,codex".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_spawn_arguments(&["team.toml".to_owned()]).unwrap(),
+            SpawnArguments {
+                spec_path: Some(PathBuf::from("team.toml")),
+                agents: None,
+            }
+        );
+    }
+
+    #[test]
+    fn preflight_failure_performs_no_herdr_mutation_and_names_worker_and_cli() {
+        let temp = TempDir::new();
+        let fake = FakeHerdr::default();
+        let spec = team(
+            temp.path(),
+            vec![worker(temp.path(), "missing-cli-worker", "claude")],
+        );
+
+        let error = spawn_resolved(
+            spec,
+            &launchers(),
+            &temp.path().join("state"),
+            "god-pane".to_owned(),
+            &fake,
+            |_| false,
+        )
+        .expect_err("missing CLI must fail preflight")
+        .to_string();
+
+        assert!(error.contains("missing-cli-worker"));
+        assert!(error.contains("claude"));
+        assert!(fake.calls().is_empty());
+        assert!(!temp.path().join("state/runs").exists());
+    }
+
+    #[test]
+    fn worktree_worker_is_explicitly_deferred_before_mutation() {
+        let temp = TempDir::new();
+        let fake = FakeHerdr::default();
+        let mut builder = worker(temp.path(), "builder", "claude");
+        builder.role = "builder".to_owned();
+        builder.worktree = true;
+        builder.branch = Some("feat/builder".to_owned());
+
+        let error = spawn_resolved(
+            team(temp.path(), vec![builder]),
+            &launchers(),
+            &temp.path().join("state"),
+            "god-pane".to_owned(),
+            &fake,
+            |_| true,
+        )
+        .expect_err("ticket 10 worker must fail")
+        .to_string();
+
+        assert!(error.contains("worker 'builder'"));
+        assert!(error.contains("ticket 10"));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn unreachable_herdr_fails_preflight_before_workspace_mutation() {
+        let temp = TempDir::new();
+        let fake = FakeHerdr::default();
+        fake.fail_health.set(true);
+        let spec = team(
+            temp.path(),
+            vec![worker(temp.path(), "claude-worker", "claude")],
+        );
+
+        let error = spawn_resolved(
+            spec,
+            &launchers(),
+            &temp.path().join("state"),
+            "god-pane".to_owned(),
+            &fake,
+            |_| true,
+        )
+        .expect_err("unreachable Herdr must fail")
+        .to_string();
+
+        assert!(error.contains("fake pane run"));
+        assert_eq!(fake.calls(), ["health_check"]);
+        assert!(!temp.path().join("state/runs").exists());
+    }
+
+    #[test]
+    fn early_unresolved_agent_wait_is_retried_within_the_deadline() {
+        let temp = TempDir::new();
+        let fake = FakeHerdr::default();
+        fake.wait_timeouts.set(1);
+        let worker = worker(temp.path(), "claude-worker", "claude");
+
+        wait_for(
+            &fake,
+            &worker,
+            "pane-1",
+            "idle",
+            Duration::from_millis(500),
+            "agent startup",
+        )
+        .expect("second wait should observe the agent");
+
+        assert_eq!(
+            fake.calls(),
+            ["agent_wait:pane-1:idle", "agent_wait:pane-1:idle"]
+        );
+    }
+
+    #[test]
+    fn swallowed_submit_uses_empty_pane_run_without_duplicating_prompt() {
+        let temp = TempDir::new();
+        let fake = FakeHerdr::default();
+        fake.require_empty_submit.set(true);
+        let worker = worker(temp.path(), "claude-worker", "claude");
+
+        submit_prompt(
+            &fake,
+            &worker,
+            "pane-1",
+            "Read the brief pointer.",
+            true,
+            Duration::from_millis(1),
+            Duration::from_millis(100),
+        )
+        .expect("empty pane run should submit the existing composer");
+
+        let calls = fake.calls();
+        assert_eq!(calls[0], "pane_run:pane-1:Read the brief pointer.");
+        assert!(calls.iter().any(|call| call == "pane_run:pane-1:"));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("Read the brief pointer."))
+                .count(),
+            1,
+            "the fallback must not duplicate the prompt"
+        );
+        assert_eq!(calls.last().unwrap(), "agent_wait:pane-1:working");
+    }
+
+    #[test]
+    fn successful_worker_uses_root_pane_and_persists_returned_ids() {
+        let temp = TempDir::new();
+        let state_dir = temp.path().join("state");
+        let fake = FakeHerdr::default();
+        *fake.protocols_state_dir.borrow_mut() = Some(state_dir.clone());
+        let spec = team(
+            temp.path(),
+            vec![worker(temp.path(), "claude-worker", "claude")],
+        );
+
+        let run = spawn_resolved(
+            spec,
+            &launchers(),
+            &state_dir,
+            "god-pane".to_owned(),
+            &fake,
+            |_| true,
+        )
+        .expect("spawn worker");
+
+        let persisted = load_run(&run.dir).expect("load persisted run");
+        let worker = &persisted.state.workers["claude-worker"];
+        assert_eq!(worker.workspace_id.as_deref(), Some("workspace-1"));
+        assert_eq!(worker.pane_id.as_deref(), Some("pane-1"));
+        assert_eq!(
+            worker.agent_id.as_deref(),
+            Some("agent-session-pane-1"),
+            "persist the opaque ID returned by the typed client"
+        );
+        assert_eq!(worker.lifecycle, WorkerLifecycle::Running);
+        let calls = fake.calls();
+        assert_eq!(calls[0], "health_check");
+        assert!(calls.iter().any(|call| call == "pane_run:pane-1:'claude'"));
+        assert!(!calls.iter().any(|call| call.contains("pane_split")));
+        assert!(calls.iter().any(|call| {
+            call.starts_with("pane_run:pane-1:Read your brief at ")
+                && call.contains("Read the generated team protocol at")
+        }));
+        assert!(calls.iter().any(|call| call == "agent_wait:pane-1:working"));
+    }
+
+    #[test]
+    fn partial_failure_keeps_first_worker_recorded_and_marks_second_failed() {
+        let temp = TempDir::new();
+        let state_dir = temp.path().join("state");
+        let fake = FakeHerdr::default();
+        *fake.fail_launch_pane.borrow_mut() = Some("pane-2".to_owned());
+        let spec = team(
+            temp.path(),
+            vec![
+                worker(temp.path(), "first", "claude"),
+                worker(temp.path(), "second", "codex"),
+            ],
+        );
+
+        let error = spawn_resolved(
+            spec,
+            &launchers(),
+            &state_dir,
+            "god-pane".to_owned(),
+            &fake,
+            |_| true,
+        )
+        .expect_err("second launch should fail")
+        .to_string();
+
+        assert!(error.contains("worker 'second'"));
+        assert!(error.contains("agent launch"));
+        let run = load_run(&only_run_dir(&state_dir)).expect("load partial run");
+        assert_eq!(
+            run.state.workers["first"].lifecycle,
+            WorkerLifecycle::Running
+        );
+        assert_eq!(
+            run.state.workers["first"].workspace_id.as_deref(),
+            Some("workspace-1")
+        );
+        assert_eq!(
+            run.state.workers["second"].lifecycle,
+            WorkerLifecycle::Failed
+        );
+        assert_eq!(
+            run.state.workers["second"].workspace_id.as_deref(),
+            Some("workspace-2")
+        );
+        assert!(!fake.calls().iter().any(|call| call.contains("close")));
+    }
+
+    #[test]
+    fn missing_agent_session_id_is_never_synthesized() {
+        let temp = TempDir::new();
+        let fake = FakeHerdr::default();
+        fake.omit_agent_id.set(true);
+        let worker = worker(temp.path(), "claude-worker", "claude");
+
+        let error = wait_for_agent_info(&fake, &worker, "pane-1", Duration::from_millis(1))
+            .expect_err("missing opaque ID must fail")
+            .to_string();
+
+        assert!(error.contains("agent_session.value"));
+    }
+
+    #[test]
+    fn delayed_agent_session_id_is_retried_and_returned_verbatim() {
+        let temp = TempDir::new();
+        let fake = FakeHerdr::default();
+        fake.agent_id_delays.set(1);
+        let worker = worker(temp.path(), "claude-worker", "claude");
+
+        let pane = wait_for_agent_info(&fake, &worker, "pane-1", Duration::from_millis(500))
+            .expect("second pane read should include the opaque ID");
+
+        assert_eq!(pane.agent_id.as_deref(), Some("agent-session-pane-1"));
+        assert_eq!(fake.calls(), ["pane_get:pane-1", "pane_get:pane-1"]);
+    }
+
+    #[test]
+    fn shell_join_preserves_argument_boundaries() {
+        assert_eq!(
+            shell_join(&[
+                "claude".to_owned(),
+                "--name".to_owned(),
+                "O'Brien worker".to_owned(),
+            ]),
+            "'claude' '--name' 'O'\"'\"'Brien worker'"
+        );
+    }
+
+    #[test]
+    fn shared_cwd_workers_get_distinct_protocols_without_overwriting_authored_agents_md() {
+        let temp = TempDir::new();
+        let state_dir = temp.path().join("state");
+        let authored_agents = temp.path().join("AGENTS.md");
+        fs::write(&authored_agents, "# Authored repository instructions\n")
+            .expect("write authored AGENTS.md");
+        let fake = FakeHerdr::default();
+        let spec = team(
+            temp.path(),
+            vec![
+                worker(temp.path(), "pointer-worker", "claude"),
+                worker(temp.path(), "native-worker", "codex"),
+            ],
+        );
+
+        let run = spawn_resolved(
+            spec,
+            &launchers(),
+            &state_dir,
+            "god-pane".to_owned(),
+            &fake,
+            |_| true,
+        )
+        .expect("spawn shared-cwd workers");
+
+        assert_eq!(
+            fs::read_to_string(authored_agents).expect("read authored AGENTS.md"),
+            "# Authored repository instructions\n"
+        );
+
+        let marker = "Read the generated team protocol at ";
+        let protocol_paths = fake
+            .calls()
+            .into_iter()
+            .filter_map(|call| {
+                let (_, path) = call.split_once(marker)?;
+                Some(PathBuf::from(path.strip_suffix('.').unwrap_or(path)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            protocol_paths.len(),
+            2,
+            "every launcher mode needs a pointer"
+        );
+        assert_ne!(protocol_paths[0], protocol_paths[1]);
+
+        for (path, worker_name) in protocol_paths
+            .iter()
+            .zip(["pointer-worker", "native-worker"])
+        {
+            assert!(path.is_absolute());
+            assert!(path.starts_with(&run.dir));
+            let protocol = fs::read_to_string(path).expect("read generated protocol");
+            assert!(protocol.contains(&format!("- Worker: `{worker_name}`")));
+            assert!(protocol.contains(&format!("/inbox/{worker_name}.md")));
+            let other = if worker_name == "pointer-worker" {
+                "native-worker"
+            } else {
+                "pointer-worker"
+            };
+            assert!(!protocol.contains(&format!("- Worker: `{other}`")));
+            assert!(!protocol.contains(&format!("/inbox/{other}.md")));
+        }
+    }
+
+    #[test]
+    fn per_worker_protocols_remain_unchanged_across_shared_cwd_launches() {
+        let temp = TempDir::new();
+        let state_dir = temp.path().join("state");
+        let fake = FakeHerdr::default();
+        *fake.protocols_state_dir.borrow_mut() = Some(state_dir.clone());
+        let spec = team(
+            temp.path(),
+            vec![
+                worker(temp.path(), "first", "claude"),
+                worker(temp.path(), "second", "codex"),
+            ],
+        );
+
+        spawn_resolved(
+            spec,
+            &launchers(),
+            &state_dir,
+            "god-pane".to_owned(),
+            &fake,
+            |_| true,
+        )
+        .expect("spawn shared-cwd workers");
+
+        let snapshots = fake.protocol_snapshots();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0], snapshots[1]);
+        assert_eq!(snapshots[0], read_protocol_snapshot(&state_dir));
+    }
+
+    #[test]
+    fn mesh_protocols_are_immutable_snapshots_of_all_allocated_workspaces() {
+        let temp = TempDir::new();
+        let state_dir = temp.path().join("state");
+        let fake = FakeHerdr::default();
+        let mut spec = team(
+            temp.path(),
+            vec![
+                worker(temp.path(), "first", "claude"),
+                worker(temp.path(), "second", "codex"),
+            ],
+        );
+        spec.topology = Topology::Mesh;
+
+        let run = spawn_resolved(
+            spec,
+            &launchers(),
+            &state_dir,
+            "god-pane".to_owned(),
+            &fake,
+            |_| true,
+        )
+        .expect("spawn mesh workers");
+
+        let first = fs::read_to_string(worker_protocol_path(&run, &run.state.spec.workers[0]))
+            .expect("read first protocol");
+        let second = fs::read_to_string(worker_protocol_path(&run, &run.state.spec.workers[1]))
+            .expect("read second protocol");
+
+        assert!(first.contains("- Workspace: `workspace-1`"));
+        assert!(first.contains("| `second` |"));
+        assert!(second.contains("- Workspace: `workspace-2`"));
+        assert!(second.contains("| `first` |"));
+        assert!(!first.contains("`pending`"));
+        assert!(!second.contains("`pending`"));
+    }
+
+    #[test]
+    fn unsafe_worker_filename_components_fail_preflight_before_herdr() {
+        for (index, unsafe_name) in [
+            "",
+            ".",
+            "..",
+            "/absolute",
+            "nested/worker",
+            "nested\\worker",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = TempDir::new();
+            let fake = FakeHerdr::default();
+            let mut unsafe_worker = worker(temp.path(), &format!("safe-{index}"), "claude");
+            unsafe_worker.name = unsafe_name.to_owned();
+            let spec = team(temp.path(), vec![unsafe_worker]);
+
+            let error = preflight(&spec, &launchers(), &fake, &|_| true)
+                .expect_err("unsafe protocol filename must fail preflight")
+                .to_string();
+
+            assert!(error.contains("safe single filename component"));
+            assert!(
+                fake.calls().is_empty(),
+                "unsafe name reached Herdr: {unsafe_name:?}"
+            );
+        }
+    }
 }

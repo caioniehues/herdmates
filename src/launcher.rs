@@ -29,18 +29,18 @@ pub fn default_launcher_table() -> LauncherTable {
             "claude".to_owned(),
             LauncherEntry {
                 command: vec!["claude".to_owned()],
-                submit: vec!["Enter".to_owned()],
                 submit_verify: true,
                 reads_agents_md: AgentsMdMode::Pointer,
+                queues_midturn: true,
             },
         ),
         (
             "codex".to_owned(),
             LauncherEntry {
                 command: vec!["codex".to_owned()],
-                submit: vec!["Enter".to_owned()],
                 submit_verify: true,
                 reads_agents_md: AgentsMdMode::Native,
+                queues_midturn: true,
             },
         ),
     ]
@@ -126,20 +126,71 @@ mod tests {
             table["claude"],
             LauncherEntry {
                 command: vec!["claude".to_owned()],
-                submit: vec!["Enter".to_owned()],
                 submit_verify: true,
                 reads_agents_md: AgentsMdMode::Pointer,
+                queues_midturn: true,
             }
         );
         assert_eq!(
             table["codex"],
             LauncherEntry {
                 command: vec!["codex".to_owned()],
-                submit: vec!["Enter".to_owned()],
                 submit_verify: true,
                 reads_agents_md: AgentsMdMode::Native,
+                queues_midturn: true,
             }
         );
+    }
+
+    #[test]
+    fn config_entry_parses_queues_midturn() {
+        let config_dir = TempDir::new();
+        fs::write(
+            config_dir.path().join("agents.toml"),
+            r#"
+[opencode]
+command = ["opencode"]
+submit_verify = true
+reads_agents_md = "native"
+queues_midturn = true
+"#,
+        )
+        .expect("write launcher config with queues_midturn");
+
+        let table = load_launcher_table(config_dir.path()).expect("load launcher config");
+
+        assert!(table["opencode"].queues_midturn);
+    }
+
+    #[test]
+    fn config_entry_without_queues_midturn_defaults_to_false() {
+        let config_dir = TempDir::new();
+        fs::write(
+            config_dir.path().join("agents.toml"),
+            r#"
+[opencode]
+command = ["opencode"]
+submit_verify = true
+reads_agents_md = "native"
+"#,
+        )
+        .expect("write launcher config without queues_midturn");
+
+        let table = load_launcher_table(config_dir.path()).expect("load launcher config");
+
+        assert!(!table["opencode"].queues_midturn);
+    }
+
+    #[test]
+    fn launcher_table_round_trips_queues_midturn() {
+        let table = default_launcher_table();
+
+        let serialized = toml::to_string(&table).expect("serialize launcher table");
+        let reparsed: LauncherTable =
+            toml::from_str(&serialized).expect("reparse serialized launcher table");
+
+        assert_eq!(reparsed, table);
+        assert_eq!(serialized.matches("queues_midturn = true").count(), 2);
     }
 
     #[test]
@@ -150,13 +201,11 @@ mod tests {
             r#"
 [claude]
 command = ["claude", "--model", "opus"]
-submit = ["C-m"]
 submit_verify = false
 reads_agents_md = "native"
 
 [opencode]
 command = ["opencode"]
-submit = ["Enter"]
 submit_verify = true
 reads_agents_md = "pointer"
 "#,
@@ -167,11 +216,39 @@ reads_agents_md = "pointer"
 
         assert_eq!(table.len(), 3);
         assert_eq!(table["claude"].command, ["claude", "--model", "opus"]);
-        assert_eq!(table["claude"].submit, ["C-m"]);
         assert!(!table["claude"].submit_verify);
         assert_eq!(table["claude"].reads_agents_md, AgentsMdMode::Native);
         assert_eq!(table["codex"], default_launcher_table()["codex"]);
         assert_eq!(table["opencode"].command, ["opencode"]);
+    }
+
+    #[test]
+    fn legacy_submit_keys_remain_accepted_and_ignored() {
+        let config_dir = TempDir::new();
+        fs::write(
+            config_dir.path().join("agents.toml"),
+            r#"
+[claude]
+command = ["claude", "--model", "opus"]
+submit = ["C-m", "Enter"]
+submit_verify = false
+reads_agents_md = "native"
+"#,
+        )
+        .expect("write launcher config with legacy submit keys");
+
+        let table = load_launcher_table(config_dir.path())
+            .expect("legacy submit keys should remain compatible");
+
+        assert_eq!(
+            table["claude"],
+            LauncherEntry {
+                command: vec!["claude".to_owned(), "--model".to_owned(), "opus".to_owned()],
+                submit_verify: false,
+                reads_agents_md: AgentsMdMode::Native,
+                queues_midturn: false,
+            }
+        );
     }
 
     #[test]

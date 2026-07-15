@@ -27,6 +27,4 @@ The report is the durable payload. The god receives only a pointer to it when yo
 
 ## God contact
 
-- God pane: `god-pane-7`
-- The god reaches you with `herdr agent send builder "..."`.
-- Reply with `herdr agent send god-pane-7 "..."`.
+- Reply with `herdr-agent-team msg god "<text>"`.

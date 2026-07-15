@@ -43,22 +43,82 @@ pub struct WorktreeRef {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneInfo {
     pub pane_id: String,
     pub workspace_id: String,
     pub agent: Option<String>,
+    pub agent_id: Option<String>,
     pub agent_status: Option<String>,
     pub cwd: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentInfo {
     pub pane_id: String,
     pub workspace_id: String,
     pub agent: Option<String>,
+    pub agent_id: Option<String>,
     #[serde(rename = "agent_status")]
     pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSessionRef {
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneInfoWire {
+    pane_id: String,
+    workspace_id: String,
+    agent: Option<String>,
+    agent_session: Option<AgentSessionRef>,
+    agent_status: Option<String>,
+    cwd: Option<PathBuf>,
+}
+
+impl<'de> Deserialize<'de> for PaneInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = PaneInfoWire::deserialize(deserializer)?;
+        Ok(Self {
+            pane_id: wire.pane_id,
+            workspace_id: wire.workspace_id,
+            agent: wire.agent,
+            agent_id: wire.agent_session.map(|session| session.value),
+            agent_status: wire.agent_status,
+            cwd: wire.cwd,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentInfoWire {
+    pane_id: String,
+    workspace_id: String,
+    agent: Option<String>,
+    agent_session: Option<AgentSessionRef>,
+    #[serde(rename = "agent_status")]
+    status: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for AgentInfo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AgentInfoWire::deserialize(deserializer)?;
+        Ok(Self {
+            pane_id: wire.pane_id,
+            workspace_id: wire.workspace_id,
+            agent: wire.agent,
+            agent_id: wire.agent_session.map(|session| session.value),
+            status: wire.status,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,8 +202,8 @@ impl HerdrClient {
 
     pub fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
         let args = args(["pane", "run"]).with(pane_id).with(input).finish();
-        let stdout = self.invoke(&args)?;
-        parse_ok(&stdout).map_err(|message| self.invalid_response(&args, message))
+        self.invoke(&args)?;
+        Ok(())
     }
 
     pub fn pane_read(&self, pane_id: &str) -> Result<String, HerdrError> {
@@ -154,7 +214,9 @@ impl HerdrClient {
     pub fn pane_rename(&self, pane_id: &str, title: &str) -> Result<(), HerdrError> {
         let args = args(["pane", "rename"]).with(pane_id).with(title).finish();
         let stdout = self.invoke(&args)?;
-        parse_ok(&stdout).map_err(|message| self.invalid_response(&args, message))
+        parse_pane_info(&stdout)
+            .map(|_| ())
+            .map_err(|message| self.invalid_response(&args, message))
     }
 
     pub fn agent_wait(
@@ -174,7 +236,7 @@ impl HerdrClient {
 
         match self.invoke(&args) {
             Ok(stdout) => {
-                parse_agent_info(&stdout)
+                parse_agent_wait(&stdout, pane_id, status)
                     .map_err(|message| self.invalid_response(&args, message))?;
                 Ok(WaitOutcome::Reached)
             }
@@ -329,6 +391,27 @@ struct AgentInfoResult {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AgentWaitResponse {
+    Immediate { result: AgentInfoResult },
+    Future(AgentStatusEventEnvelope),
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentStatusEventEnvelope {
+    event: String,
+    data: AgentStatusEventData,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentStatusEventData {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    pane_id: String,
+    agent_status: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct AgentListResult {
     #[serde(rename = "type")]
     kind: String,
@@ -401,10 +484,44 @@ fn parse_pane_info(stdout: &str) -> Result<PaneInfo, String> {
     Ok(result.pane)
 }
 
-fn parse_agent_info(stdout: &str) -> Result<AgentInfo, String> {
-    let result: AgentInfoResult = parse_response(stdout)?;
-    expect_kind(&result.kind, "agent_info")?;
-    Ok(result.agent)
+fn parse_agent_wait(stdout: &str, pane_id: &str, status: &str) -> Result<(), String> {
+    match serde_json::from_str::<AgentWaitResponse>(stdout).map_err(|error| error.to_string())? {
+        AgentWaitResponse::Immediate { result } => {
+            expect_kind(&result.kind, "agent_info")?;
+            if result.agent.pane_id != pane_id {
+                return Err(format!(
+                    "wait matched pane `{}`, expected `{pane_id}`",
+                    result.agent.pane_id
+                ));
+            }
+            if result.agent.status.as_deref() != Some(status) {
+                return Err(format!(
+                    "wait matched status `{:?}`, expected `{status}`",
+                    result.agent.status
+                ));
+            }
+            Ok(())
+        }
+        AgentWaitResponse::Future(envelope) => {
+            expect_kind(&envelope.event, "pane.agent_status_changed")?;
+            if let Some(kind) = envelope.data.kind.as_deref() {
+                expect_kind(kind, "pane_agent_status_changed")?;
+            }
+            if envelope.data.pane_id != pane_id {
+                return Err(format!(
+                    "wait matched pane `{}`, expected `{pane_id}`",
+                    envelope.data.pane_id
+                ));
+            }
+            if envelope.data.agent_status != status {
+                return Err(format!(
+                    "wait matched status `{}`, expected `{status}`",
+                    envelope.data.agent_status
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn parse_agent_list(stdout: &str) -> Result<Vec<AgentInfo>, String> {
@@ -421,9 +538,85 @@ fn parse_ok(stdout: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     const LIVE_AGENT_LIST: &str = r#"{"id":"cli:agent:list","result":{"agents":[{"agent":"codex","agent_session":{"agent":"codex","kind":"id","source":"herdr:codex","value":"019f6268-cf99-7110-8c8f-e94817e05fad"},"agent_status":"working","cwd":"/home/caio/Projects/herdr-agent-team","focused":false,"foreground_cwd":"/home/caio/Projects/herdr-agent-team","pane_id":"wG:p6","revision":0,"tab_id":"wG:t2","terminal_id":"term_6569868fff53416","workspace_id":"wG"}],"type":"agent_list"}}"#;
     const LIVE_PANE_GET: &str = r#"{"id":"cli:pane:get","result":{"pane":{"agent":"codex","agent_session":{"agent":"codex","kind":"id","source":"herdr:codex","value":"019f6268-cf99-7110-8c8f-e94817e05fad"},"agent_status":"working","cwd":"/home/caio/Projects/herdr-agent-team","focused":true,"foreground_cwd":"/home/caio/Projects/herdr-agent-team","label":"codex-05-herdr","pane_id":"wG:p6","revision":0,"scroll":{"max_offset_from_bottom":141,"offset_from_bottom":0,"viewport_rows":29},"tab_id":"wG:t2","terminal_id":"term_6569868fff53416","workspace_id":"wG"},"type":"pane_info"}}"#;
+
+    struct FakeBinary {
+        _directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl FakeBinary {
+        fn returning(stdout: &str) -> Self {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock should follow Unix epoch")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "herdr-client-tests-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&directory).expect("create fake Herdr directory");
+            let response = directory.join("response");
+            fs::write(&response, stdout).expect("write fake Herdr response");
+            let path = directory.join("herdr");
+            let staging_path = directory.join("herdr.staging");
+            fs::write(
+                &staging_path,
+                format!("#!/bin/sh\ncat '{}'\n", response.display()),
+            )
+            .expect("write fake Herdr executable");
+            let mut permissions = fs::metadata(&staging_path)
+                .expect("stat fake Herdr executable")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&staging_path, permissions)
+                .expect("make fake Herdr executable runnable");
+            fs::rename(staging_path, &path).expect("atomically install fake Herdr executable");
+
+            // Some filesystems briefly retain a writable reference to a newly
+            // installed executable. Wait until execve accepts it before handing
+            // the path to tests running in parallel.
+            for attempt in 0..100 {
+                match Command::new(&path).output() {
+                    Ok(_) => break,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && attempt < 99 =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("probe fake Herdr executable: {error}"),
+                }
+            }
+            Self {
+                _directory: directory,
+                path,
+            }
+        }
+
+        fn client(&self) -> HerdrClient {
+            HerdrClient {
+                binary: self.path.clone(),
+            }
+        }
+    }
+
+    impl Drop for FakeBinary {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self._directory);
+        }
+    }
 
     #[test]
     fn parses_workspace_create_ids_from_response() {
@@ -463,19 +656,83 @@ mod tests {
         assert_eq!(pane.pane_id, "wG:p6");
         assert_eq!(pane.workspace_id, "wG");
         assert_eq!(pane.agent_status.as_deref(), Some("working"));
+        assert_eq!(
+            pane.agent_id.as_deref(),
+            Some("019f6268-cf99-7110-8c8f-e94817e05fad")
+        );
 
         let agents = parse_agent_list(LIVE_AGENT_LIST).unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].pane_id, "wG:p6");
         assert_eq!(agents[0].status.as_deref(), Some("working"));
+        assert_eq!(
+            agents[0].agent_id.as_deref(),
+            Some("019f6268-cf99-7110-8c8f-e94817e05fad")
+        );
     }
 
     #[test]
     fn parses_live_agent_wait_match_sample() {
         let fixture = r#"{"id":"cli:agent:wait:resolve","result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"wG:p6","workspace_id":"wG"},"type":"agent_info"}}"#;
-        let agent = parse_agent_info(fixture).unwrap();
-        assert_eq!(agent.pane_id, "wG:p6");
-        assert_eq!(agent.status.as_deref(), Some("working"));
+        parse_agent_wait(fixture, "wG:p6", "working").unwrap();
+    }
+
+    #[test]
+    fn tolerates_missing_and_null_agent_sessions_without_constructing_ids() {
+        let missing = r#"{"id":"cli:pane:get","result":{"pane":{"agent":"codex","agent_status":"working","pane_id":"opaque-pane","workspace_id":"opaque-workspace"},"type":"pane_info"}}"#;
+        let pane = parse_pane_info(missing).unwrap();
+        assert_eq!(pane.agent_id, None);
+
+        let null = r#"{"id":"cli:agent:list","result":{"agents":[{"agent":"codex","agent_session":null,"agent_status":"working","pane_id":"opaque-pane","workspace_id":"opaque-workspace"}],"type":"agent_list"}}"#;
+        let agents = parse_agent_list(null).unwrap();
+        assert_eq!(agents[0].agent_id, None);
+    }
+
+    #[test]
+    fn pane_run_accepts_zero_exit_with_empty_stdout() {
+        let binary = FakeBinary::returning("");
+        binary
+            .client()
+            .pane_run("opaque-pane", "launch command")
+            .expect("empty stdout is the live successful pane-run response");
+    }
+
+    #[test]
+    fn agent_wait_accepts_future_status_event_envelope() {
+        let binary = FakeBinary::returning(
+            r#"{"event":"pane.agent_status_changed","data":{"pane_id":"opaque-pane","workspace_id":"opaque-workspace","agent_status":"working","agent":"codex"}}"#,
+        );
+        assert_eq!(
+            binary
+                .client()
+                .agent_wait("opaque-pane", "working", Duration::from_secs(1))
+                .expect("future status event is a successful wait match"),
+            WaitOutcome::Reached
+        );
+    }
+
+    #[test]
+    fn future_status_event_must_match_requested_pane_and_status() {
+        let wrong_pane = r#"{"event":"pane.agent_status_changed","data":{"pane_id":"other-pane","agent_status":"working"}}"#;
+        assert!(parse_agent_wait(wrong_pane, "opaque-pane", "working")
+            .unwrap_err()
+            .contains("expected `opaque-pane`"));
+
+        let wrong_status = r#"{"event":"pane.agent_status_changed","data":{"pane_id":"opaque-pane","agent_status":"idle"}}"#;
+        assert!(parse_agent_wait(wrong_status, "opaque-pane", "working")
+            .unwrap_err()
+            .contains("expected `working`"));
+    }
+
+    #[test]
+    fn pane_rename_accepts_live_pane_info_response() {
+        let binary = FakeBinary::returning(
+            r#"{"id":"cli:pane:rename","result":{"pane":{"agent":null,"agent_session":null,"agent_status":"unknown","cwd":"/tmp","focused":false,"pane_id":"opaque-pane","revision":1,"tab_id":"opaque-tab","terminal_id":"opaque-terminal","workspace_id":"opaque-workspace"},"type":"pane_info"}}"#,
+        );
+        binary
+            .client()
+            .pane_rename("opaque-pane", "worker")
+            .expect("pane_info is the live successful rename response");
     }
 
     #[test]

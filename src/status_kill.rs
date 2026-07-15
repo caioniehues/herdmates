@@ -1,33 +1,655 @@
 //! Team status and teardown commands from `docs/spec.md` section 6.
 
-use crate::herdr::HerdrClient;
-use std::path::Path;
+use crate::herdr::{AgentInfo, HerdrClient, HerdrError};
+use crate::run::{load_run, mark_ended, RunBoard, RunError};
+use crate::types::RunLifecycle;
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
-#[error("ticket 09: status and kill are not implemented")]
-pub struct StatusKillError;
+const STATUS_USAGE: &str = "usage: herdr-agent-team status <run-dir> [--json]";
+const KILL_USAGE: &str = "usage: herdr-agent-team kill <run-dir> [--remove-worktrees]";
 
-pub fn status_command(_args: &[String]) -> Result<(), StatusKillError> {
-    todo!("ticket 09: implement team status")
+#[derive(Debug, Error)]
+pub enum StatusKillError {
+    #[error("{0}")]
+    Usage(String),
+
+    #[error(transparent)]
+    Run(#[from] RunError),
+
+    #[error(transparent)]
+    Herdr(#[from] HerdrError),
+
+    #[error("failed to read report metadata at {path}: {source}")]
+    ReportMetadata {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("report timestamp is before the Unix epoch at {path}: {source}")]
+    ReportClock {
+        path: PathBuf,
+        #[source]
+        source: SystemTimeError,
+    },
+
+    #[error("failed to serialize status JSON: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("failed to inspect worktree {path} with git: {source}")]
+    GitSpawn {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("git status failed for worktree {path}: {stderr}")]
+    GitStatus { path: PathBuf, stderr: String },
+
+    #[error("refusing to remove dirty worktree(s): {paths:?}")]
+    DirtyWorktrees { paths: Vec<PathBuf> },
 }
 
-pub fn kill_command(_args: &[String]) -> Result<(), StatusKillError> {
-    todo!("ticket 09: implement team kill")
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct StatusSnapshot {
+    team: String,
+    lifecycle: &'static str,
+    workers: Vec<WorkerStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct WorkerStatus {
+    worker: String,
+    agent: String,
+    status: String,
+    last_report_time_unix_secs: Option<u64>,
+}
+
+pub fn status_command(args: &[String]) -> Result<(), StatusKillError> {
+    let (run_dir, json) = parse_command_args(args, "--json", STATUS_USAGE)?;
+    let rendered = status_run(&run_dir, json, &HerdrClient::from_env())?;
+    print!("{rendered}");
+    Ok(())
+}
+
+pub fn kill_command(args: &[String]) -> Result<(), StatusKillError> {
+    let (run_dir, remove_worktrees) = parse_command_args(args, "--remove-worktrees", KILL_USAGE)?;
+    kill_run(&run_dir, remove_worktrees, &HerdrClient::from_env())
 }
 
 pub fn status_run(
-    _run_dir: &Path,
-    _json: bool,
-    _herdr: &HerdrClient,
+    run_dir: &Path,
+    json: bool,
+    herdr: &HerdrClient,
 ) -> Result<String, StatusKillError> {
-    todo!("ticket 09: join run.toml with live Herdr agent state")
+    status_run_with_source(run_dir, json, herdr)
 }
 
 pub fn kill_run(
-    _run_dir: &Path,
-    _remove_worktrees: bool,
-    _herdr: &HerdrClient,
+    run_dir: &Path,
+    remove_worktrees: bool,
+    herdr: &HerdrClient,
 ) -> Result<(), StatusKillError> {
-    todo!("ticket 09: close recorded workspaces and mark the run ended")
+    let backend = SystemTeardown { herdr };
+    kill_run_with_backend(run_dir, remove_worktrees, &backend)
+}
+
+fn parse_command_args(
+    args: &[String],
+    allowed_flag: &str,
+    usage: &str,
+) -> Result<(PathBuf, bool), StatusKillError> {
+    let mut run_dir = None;
+    let mut flag = false;
+
+    for arg in args {
+        if arg == allowed_flag {
+            if flag {
+                return Err(StatusKillError::Usage(format!(
+                    "duplicate option {allowed_flag}; {usage}"
+                )));
+            }
+            flag = true;
+        } else if arg.starts_with('-') {
+            return Err(StatusKillError::Usage(format!(
+                "unknown option {arg}; {usage}"
+            )));
+        } else if run_dir.replace(PathBuf::from(arg)).is_some() {
+            return Err(StatusKillError::Usage(format!(
+                "expected one run directory; {usage}"
+            )));
+        }
+    }
+
+    run_dir
+        .map(|run_dir| (run_dir, flag))
+        .ok_or_else(|| StatusKillError::Usage(usage.to_owned()))
+}
+
+trait AgentSource {
+    fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError>;
+}
+
+impl AgentSource for HerdrClient {
+    fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError> {
+        HerdrClient::agent_list(self)
+    }
+}
+
+fn status_run_with_source(
+    run_dir: &Path,
+    json: bool,
+    source: &impl AgentSource,
+) -> Result<String, StatusKillError> {
+    let run = load_run(run_dir)?;
+    let agents = source.agent_list()?;
+    let report_times = read_report_times(&run)?;
+    let snapshot = build_status_snapshot(&run, &agents, &report_times);
+    if json {
+        render_status_json(&snapshot)
+    } else {
+        Ok(render_status_table(&snapshot))
+    }
+}
+
+fn read_report_times(run: &RunBoard) -> Result<BTreeMap<String, Option<u64>>, StatusKillError> {
+    run.state
+        .spec
+        .workers
+        .iter()
+        .map(|worker| {
+            let path = run.dir.join("inbox").join(format!("{}.md", worker.name));
+            let timestamp = match fs::metadata(&path) {
+                Ok(metadata) => {
+                    let modified =
+                        metadata
+                            .modified()
+                            .map_err(|source| StatusKillError::ReportMetadata {
+                                path: path.clone(),
+                                source,
+                            })?;
+                    Some(
+                        modified
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|source| StatusKillError::ReportClock {
+                                path: path.clone(),
+                                source,
+                            })?
+                            .as_secs(),
+                    )
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(StatusKillError::ReportMetadata {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            };
+            Ok((worker.name.clone(), timestamp))
+        })
+        .collect()
+}
+
+fn build_status_snapshot(
+    run: &RunBoard,
+    agents: &[AgentInfo],
+    report_times: &BTreeMap<String, Option<u64>>,
+) -> StatusSnapshot {
+    let workers = run
+        .state
+        .spec
+        .workers
+        .iter()
+        .map(|worker| {
+            let pane_id = run
+                .state
+                .workers
+                .get(&worker.name)
+                .and_then(|state| state.pane_id.as_deref());
+            let status = match pane_id {
+                Some(pane_id) => agents
+                    .iter()
+                    .find(|agent| agent.pane_id == pane_id)
+                    .and_then(|agent| agent.status.as_deref())
+                    .unwrap_or_else(|| {
+                        if agents.iter().any(|agent| agent.pane_id == pane_id) {
+                            "unknown"
+                        } else {
+                            "gone"
+                        }
+                    }),
+                None => "unknown",
+            };
+
+            WorkerStatus {
+                worker: worker.name.clone(),
+                agent: worker.agent.clone(),
+                status: status.to_owned(),
+                last_report_time_unix_secs: report_times.get(&worker.name).copied().flatten(),
+            }
+        })
+        .collect();
+
+    StatusSnapshot {
+        team: run.state.spec.name.clone(),
+        lifecycle: lifecycle_name(run.state.lifecycle),
+        workers,
+    }
+}
+
+fn lifecycle_name(lifecycle: RunLifecycle) -> &'static str {
+    match lifecycle {
+        RunLifecycle::Active => "active",
+        RunLifecycle::Ended => "ended",
+    }
+}
+
+fn render_status_table(snapshot: &StatusSnapshot) -> String {
+    let mut output = format!(
+        "TEAM\t{}\nLIFECYCLE\t{}\nWORKER\tAGENT\tSTATUS\tLAST_REPORT_UNIX_SECS\n",
+        snapshot.team, snapshot.lifecycle
+    );
+    for worker in &snapshot.workers {
+        let report_time = worker
+            .last_report_time_unix_secs
+            .map(|timestamp| timestamp.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        output.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            worker.worker, worker.agent, worker.status, report_time
+        ));
+    }
+    output
+}
+
+fn render_status_json(snapshot: &StatusSnapshot) -> Result<String, StatusKillError> {
+    let mut output = serde_json::to_string_pretty(snapshot)?;
+    output.push('\n');
+    Ok(output)
+}
+
+trait TeardownBackend {
+    fn workspace_close(&self, workspace_id: &str) -> Result<(), StatusKillError>;
+    fn worktree_is_dirty(&self, path: &Path) -> Result<bool, StatusKillError>;
+    fn worktree_remove(&self, path: &Path) -> Result<(), StatusKillError>;
+}
+
+struct SystemTeardown<'a> {
+    herdr: &'a HerdrClient,
+}
+
+impl TeardownBackend for SystemTeardown<'_> {
+    fn workspace_close(&self, workspace_id: &str) -> Result<(), StatusKillError> {
+        self.herdr.workspace_close(workspace_id)?;
+        Ok(())
+    }
+
+    fn worktree_is_dirty(&self, path: &Path) -> Result<bool, StatusKillError> {
+        worktree_is_dirty(path)
+    }
+
+    fn worktree_remove(&self, path: &Path) -> Result<(), StatusKillError> {
+        self.herdr.worktree_remove(path)?;
+        Ok(())
+    }
+}
+
+fn kill_run_with_backend(
+    run_dir: &Path,
+    remove_worktrees: bool,
+    backend: &impl TeardownBackend,
+) -> Result<(), StatusKillError> {
+    let mut run = load_run(run_dir)?;
+    if run.state.lifecycle == RunLifecycle::Ended {
+        return Ok(());
+    }
+
+    let workspace_ids = run
+        .state
+        .workers
+        .values()
+        .filter_map(|worker| worker.workspace_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    for workspace_id in workspace_ids {
+        backend.workspace_close(workspace_id)?;
+    }
+
+    let mut dirty_paths = Vec::new();
+    if remove_worktrees {
+        let worktree_paths = run
+            .state
+            .workers
+            .values()
+            .filter_map(|worker| worker.worktree_path.as_deref())
+            .collect::<BTreeSet<_>>();
+        for path in worktree_paths {
+            if backend.worktree_is_dirty(path)? {
+                dirty_paths.push(path.to_path_buf());
+            } else {
+                backend.worktree_remove(path)?;
+            }
+        }
+    }
+
+    mark_ended(&mut run)?;
+    if dirty_paths.is_empty() {
+        Ok(())
+    } else {
+        Err(StatusKillError::DirtyWorktrees { paths: dirty_paths })
+    }
+}
+
+fn worktree_is_dirty(path: &Path) -> Result<bool, StatusKillError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .map_err(|source| StatusKillError::GitSpawn {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("git status failed without diagnostic output")
+            .to_owned();
+        return Err(StatusKillError::GitStatus {
+            path: path.to_path_buf(),
+            stderr,
+        });
+    }
+
+    Ok(!output.stdout.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::{create_run, load_run, match_pane};
+    use crate::types::{
+        GodSpec, RunState, TeamSpec, Topology, WorkerLifecycle, WorkerRunState, WorkerSpec,
+    };
+    use std::cell::RefCell;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock should be after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "herdr-status-kill-tests-{}-{nanos}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_state(worktree_root: &Path) -> RunState {
+        let workers = vec![
+            WorkerSpec {
+                name: "builder".to_owned(),
+                agent: "codex".to_owned(),
+                role: "builder".to_owned(),
+                worktree: true,
+                branch: Some("feat/builder".to_owned()),
+                brief: PathBuf::from("briefs/builder.md"),
+            },
+            WorkerSpec {
+                name: "reviewer".to_owned(),
+                agent: "claude".to_owned(),
+                role: "reviewer".to_owned(),
+                worktree: true,
+                branch: Some("feat/reviewer".to_owned()),
+                brief: PathBuf::from("briefs/reviewer.md"),
+            },
+        ];
+        let runtime = |workspace: &str, pane: &str, worktree: &str| WorkerRunState {
+            workspace_id: Some(workspace.to_owned()),
+            pane_id: Some(pane.to_owned()),
+            agent_id: Some(format!("agent-{pane}")),
+            worktree_path: Some(worktree_root.join(worktree)),
+            lifecycle: WorkerLifecycle::Running,
+        };
+
+        RunState {
+            spec: TeamSpec {
+                name: "status-wave".to_owned(),
+                topology: Topology::Star,
+                cwd: PathBuf::from("/repo"),
+                setup: Vec::new(),
+                god: GodSpec::default(),
+                workers,
+            },
+            god_pane_id: "god-pane".to_owned(),
+            workers: BTreeMap::from([
+                (
+                    "builder".to_owned(),
+                    runtime("workspace-builder", "pane-builder", "builder"),
+                ),
+                (
+                    "reviewer".to_owned(),
+                    runtime("workspace-reviewer", "pane-reviewer", "reviewer"),
+                ),
+            ]),
+            lifecycle: RunLifecycle::Active,
+        }
+    }
+
+    struct FakeAgents(Vec<AgentInfo>);
+
+    impl AgentSource for FakeAgents {
+        fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn status_reports_live_gone_and_report_mtime_in_spec_order() {
+        let temp = TempDir::new();
+        let run = create_run(temp.path(), run_state(temp.path())).expect("create run");
+        fs::write(run.dir.join("inbox/builder.md"), "done").expect("write report");
+        let source = FakeAgents(vec![AgentInfo {
+            pane_id: "pane-builder".to_owned(),
+            workspace_id: "workspace-builder".to_owned(),
+            agent: Some("codex".to_owned()),
+            agent_id: None,
+            status: Some("working".to_owned()),
+        }]);
+
+        let table = status_run_with_source(&run.dir, false, &source).expect("render table");
+        let rows = table.lines().collect::<Vec<_>>();
+
+        assert_eq!(rows[0], "TEAM\tstatus-wave");
+        assert_eq!(rows[1], "LIFECYCLE\tactive");
+        assert!(rows[3].starts_with("builder\tcodex\tworking\t"));
+        assert!(!rows[3].ends_with("\t-"));
+        assert_eq!(rows[4], "reviewer\tclaude\tgone\t-");
+    }
+
+    #[test]
+    fn status_json_is_stable_and_machine_readable() {
+        let temp = TempDir::new();
+        let run = RunBoard {
+            dir: temp.path().to_path_buf(),
+            state: run_state(temp.path()),
+        };
+        let report_times = BTreeMap::from([
+            ("builder".to_owned(), Some(1_721_234_567)),
+            ("reviewer".to_owned(), None),
+        ]);
+        let agents = vec![AgentInfo {
+            pane_id: "pane-builder".to_owned(),
+            workspace_id: "workspace-builder".to_owned(),
+            agent: Some("codex".to_owned()),
+            agent_id: None,
+            status: Some("idle".to_owned()),
+        }];
+
+        let snapshot = build_status_snapshot(&run, &agents, &report_times);
+
+        assert_eq!(
+            render_status_json(&snapshot).unwrap(),
+            concat!(
+                "{\n",
+                "  \"team\": \"status-wave\",\n",
+                "  \"lifecycle\": \"active\",\n",
+                "  \"workers\": [\n",
+                "    {\n",
+                "      \"worker\": \"builder\",\n",
+                "      \"agent\": \"codex\",\n",
+                "      \"status\": \"idle\",\n",
+                "      \"last_report_time_unix_secs\": 1721234567\n",
+                "    },\n",
+                "    {\n",
+                "      \"worker\": \"reviewer\",\n",
+                "      \"agent\": \"claude\",\n",
+                "      \"status\": \"gone\",\n",
+                "      \"last_report_time_unix_secs\": null\n",
+                "    }\n",
+                "  ]\n",
+                "}\n"
+            )
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeTeardown {
+        dirty: BTreeSet<PathBuf>,
+        closed: RefCell<Vec<String>>,
+        inspected: RefCell<Vec<PathBuf>>,
+        removed: RefCell<Vec<PathBuf>>,
+    }
+
+    impl TeardownBackend for FakeTeardown {
+        fn workspace_close(&self, workspace_id: &str) -> Result<(), StatusKillError> {
+            self.closed.borrow_mut().push(workspace_id.to_owned());
+            Ok(())
+        }
+
+        fn worktree_is_dirty(&self, path: &Path) -> Result<bool, StatusKillError> {
+            self.inspected.borrow_mut().push(path.to_path_buf());
+            Ok(self.dirty.contains(path))
+        }
+
+        fn worktree_remove(&self, path: &Path) -> Result<(), StatusKillError> {
+            self.removed.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn kill_closes_only_recorded_workspaces_and_ends_the_run() {
+        let temp = TempDir::new();
+        let run = create_run(temp.path(), run_state(temp.path())).expect("create run");
+        let backend = FakeTeardown::default();
+
+        kill_run_with_backend(&run.dir, false, &backend).expect("kill run");
+
+        assert_eq!(
+            backend.closed.into_inner(),
+            vec!["workspace-builder", "workspace-reviewer"]
+        );
+        assert!(backend.removed.into_inner().is_empty());
+        assert_eq!(
+            load_run(&run.dir).expect("load ended run").state.lifecycle,
+            RunLifecycle::Ended
+        );
+        assert!(match_pane(temp.path(), "pane-builder")
+            .expect("match pane")
+            .is_none());
+    }
+
+    #[test]
+    fn kill_removes_clean_worktrees_but_preserves_every_dirty_path() {
+        let temp = TempDir::new();
+        let run = create_run(temp.path(), run_state(temp.path())).expect("create run");
+        let clean = temp.path().join("builder");
+        let dirty = temp.path().join("reviewer");
+        let backend = FakeTeardown {
+            dirty: BTreeSet::from([dirty.clone()]),
+            ..FakeTeardown::default()
+        };
+
+        let error = kill_run_with_backend(&run.dir, true, &backend).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StatusKillError::DirtyWorktrees { paths } if paths == vec![dirty.clone()]
+        ));
+        assert_eq!(backend.inspected.into_inner(), vec![clean.clone(), dirty]);
+        assert_eq!(backend.removed.into_inner(), vec![clean]);
+        assert_eq!(
+            load_run(&run.dir).expect("load ended run").state.lifecycle,
+            RunLifecycle::Ended
+        );
+    }
+
+    #[test]
+    fn git_status_boundary_detects_untracked_evidence() {
+        let temp = TempDir::new();
+        let repo = temp.path().join("repo");
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repo)
+            .status()
+            .expect("run git init");
+        assert!(init.success());
+        assert!(!worktree_is_dirty(&repo).expect("clean status"));
+
+        fs::write(repo.join("evidence.txt"), "uncommitted").expect("write evidence");
+
+        assert!(worktree_is_dirty(&repo).expect("dirty status"));
+    }
+
+    #[test]
+    fn command_args_accept_one_run_and_reject_unknown_or_duplicate_options() {
+        assert_eq!(
+            parse_command_args(
+                &["--json".to_owned(), "/run/one".to_owned()],
+                "--json",
+                STATUS_USAGE
+            )
+            .unwrap(),
+            (PathBuf::from("/run/one"), true)
+        );
+        assert!(parse_command_args(&["--wat".to_owned()], "--json", STATUS_USAGE).is_err());
+        assert!(parse_command_args(
+            &["--json".to_owned(), "--json".to_owned()],
+            "--json",
+            STATUS_USAGE
+        )
+        .is_err());
+    }
 }

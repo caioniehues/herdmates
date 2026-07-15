@@ -3,12 +3,12 @@
 
 [claude]
 command = ["claude"]
-submit = ["Enter"]
 submit_verify = true
 reads_agents_md = "pointer"   # needs a pointer line in the launch prompt
+queues_midturn = true          # mid-turn pane run queues cleanly (live-verified)
 
 [codex]
 command = ["codex"]
-submit = ["Enter", "Enter"]   # codex TUI often needs two Enters to submit
 submit_verify = true
-reads_agents_md = "native"    # codex reads AGENTS.md from cwd natively
+reads_agents_md = "native"    # honors the repository's authored AGENTS.md natively
+queues_midturn = true          # mid-turn pane run queues cleanly (live-verified)
