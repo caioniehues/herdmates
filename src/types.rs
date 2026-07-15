@@ -98,6 +98,8 @@ pub struct WorkerRunState {
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<PathBuf>,
+    #[serde(default)]
+    pub adopted: bool,
     pub lifecycle: WorkerLifecycle,
 }
 
@@ -117,6 +119,7 @@ pub enum WorkerLifecycle {
     Running,
     Failed,
     Ended,
+    Released,
 }
 
 fn default_cwd() -> PathBuf {

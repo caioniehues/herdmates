@@ -1,11 +1,12 @@
 //! herdr-agent-team — Herdr plugin binary.
 //!
-//! Subcommand dispatch follows `docs/spec.md` section 1: the CLI half is
-//! `spawn`, `status`, and `kill`; the event half is `on-agent-status`.
+//! Subcommand dispatch follows `docs/spec.md`: the CLI half is `adopt`,
+//! `spawn`, `status`, `kill`, and `msg`; the event half is `on-agent-status`.
 
 use std::fmt::Display;
 use std::process::ExitCode;
 
+pub mod adopt;
 pub mod agents_md;
 pub mod herdr;
 pub mod hook;
@@ -23,13 +24,14 @@ fn main() -> ExitCode {
     let args = args.collect::<Vec<_>>();
 
     match command.as_str() {
+        "adopt" => exit(adopt::adopt_command(&args)),
         "spawn" => exit(spawn::spawn_command(&args)),
         "status" => exit(status_kill::status_command(&args)),
         "kill" => exit(status_kill::kill_command(&args)),
         "msg" => exit(msg::msg_command(&args)),
         "on-agent-status" => exit(hook::hook_command()),
         "" | "help" | "--help" | "-h" => {
-            eprintln!("herdr-agent-team <spawn|status|kill|msg|on-agent-status>");
+            eprintln!("herdr-agent-team <adopt|spawn|status|kill|msg|on-agent-status>");
             ExitCode::SUCCESS
         }
         other => {

@@ -1,7 +1,10 @@
 //! Name-addressed worker messaging and deferred delivery from `docs/spec.md` section 11.
 
 use crate::herdr::{HerdrClient, HerdrError, PaneInfo, WaitOutcome};
-use crate::launcher::{default_launcher_table, launcher_entry, load_launcher_table, LauncherError};
+use crate::launcher::{
+    conservative_adopted_launcher, default_launcher_table, launcher_entry, load_launcher_table,
+    LauncherError,
+};
 use crate::run::{list_active_runs, load_run, RunBoard, RunError};
 use crate::types::{LauncherEntry, LauncherTable, RunLifecycle};
 use std::collections::BTreeSet;
@@ -84,6 +87,7 @@ struct ResolvedTarget {
     name: String,
     pane_id: String,
     agent: Option<String>,
+    adopted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,8 +156,8 @@ pub(crate) fn deliver_queued_message(
             pane_id: target.pane_id.clone(),
         })?;
     let launchers = load_launchers()?;
-    let launcher = launcher_entry(&launchers, agent)?;
-    deliver_message(herdr, &target, text, launcher)
+    let launcher = target_launcher(&launchers, &target, agent)?;
+    deliver_message(herdr, &target, text, &launcher)
 }
 
 fn parse_msg_arguments(args: &[String]) -> Result<MsgArguments, MsgError> {
@@ -251,7 +255,7 @@ fn send_message<H: HerdrApi>(
                 })?
         }
     };
-    let launcher = launcher_entry(launchers, agent)?;
+    let launcher = target_launcher(launchers, &target, agent)?;
 
     if !launcher.queues_midturn && pane.is_none() {
         pane = Some(herdr.pane_get(&target.pane_id)?);
@@ -261,7 +265,7 @@ fn send_message<H: HerdrApi>(
 
     match delivery_decision(launcher.queues_midturn, status) {
         DeliveryDecision::Deliver => {
-            deliver_message(herdr, &target, &sanitized, launcher)?;
+            deliver_message(herdr, &target, &sanitized, &launcher)?;
             Ok(MessageOutcome::Delivered)
         }
         DeliveryDecision::Enqueue => {
@@ -279,6 +283,7 @@ fn resolve_target(run: &RunBoard, target_name: &str) -> Result<ResolvedTarget, M
             name: "god".to_owned(),
             pane_id: run.state.god_pane_id.clone(),
             agent: None,
+            adopted: false,
         });
     }
 
@@ -299,6 +304,7 @@ fn resolve_target(run: &RunBoard, target_name: &str) -> Result<ResolvedTarget, M
                     target: strip_escape_sequences(target_name),
                 })?,
             agent,
+            adopted: worker_state.adopted,
         });
     }
 
@@ -312,6 +318,18 @@ fn resolve_target(run: &RunBoard, target_name: &str) -> Result<ResolvedTarget, M
             target: strip_escape_sequences(target_name),
             candidates: "god (coordinator), god (worker)".to_owned(),
         }),
+    }
+}
+
+fn target_launcher(
+    launchers: &LauncherTable,
+    target: &ResolvedTarget,
+    agent: &str,
+) -> Result<LauncherEntry, MsgError> {
+    if target.adopted && !launchers.contains_key(agent) {
+        Ok(conservative_adopted_launcher(agent))
+    } else {
+        Ok(launcher_entry(launchers, agent)?.clone())
     }
 }
 
@@ -621,6 +639,7 @@ mod tests {
                         pane_id: Some("worker-pane".to_owned()),
                         agent_id: Some("session".to_owned()),
                         worktree_path: None,
+                        adopted: false,
                         lifecycle: WorkerLifecycle::Running,
                     },
                 )]),
@@ -662,6 +681,27 @@ mod tests {
         assert_eq!(
             herdr.calls(),
             [
+                Call::PaneRun("worker-pane".to_owned(), "hello".to_owned()),
+                Call::AgentWait("worker-pane".to_owned(), "working".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn adopted_unknown_agent_remains_messageable_with_conservative_policy() {
+        let temp = TempDir::new();
+        let mut run = fixture_run(temp.path(), "borrowed", "opencode");
+        run.state.workers.get_mut("borrowed").unwrap().adopted = true;
+        let herdr = FakeHerdr::new("opencode", Some("idle"), [WaitOutcome::Reached]);
+
+        let outcome = send_message(&run, &default_launcher_table(), "borrowed", "hello", &herdr)
+            .expect("synthetic adopted policy should support msg");
+
+        assert_eq!(outcome, MessageOutcome::Delivered);
+        assert_eq!(
+            herdr.calls(),
+            [
+                Call::PaneGet("worker-pane".to_owned()),
                 Call::PaneRun("worker-pane".to_owned(), "hello".to_owned()),
                 Call::AgentWait("worker-pane".to_owned(), "working".to_owned()),
             ]

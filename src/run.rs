@@ -236,6 +236,7 @@ mod tests {
                 pane_id: Some(pane_id.to_owned()),
                 agent_id: Some("agent-1".to_owned()),
                 worktree_path: Some(PathBuf::from("/tmp/worktree")),
+                adopted: false,
                 lifecycle: WorkerLifecycle::Running,
             },
         );
@@ -365,6 +366,21 @@ mod tests {
         assert!(list_active_runs(temp.path())
             .expect("list missing runs directory")
             .is_empty());
+    }
+
+    #[test]
+    fn legacy_worker_state_without_adopted_defaults_to_owned() {
+        let worker: WorkerRunState = toml::from_str(
+            r#"
+workspace_id = "workspace-legacy"
+pane_id = "pane-legacy"
+lifecycle = "running"
+"#,
+        )
+        .expect("parse pre-adoption worker state");
+
+        assert!(!worker.adopted);
+        assert_eq!(worker.lifecycle, WorkerLifecycle::Running);
     }
 
     #[test]

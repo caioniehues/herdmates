@@ -371,6 +371,7 @@ mod tests {
                         pane_id: Some(worker_pane.to_owned()),
                         agent_id: Some("agent-1".to_owned()),
                         worktree_path: None,
+                        adopted: false,
                         lifecycle: WorkerLifecycle::Running,
                     },
                 )]),

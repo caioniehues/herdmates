@@ -121,7 +121,7 @@ struct SpawnContext {
     god_pane_id: String,
 }
 
-trait HerdrApi {
+pub(crate) trait HerdrApi {
     fn health_check(&self) -> Result<(), HerdrError>;
     fn worktree_create(&self, repo: &Path, branch: &str) -> Result<WorktreeRef, HerdrError>;
     fn workspace_create(&self, cwd: &Path, label: &str) -> Result<WorkspaceRef, HerdrError>;
@@ -426,6 +426,7 @@ where
                     pane_id: None,
                     agent_id: None,
                     worktree_path: None,
+                    adopted: false,
                     lifecycle: WorkerLifecycle::Pending,
                 },
             )
@@ -526,7 +527,7 @@ where
     Ok(())
 }
 
-fn is_safe_worker_filename(name: &str) -> bool {
+pub(crate) fn is_safe_worker_filename(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
@@ -652,14 +653,12 @@ fn launch_worker<H: HerdrApi>(
     save_run(run)?;
 
     let prompt = launch_prompt(worker, launcher, &worker_protocol_path(run, worker));
-    submit_prompt(
+    submit_worker_prompt(
         herdr,
         worker,
         &pane.pane_id,
         &prompt,
         launcher.submit_verify,
-        SUBMIT_GRACE_TIMEOUT,
-        SUBMIT_VERIFY_TIMEOUT,
     )?;
 
     run.state
@@ -671,7 +670,7 @@ fn launch_worker<H: HerdrApi>(
     Ok(())
 }
 
-fn write_worker_protocol(
+pub(crate) fn write_worker_protocol(
     spec: &TeamSpec,
     worker: &WorkerSpec,
     run: &RunBoard,
@@ -701,7 +700,7 @@ fn write_worker_protocol(
         })
 }
 
-fn worker_protocol_path(run: &RunBoard, worker: &WorkerSpec) -> PathBuf {
+pub(crate) fn worker_protocol_path(run: &RunBoard, worker: &WorkerSpec) -> PathBuf {
     run.dir
         .join(PROTOCOLS_DIR)
         .join(format!("{}.md", worker.name))
@@ -720,6 +719,46 @@ fn launch_prompt(worker: &WorkerSpec, launcher: &LauncherEntry, protocol_path: &
             protocol_path.display()
         ),
     }
+}
+
+pub(crate) fn adoption_prompt(
+    worker: &WorkerSpec,
+    launcher: &LauncherEntry,
+    protocol_path: &Path,
+    include_brief: bool,
+) -> String {
+    if include_brief {
+        return launch_prompt(worker, launcher, protocol_path);
+    }
+
+    match launcher.reads_agents_md {
+        AgentsMdMode::Native => format!(
+            "The repository's authored AGENTS.md remains in effect. Read the generated team protocol at {}.",
+            protocol_path.display()
+        ),
+        AgentsMdMode::Pointer => format!(
+            "Read the generated team protocol at {}.",
+            protocol_path.display()
+        ),
+    }
+}
+
+pub(crate) fn submit_worker_prompt<H: HerdrApi>(
+    herdr: &H,
+    worker: &WorkerSpec,
+    pane_id: &str,
+    prompt: &str,
+    verify: bool,
+) -> Result<(), SpawnError> {
+    submit_prompt(
+        herdr,
+        worker,
+        pane_id,
+        prompt,
+        verify,
+        SUBMIT_GRACE_TIMEOUT,
+        SUBMIT_VERIFY_TIMEOUT,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

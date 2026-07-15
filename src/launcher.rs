@@ -83,6 +83,17 @@ pub fn launcher_entry<'a>(
     })
 }
 
+/// Synthetic policy for an adopted pane whose detected agent kind has no
+/// launcher-table entry. It is intentionally not inserted into the table.
+pub(crate) fn conservative_adopted_launcher(agent: &str) -> LauncherEntry {
+    LauncherEntry {
+        command: vec![agent.to_owned()],
+        submit_verify: true,
+        reads_agents_md: AgentsMdMode::Pointer,
+        queues_midturn: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

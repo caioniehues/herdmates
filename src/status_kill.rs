@@ -1,7 +1,7 @@
-//! Team status and teardown commands from `docs/spec.md` section 6.
+//! Team status and teardown commands from `docs/spec.md` sections 6 and 12.
 
 use crate::herdr::{AgentInfo, HerdrClient, HerdrError};
-use crate::run::{load_run, mark_ended, RunBoard, RunError};
+use crate::run::{load_run, mark_ended, save_run, RunBoard, RunError};
 use crate::types::{RunLifecycle, WorkerLifecycle};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,6 +55,9 @@ pub enum StatusKillError {
 
     #[error("refusing to remove dirty worktree(s): {paths:?}")]
     DirtyWorktrees { paths: Vec<PathBuf> },
+
+    #[error("adopted worker '{worker}' has no recorded pane id")]
+    MissingAdoptedPane { worker: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -278,6 +281,7 @@ fn render_status_json(snapshot: &StatusSnapshot) -> Result<String, StatusKillErr
 
 trait TeardownBackend {
     fn workspace_close(&self, workspace_id: &str) -> Result<(), StatusKillError>;
+    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), StatusKillError>;
     fn worktree_is_dirty(&self, path: &Path) -> Result<bool, StatusKillError>;
     fn worktree_remove(&self, path: &Path) -> Result<(), StatusKillError>;
 }
@@ -289,6 +293,11 @@ struct SystemTeardown<'a> {
 impl TeardownBackend for SystemTeardown<'_> {
     fn workspace_close(&self, workspace_id: &str) -> Result<(), StatusKillError> {
         self.herdr.workspace_close(workspace_id)?;
+        Ok(())
+    }
+
+    fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), StatusKillError> {
+        self.herdr.pane_run(pane_id, input)?;
         Ok(())
     }
 
@@ -309,16 +318,19 @@ fn kill_run_with_backend(
 ) -> Result<(), StatusKillError> {
     let mut run = load_run(run_dir)?;
     if run.state.lifecycle == RunLifecycle::Ended {
-        if end_non_failed_workers(&mut run) {
+        if end_non_failed_owned_workers(&mut run) {
             mark_ended(&mut run)?;
         }
         return Ok(());
     }
 
+    release_adopted_workers(&mut run, backend)?;
+
     let workspace_ids = run
         .state
         .workers
         .values()
+        .filter(|worker| !worker.adopted)
         .filter_map(|worker| worker.workspace_id.as_deref())
         .collect::<BTreeSet<_>>();
     for workspace_id in workspace_ids {
@@ -331,6 +343,7 @@ fn kill_run_with_backend(
             .state
             .workers
             .values()
+            .filter(|worker| !worker.adopted)
             .filter_map(|worker| worker.worktree_path.as_deref())
             .collect::<BTreeSet<_>>();
         for path in worktree_paths {
@@ -342,7 +355,7 @@ fn kill_run_with_backend(
         }
     }
 
-    end_non_failed_workers(&mut run);
+    end_non_failed_owned_workers(&mut run);
     mark_ended(&mut run)?;
     if dirty_paths.is_empty() {
         Ok(())
@@ -351,13 +364,53 @@ fn kill_run_with_backend(
     }
 }
 
-fn end_non_failed_workers(run: &mut RunBoard) -> bool {
+fn release_adopted_workers(
+    run: &mut RunBoard,
+    backend: &impl TeardownBackend,
+) -> Result<(), StatusKillError> {
+    let pending = run
+        .state
+        .workers
+        .iter()
+        .filter(|(_, worker)| worker.adopted && worker.lifecycle != WorkerLifecycle::Released)
+        .map(|(name, worker)| {
+            let pane_id =
+                worker
+                    .pane_id
+                    .clone()
+                    .ok_or_else(|| StatusKillError::MissingAdoptedPane {
+                        worker: name.clone(),
+                    })?;
+            Ok((name.clone(), pane_id))
+        })
+        .collect::<Result<Vec<_>, StatusKillError>>()?;
+    let notice = release_notice(&run.state.spec.name);
+
+    for (name, pane_id) in pending {
+        backend.pane_run(&pane_id, &notice)?;
+        run.state
+            .workers
+            .get_mut(&name)
+            .expect("release candidates come from the same run state")
+            .lifecycle = WorkerLifecycle::Released;
+        save_run(run)?;
+    }
+    Ok(())
+}
+
+fn release_notice(team_name: &str) -> String {
+    format!("team {team_name} ended; report protocol no longer applies")
+}
+
+fn end_non_failed_owned_workers(run: &mut RunBoard) -> bool {
     let mut changed = false;
     for worker in run.state.workers.values_mut() {
-        if !matches!(
-            worker.lifecycle,
-            WorkerLifecycle::Failed | WorkerLifecycle::Ended
-        ) {
+        if !worker.adopted
+            && !matches!(
+                worker.lifecycle,
+                WorkerLifecycle::Failed | WorkerLifecycle::Ended
+            )
+        {
             worker.lifecycle = WorkerLifecycle::Ended;
             changed = true;
         }
@@ -458,6 +511,7 @@ mod tests {
             pane_id: Some(pane.to_owned()),
             agent_id: Some(format!("agent-{pane}")),
             worktree_path: Some(worktree_root.join(worktree)),
+            adopted: false,
             lifecycle: WorkerLifecycle::Running,
         };
 
@@ -566,6 +620,7 @@ mod tests {
     struct FakeTeardown {
         dirty: BTreeSet<PathBuf>,
         closed: RefCell<Vec<String>>,
+        notices: RefCell<Vec<(String, String)>>,
         inspected: RefCell<Vec<PathBuf>>,
         removed: RefCell<Vec<PathBuf>>,
     }
@@ -573,6 +628,13 @@ mod tests {
     impl TeardownBackend for FakeTeardown {
         fn workspace_close(&self, workspace_id: &str) -> Result<(), StatusKillError> {
             self.closed.borrow_mut().push(workspace_id.to_owned());
+            Ok(())
+        }
+
+        fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), StatusKillError> {
+            self.notices
+                .borrow_mut()
+                .push((pane_id.to_owned(), input.to_owned()));
             Ok(())
         }
 
@@ -614,6 +676,55 @@ mod tests {
         assert!(match_pane(temp.path(), "pane-builder")
             .expect("match pane")
             .is_none());
+    }
+
+    #[test]
+    fn kill_releases_adopted_worker_once_and_closes_only_owned_workspace() {
+        let temp = TempDir::new();
+        let mut state = run_state(temp.path());
+        let adopted = state.workers.get_mut("reviewer").unwrap();
+        adopted.workspace_id = Some("workspace-borrowed".to_owned());
+        adopted.pane_id = Some("pane-borrowed".to_owned());
+        adopted.worktree_path = None;
+        adopted.adopted = true;
+        let run = create_run(temp.path(), state).expect("create mixed-ownership run");
+        let backend = FakeTeardown::default();
+
+        kill_run_with_backend(&run.dir, true, &backend).expect("kill mixed-ownership run");
+
+        assert_eq!(
+            backend.notices.borrow().as_slice(),
+            [(
+                "pane-borrowed".to_owned(),
+                "team status-wave ended; report protocol no longer applies".to_owned(),
+            )]
+        );
+        assert_eq!(
+            backend.closed.borrow().as_slice(),
+            ["workspace-builder".to_owned()]
+        );
+        assert_eq!(
+            backend.inspected.borrow().as_slice(),
+            [temp.path().join("builder")]
+        );
+        assert_eq!(
+            backend.removed.borrow().as_slice(),
+            [temp.path().join("builder")]
+        );
+        let ended = load_run(&run.dir).expect("load released run");
+        assert_eq!(ended.state.lifecycle, RunLifecycle::Ended);
+        assert_eq!(
+            ended.state.workers["builder"].lifecycle,
+            WorkerLifecycle::Ended
+        );
+        assert_eq!(
+            ended.state.workers["reviewer"].lifecycle,
+            WorkerLifecycle::Released
+        );
+
+        kill_run_with_backend(&run.dir, true, &backend).expect("repeat kill is idempotent");
+        assert_eq!(backend.notices.borrow().len(), 1);
+        assert_eq!(backend.closed.borrow().len(), 1);
     }
 
     #[test]

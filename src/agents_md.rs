@@ -196,6 +196,7 @@ mod tests {
             pane_id: Some(format!("{workspace_id}-pane")),
             agent_id: None,
             worktree_path: worktree_path.map(PathBuf::from),
+            adopted: false,
             lifecycle: WorkerLifecycle::Running,
         };
         let run = RunState {
