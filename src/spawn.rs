@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const PROTOCOLS_DIR: &str = "protocols";
-const AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);
+// DoD run 1: a loaded Claude session reported its agent id shortly after 30 s.
+const AGENT_START_TIMEOUT: Duration = Duration::from_secs(90);
 const SUBMIT_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const SUBMIT_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -105,8 +106,6 @@ pub enum SpawnError {
     },
     #[error("worker '{worker}' launched in pane '{pane_id}', but Herdr did not detect an agent")]
     AgentNotDetected { worker: String, pane_id: String },
-    #[error("worker '{worker}' launched in pane '{pane_id}', but Herdr did not return agent_session.value")]
-    AgentIdNotAvailable { worker: String, pane_id: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -386,6 +385,34 @@ where
     F: Fn(&str) -> bool,
     S: SetupRunner,
 {
+    spawn_resolved_with_setup_and_agent_info_timeout(
+        spec,
+        launchers,
+        state_dir,
+        god_pane_id,
+        herdr,
+        command_available,
+        setup_runner,
+        AGENT_START_TIMEOUT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_resolved_with_setup_and_agent_info_timeout<H, F, S>(
+    spec: TeamSpec,
+    launchers: &LauncherTable,
+    state_dir: &Path,
+    god_pane_id: String,
+    herdr: &H,
+    command_available: &F,
+    setup_runner: &S,
+    agent_info_timeout: Duration,
+) -> Result<RunBoard, SpawnError>
+where
+    H: HerdrApi,
+    F: Fn(&str) -> bool,
+    S: SetupRunner,
+{
     preflight(&spec, launchers, herdr, command_available)?;
 
     let workers = spec
@@ -433,7 +460,7 @@ where
     }
 
     for worker in &spec.workers {
-        if let Err(error) = launch_worker(worker, launchers, &mut run, herdr) {
+        if let Err(error) = launch_worker(worker, launchers, &mut run, herdr, agent_info_timeout) {
             if let Some(worker_state) = run.state.workers.get_mut(&worker.name) {
                 worker_state.lifecycle = WorkerLifecycle::Failed;
             }
@@ -595,6 +622,7 @@ fn launch_worker<H: HerdrApi>(
     launchers: &LauncherTable,
     run: &mut RunBoard,
     herdr: &H,
+    agent_info_timeout: Duration,
 ) -> Result<(), SpawnError> {
     let pane_id = run
         .state
@@ -615,16 +643,12 @@ fn launch_worker<H: HerdrApi>(
         "agent startup",
     )?;
 
-    let pane = wait_for_agent_info(herdr, worker, &pane_id, AGENT_START_TIMEOUT)?;
-    let agent_id = pane
-        .agent_id
-        .clone()
-        .expect("agent info wait only returns after receiving the opaque ID");
+    let pane = wait_for_agent_info(herdr, worker, &pane_id, agent_info_timeout)?;
     run.state
         .workers
         .get_mut(&worker.name)
         .expect("run state is initialized from the same team spec")
-        .agent_id = Some(agent_id);
+        .agent_id = pane.agent_id.clone();
     save_run(run)?;
 
     let prompt = launch_prompt(worker, launcher, &worker_protocol_path(run, worker));
@@ -800,20 +824,24 @@ fn wait_for_agent_info<H: HerdrApi>(
 
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return if pane.agent.is_none() {
-                Err(SpawnError::AgentNotDetected {
+            if pane.agent.is_none() {
+                return Err(SpawnError::AgentNotDetected {
                     worker: worker.name.clone(),
                     pane_id: pane_id.to_owned(),
-                })
-            } else {
-                Err(SpawnError::AgentIdNotAvailable {
-                    worker: worker.name.clone(),
-                    pane_id: pane_id.to_owned(),
-                })
-            };
+                });
+            }
+            eprintln!("{}", missing_agent_id_warning(worker, pane_id));
+            return Ok(pane);
         }
         thread::sleep(Duration::from_millis(100).min(remaining));
     }
+}
+
+fn missing_agent_id_warning(worker: &WorkerSpec, pane_id: &str) -> String {
+    format!(
+        "warning: worker '{}' launched in pane '{}', but Herdr did not return agent_session.value before timeout; continuing without agent id",
+        worker.name, pane_id
+    )
 }
 
 fn worker_herdr(worker: &WorkerSpec, step: &'static str, source: HerdrError) -> SpawnError {
@@ -917,6 +945,7 @@ mod tests {
         fail_launch_pane: RefCell<Option<String>>,
         fail_worktree_branch: RefCell<Option<String>>,
         fail_health: Cell<bool>,
+        omit_agent: Cell<bool>,
         omit_agent_id: Cell<bool>,
         wait_timeouts: Cell<usize>,
         agent_id_delays: Cell<usize>,
@@ -1026,15 +1055,18 @@ mod tests {
             if delayed {
                 self.agent_id_delays.set(self.agent_id_delays.get() - 1);
             }
+            let agent_detected = !self.omit_agent.get();
             Ok(PaneInfo {
                 pane_id: pane_id.to_owned(),
                 workspace_id: pane_id.replace("pane", "workspace"),
-                agent: Some(if pane_id == "pane-1" {
-                    "claude".to_owned()
-                } else {
-                    "codex".to_owned()
+                agent: agent_detected.then(|| {
+                    if pane_id == "pane-1" {
+                        "claude".to_owned()
+                    } else {
+                        "codex".to_owned()
+                    }
                 }),
-                agent_id: (!self.omit_agent_id.get() && !delayed)
+                agent_id: (agent_detected && !self.omit_agent_id.get() && !delayed)
                     .then(|| format!("agent-session-{pane_id}")),
                 agent_status: Some("idle".to_owned()),
                 cwd: None,
@@ -1531,17 +1563,92 @@ mod tests {
     }
 
     #[test]
-    fn missing_agent_session_id_is_never_synthesized() {
+    fn detected_agent_without_session_id_warns_and_later_workers_still_launch() {
         let temp = TempDir::new();
+        let state_dir = temp.path().join("state");
         let fake = FakeHerdr::default();
         fake.omit_agent_id.set(true);
-        let worker = worker(temp.path(), "claude-worker", "claude");
+        let setup = FakeSetupRunner::default();
+        let spec = team(
+            temp.path(),
+            vec![
+                worker(temp.path(), "first", "claude"),
+                worker(temp.path(), "second", "codex"),
+            ],
+        );
 
-        let error = wait_for_agent_info(&fake, &worker, "pane-1", Duration::from_millis(1))
-            .expect_err("missing opaque ID must fail")
-            .to_string();
+        let run = spawn_resolved_with_setup_and_agent_info_timeout(
+            spec,
+            &launchers(),
+            &state_dir,
+            "god-pane".to_owned(),
+            &fake,
+            &command_is_available,
+            &setup,
+            Duration::ZERO,
+        )
+        .expect("missing agent ids should degrade without aborting the team");
 
-        assert!(error.contains("agent_session.value"));
+        let persisted = load_run(&run.dir).expect("load degraded run");
+        assert_eq!(persisted.state.workers["first"].agent_id, None);
+        assert_eq!(persisted.state.workers["second"].agent_id, None);
+        assert_eq!(
+            persisted.state.workers["first"].lifecycle,
+            WorkerLifecycle::Running
+        );
+        assert_eq!(
+            persisted.state.workers["second"].lifecycle,
+            WorkerLifecycle::Running
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_run:pane-2:'codex'"));
+
+        let warning = missing_agent_id_warning(&run.state.spec.workers[0], "pane-1");
+        assert!(warning.contains("worker 'first'"));
+        assert!(warning.contains("pane 'pane-1'"));
+        assert!(warning.contains("continuing without agent id"));
+        assert!(!warning.contains('\n'), "warning must remain one line");
+        assert_eq!(AGENT_START_TIMEOUT, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn no_agent_at_timeout_remains_a_hard_per_worker_failure() {
+        let temp = TempDir::new();
+        let state_dir = temp.path().join("state");
+        let fake = FakeHerdr::default();
+        fake.omit_agent.set(true);
+        let setup = FakeSetupRunner::default();
+
+        let error = spawn_resolved_with_setup_and_agent_info_timeout(
+            team(
+                temp.path(),
+                vec![worker(temp.path(), "missing-agent", "claude")],
+            ),
+            &launchers(),
+            &state_dir,
+            "god-pane".to_owned(),
+            &fake,
+            &command_is_available,
+            &setup,
+            Duration::ZERO,
+        )
+        .expect_err("undetected agent must fail the worker");
+
+        assert!(matches!(
+            error,
+            SpawnError::AgentNotDetected {
+                ref worker,
+                ref pane_id,
+            } if worker == "missing-agent" && pane_id == "pane-1"
+        ));
+        let run = load_run(&only_run_dir(&state_dir)).expect("load failed agent run");
+        assert_eq!(
+            run.state.workers["missing-agent"].lifecycle,
+            WorkerLifecycle::Failed
+        );
+        assert_eq!(run.state.workers["missing-agent"].agent_id, None);
     }
 
     #[test]
