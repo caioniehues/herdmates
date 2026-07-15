@@ -3,21 +3,9 @@ name: Claude Code Review
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,16 +17,53 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
+          prompt: |
+            Review PR ${{ github.repository }}/pull/${{ github.event.pull_request.number }}.
 
+            This repo is a published herdr marketplace plugin: pushes to main are
+            releases. Read CLAUDE.md, CONTEXT.md, and docs/adr/ before judging.
+            Post your review as a PR comment via `gh pr comment` (use
+            inline comments for line-specific findings where possible).
+
+            Review along these axes, in priority order:
+
+            1. RELEASE GATE — if the diff changes behavior (src/, skills/, or
+               launcher/spec logic) but herdr-plugin.toml `version` is not bumped,
+               flag it as a blocking finding. Docs-only or test-only changes do
+               not need a bump.
+
+            2. DOCS/SPEC DRIFT — if the diff changes behavior but neither
+               docs/spec.md, HANDOFF.md, nor a new/updated ADR reflects it, flag
+               the drift and name the doc that should change. Conversely, if docs
+               change contract-level claims with no ADR, flag that too.
+
+            3. HARD-RULE VIOLATIONS (from CLAUDE.md / ADRs — cite the ADR number):
+               - Pane cwd must be set at pane creation (--cwd), never via `cd` in
+                 prompt text (ADR-0004).
+               - Always `pane run`, never split send-text/send-keys; `agent send`
+                 is not a messaging channel (ADR-0006, ADR-0008).
+               - Report pointer injection carries a file path only, never report
+                 content (ADR-0002).
+               - Never key coordination on agent status `done` (attention state);
+                 watched panes complete as `idle`.
+               - Port from limux-cli by copying, never depending (ADR-0005).
+               - Locked ADR decisions must not be silently relitigated.
+
+            4. CODE QUALITY — correctness, error handling, edge cases. Rust must
+               be `cargo fmt` clean and `clippy -D warnings` clean; call out
+               anything that would fail those gates. Every subcommand stub must
+               cite its spec section — flag removals of those citations. New
+               behavior needs regression tests; pure logic stays separate from
+               process-spawning code.
+
+            Be concise. No praise, no restating the diff. If nothing is wrong,
+            say so in one line. Severity-tag each finding (blocking / warning /
+            nit).
+          claude_args: '--allowed-tools "Bash(gh pr:*),Bash(gh issue view:*),Bash(git diff:*),Bash(git log:*),Read,Grep,Glob" --max-turns 30'

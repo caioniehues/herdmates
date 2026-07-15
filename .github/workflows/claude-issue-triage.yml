@@ -1,0 +1,52 @@
+name: Claude Issue Triage
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    # Skip issues the maintainer opened himself
+    if: github.event.issue.user.login != 'caioniehues'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Triage issue
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Triage issue #${{ github.event.issue.number }} in
+            ${{ github.repository }}.
+
+            1. Read the issue with `gh issue view ${{ github.event.issue.number }}`.
+            2. Check for duplicates: `gh issue list --state all --search "<keywords>"`.
+               If a duplicate exists, comment linking it.
+            3. Apply exactly one triage label from this repo's canonical
+               vocabulary (docs/agents/triage-labels.md):
+               - needs-triage: unclear, maintainer must evaluate
+               - needs-info: missing reproduction steps, versions, or context —
+                 also comment asking for the specific missing information
+               - ready-for-agent: fully specified, an autonomous agent could
+                 implement it (clear acceptance criteria, no open design
+                 questions, no locked-ADR conflicts)
+               - ready-for-human: requires design judgment, touches locked ADRs
+                 (docs/adr/), or needs Caio's decision
+               - wontfix: out of scope for this plugin — explain why in a comment
+            4. Additionally label the type: bug / enhancement / question
+               (create the label if missing is NOT allowed — skip if absent).
+            5. If the issue relitigates a locked ADR decision, say which ADR and
+               label ready-for-human.
+
+            Apply labels with `gh issue edit --add-label`. Keep any comment to a
+            few lines. Do not attempt to fix the issue.
+          claude_args: '--allowed-tools "Bash(gh issue:*),Bash(gh label list:*),Read,Grep,Glob" --max-turns 15'
