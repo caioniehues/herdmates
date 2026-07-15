@@ -249,10 +249,10 @@ fn dead_worker(s: &GodSnapshot, until: &Until) -> Option<String> {
         Until::AllTerminal => false,
     };
     s.worker_lifecycles.iter().find_map(|(name, state)| {
-        let dead = matches!(state, WorkerLifecycle::Failed | WorkerLifecycle::Orphaned)
-            || (matches!(until, Until::Blocked | Until::Attention) && terminal(*state));
-        (required(name) && dead && !s.rows.iter().any(|r| r.worker == *name && r.report_present))
-            .then(|| name.clone())
+        (required(name)
+            && terminal(*state)
+            && !s.rows.iter().any(|r| r.worker == *name && r.report_present))
+        .then(|| name.clone())
     })
 }
 
@@ -587,6 +587,25 @@ mod tests {
                 .exit_code(),
             2
         );
+    }
+
+    #[test]
+    fn ended_worker_without_report_makes_report_waits_unsatisfiable() {
+        let ended = snap(false, "done", WorkerLifecycle::Ended);
+
+        for until in [
+            Until::Report("a".into()),
+            Until::AnyReport,
+            Until::AllReports,
+        ] {
+            let fake = Fake {
+                snapshots: std::sync::Mutex::new(vec![ended.clone()]),
+            };
+            let verdict = wait_with(&fake, &until, Duration::ZERO).unwrap();
+            assert_eq!(verdict.verdict, VerdictKind::DeadWorker);
+            assert_eq!(verdict.worker.as_deref(), Some("a"));
+            assert_eq!(verdict.exit_code(), 3);
+        }
     }
 
     #[test]
