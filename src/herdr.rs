@@ -484,9 +484,18 @@ pub(crate) mod test_support {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, VecDeque};
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum FakeCall {
+        PaneGet(String),
+        PaneRun(String, String),
+        AgentWait(String, String),
+        Notification(String, String, String),
+    }
+
     #[derive(Default)]
     pub(crate) struct FakeHerdr {
         pub calls: RefCell<Vec<String>>,
+        pub typed_calls: RefCell<Vec<FakeCall>>,
         pub workspace_count: Cell<usize>,
         pub worktree_count: Cell<usize>,
         pub protocols_state_dir: RefCell<Option<PathBuf>>,
@@ -523,12 +532,18 @@ pub(crate) mod test_support {
             let Some(state_dir) = self.protocols_state_dir.borrow().as_ref().cloned() else {
                 return;
             };
-            let run_dir = std::fs::read_dir(state_dir.join("runs"))
+            let entries = std::fs::read_dir(state_dir.join("runs"))
                 .expect("read run state directory")
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
-                .find(|path| path.is_dir())
-                .expect("generated run directory");
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entries.len(),
+                1,
+                "expected exactly one generated run directory"
+            );
+            let run_dir = &entries[0];
             let snapshots = std::fs::read_dir(run_dir.join("protocols"))
                 .expect("read generated protocols")
                 .filter_map(Result::ok)
@@ -595,6 +610,9 @@ pub(crate) mod test_support {
             self.calls
                 .borrow_mut()
                 .push(format!("pane_run:{pane_id}:{input}"));
+            self.typed_calls
+                .borrow_mut()
+                .push(FakeCall::PaneRun(pane_id.to_owned(), input.to_owned()));
             if self.fail_launch_pane.borrow().as_deref() == Some(pane_id) && input.starts_with('\'')
             {
                 return Err(Self::command_error());
@@ -613,6 +631,9 @@ pub(crate) mod test_support {
             self.calls
                 .borrow_mut()
                 .push(format!("agent_wait:{pane_id}:{status}"));
+            self.typed_calls
+                .borrow_mut()
+                .push(FakeCall::AgentWait(pane_id.to_owned(), status.to_owned()));
             if let Some(outcome) = self.waits.borrow_mut().pop_front() {
                 return Ok(outcome);
             }
@@ -629,10 +650,14 @@ pub(crate) mod test_support {
             Ok(WaitOutcome::Reached)
         }
         fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError> {
+            self.calls.borrow_mut().push("agent_list".to_owned());
             Ok(self.agents.borrow().clone())
         }
         fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
             self.calls.borrow_mut().push(format!("pane_get:{pane_id}"));
+            self.typed_calls
+                .borrow_mut()
+                .push(FakeCall::PaneGet(pane_id.to_owned()));
             if let Some(pane) = self.pane.borrow().clone() {
                 return Ok(pane);
             }
@@ -688,6 +713,11 @@ pub(crate) mod test_support {
             self.calls
                 .borrow_mut()
                 .push(format!("notification:{title}:{body}:{sound}"));
+            self.typed_calls.borrow_mut().push(FakeCall::Notification(
+                title.to_owned(),
+                body.to_owned(),
+                sound.to_owned(),
+            ));
             Ok(())
         }
     }

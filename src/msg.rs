@@ -529,7 +529,10 @@ fn consume_control_string(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::{test_support::FakeHerdr, PaneInfo};
+    use crate::herdr::{
+        test_support::{FakeCall as Call, FakeHerdr},
+        PaneInfo,
+    };
     use crate::launcher::default_launcher_table;
     use crate::types::{
         GodSpec, RunState, TeamSpec, Topology, WorkerLifecycle, WorkerRunState, WorkerSpec,
@@ -563,41 +566,12 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Call {
-        PaneGet(String),
-        PaneRun(String, String),
-        AgentWait(String, String),
-        Notification(String, String, String),
-    }
-
     trait FakeCalls {
         fn typed_calls(&self) -> Vec<Call>;
     }
     impl FakeCalls for FakeHerdr {
         fn typed_calls(&self) -> Vec<Call> {
-            self.calls
-                .borrow()
-                .iter()
-                .filter_map(|call| {
-                    let parts = call.splitn(4, ':').collect::<Vec<_>>();
-                    match parts.as_slice() {
-                        ["pane_get", pane] => Some(Call::PaneGet((*pane).to_owned())),
-                        ["pane_run", pane, input] => {
-                            Some(Call::PaneRun((*pane).to_owned(), (*input).to_owned()))
-                        }
-                        ["agent_wait", pane, status] => {
-                            Some(Call::AgentWait((*pane).to_owned(), (*status).to_owned()))
-                        }
-                        ["notification", title, body, sound] => Some(Call::Notification(
-                            (*title).to_owned(),
-                            (*body).to_owned(),
-                            (*sound).to_owned(),
-                        )),
-                        _ => None,
-                    }
-                })
-                .collect()
+            self.typed_calls.borrow().clone()
         }
     }
 
