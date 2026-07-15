@@ -32,11 +32,17 @@ and core wave are committed; docs remain the contract.
   (command runs verbatim; codex's default sandbox then denies the herdr
   socket — launcher policy, documented in spec §11 + examples/agents.toml).
   85 tests green.
-- Open: ticket 18 (cosmetic — kill leaves worker lifecycles `running`).
-- **v1 is DoD-complete. Next step is the publish conversation with Caio:**
-  create public repo `caioniehues/herdr-agent-team` + `herdr-plugin` topic
-  (marketplace auto-lists in ~30 min), migrate open tickets to GitHub
-  Issues per docs/agents/issue-tracker.md. NEVER without explicit go-ahead.
+- Ticket 18 landed (`3b8d0c6`): kill marks worker lifecycles ended; README
+  reflects shipped v1. 87 tests.
+- **PUBLISHED 2026-07-15 with Caio's explicit go-ahead:**
+  https://github.com/caioniehues/herdr-agent-team — public, topic
+  `herdr-plugin` (marketplace listing ~30 min), tag `v0.1.0`. Issue tracker
+  switched to GitHub Issues (docs/agents/issue-tracker.md). All tickets
+  01–18 closed pre-publish.
+- Post-v1 backlog seeds: spec §8 roadmap (dashboard pane, `team wait`,
+  `team restart` via agent_session resume, task-board files,
+  report-metadata progress pings) — order by dogfooding pain, not
+  speculation (ADR-0007 discipline).
 - Local git only — **NOT on GitHub yet.** Publishing = create public repo
   `caioniehues/herdr-agent-team` + topic `herdr-plugin` (marketplace auto-lists
   in ~30 min). Ask Caio before pushing.

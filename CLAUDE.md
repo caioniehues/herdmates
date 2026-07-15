@@ -17,9 +17,12 @@ stubs.
 
 ## Hard rules
 
-- **Local git only. Never push / create the GitHub repo / add the
-  `herdr-plugin` topic without Caio's explicit go-ahead** — the topic
-  auto-publishes to the herdr marketplace within ~30 min.
+- **PUBLISHED 2026-07-15** (Caio's explicit go-ahead):
+  `caioniehues/herdr-agent-team`, public, topic `herdr-plugin` — listed on
+  the herdr marketplace. **Pushes to `main` are releases**: users install
+  from this repo. Gate every push (fmt/clippy/tests), bump the manifest
+  `version` for behavior changes, tag releases. Don't push without Caio's
+  ask, per global rules.
 - The herdr CLI (via `HERDR_BIN_PATH`) is the entire plugin API — no SDK.
   Ground truth for verbs: `herdr <cmd> --help` and
   `docs/herdr-api-schema.snapshot.json` (protocol 16 baseline; re-snapshot and
