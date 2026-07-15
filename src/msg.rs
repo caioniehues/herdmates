@@ -119,9 +119,42 @@ pub fn msg_command(args: &[String]) -> Result<(), MsgError> {
     let run = select_run(arguments.run_dir.as_deref())?;
     let launchers = load_launchers()?;
     let herdr = HerdrClient::from_env();
-    send_message(&run, &launchers, &arguments.target, &arguments.text, &herdr)?;
+    send_to_targets(&run, &launchers, &arguments.target, &arguments.text, &herdr)?;
     if arguments.attention {
         request_attention(&run, &arguments.target, &arguments.text, &herdr)?;
+    }
+    Ok(())
+}
+
+fn send_to_targets<H: HerdrApi>(
+    run: &RunBoard,
+    launchers: &LauncherTable,
+    target: &str,
+    text: &str,
+    herdr: &H,
+) -> Result<(), MsgError> {
+    let names = if target == "all" {
+        run.state.workers.keys().cloned().collect::<Vec<_>>()
+    } else if target.contains(',') {
+        let names = target
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return Err(arguments("target list is empty"));
+        }
+        names
+    } else {
+        vec![target.to_owned()]
+    };
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        send_message(run, launchers, &name, text, herdr)?;
     }
     Ok(())
 }
@@ -738,6 +771,39 @@ mod tests {
                 Call::PaneGet("worker-pane".to_owned()),
                 Call::PaneGet("worker-pane".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn fanout_all_and_subset_reuse_delivery_and_outbox_discipline() {
+        let temp = TempDir::new();
+        let mut run = fixture_run(temp.path(), "a", "codex");
+        let b = run.state.spec.workers[0].clone();
+        run.state.spec.workers.push(WorkerSpec {
+            name: "b".into(),
+            ..b
+        });
+        let mut bstate = run.state.workers["a"].clone();
+        bstate.pane_id = Some("worker-pane-b".into());
+        run.state.workers.insert("b".into(), bstate);
+        let herdr = fake_herdr("codex", Some("working"), []);
+        send_to_targets(&run, &conservative_table(), "all", "broadcast", &herdr).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("outbox/a/00000000000000000001.msg")).unwrap(),
+            "broadcast"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("outbox/b/00000000000000000001.msg")).unwrap(),
+            "broadcast"
+        );
+        send_to_targets(&run, &conservative_table(), "b,a,b", "subset", &herdr).unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("outbox/a/00000000000000000002.msg")).unwrap(),
+            "subset"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("outbox/b/00000000000000000002.msg")).unwrap(),
+            "subset"
         );
     }
 
