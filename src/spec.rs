@@ -63,6 +63,7 @@ struct RawWorkerSpec {
     name: String,
     agent: String,
     role: String,
+    task: Option<String>,
     worktree: Option<bool>,
     branch: Option<String>,
     brief: PathBuf,
@@ -122,6 +123,7 @@ pub fn team_spec_from_agents(
                 name,
                 agent: agent.to_owned(),
                 role: SHORTHAND_ROLE.to_owned(),
+                task: None,
                 worktree: false,
                 branch: None,
             }
@@ -245,10 +247,11 @@ pub fn render_spawn_plan(spec: &TeamSpec) -> String {
     for worker in &spec.workers {
         writeln!(
             plan,
-            "  - {}: agent={} role={} worktree={} branch={} brief={}",
+            "  - {}: agent={} role={} task={} worktree={} branch={} brief={}",
             worker.name,
             worker.agent,
             worker.role,
+            worker.task.as_deref().unwrap_or("none"),
             worker.worktree,
             worker.branch.as_deref().unwrap_or("none"),
             worker.brief.display()
@@ -292,6 +295,7 @@ fn resolve_raw_spec(raw: RawTeamSpec) -> TeamSpec {
                 agent: worker.agent,
                 worktree: worker.worktree.unwrap_or_else(|| worker.role == "builder"),
                 role: worker.role,
+                task: worker.task,
                 branch: worker.branch,
                 brief: worker.brief,
             })
@@ -426,6 +430,7 @@ brief = "briefs/reviewer-1.md"
             name: name.to_owned(),
             agent: agent.to_owned(),
             role: "reviewer".to_owned(),
+            task: None,
             worktree: false,
             branch: None,
             brief: PathBuf::from(format!("briefs/{name}.md")),
@@ -459,6 +464,7 @@ brief = "briefs/reviewer-1.md"
                 name: "builder-1".to_owned(),
                 agent: "claude".to_owned(),
                 role: "builder".to_owned(),
+                task: None,
                 worktree: true,
                 branch: Some("feat/wave3-builder-1".to_owned()),
                 brief: PathBuf::from("briefs/builder-1.md"),
@@ -470,11 +476,18 @@ brief = "briefs/reviewer-1.md"
                 name: "reviewer-1".to_owned(),
                 agent: "codex".to_owned(),
                 role: "reviewer".to_owned(),
+                task: None,
                 worktree: false,
                 branch: None,
                 brief: PathBuf::from("briefs/reviewer-1.md"),
             }
         );
+    }
+
+    #[test]
+    fn parses_optional_worker_task() {
+        let spec = parse_team_spec("name = 'wave'\n[[workers]]\nname = 'builder'\nagent = 'codex'\nrole = 'builder'\ntask = 'ship control deck'\nbrief = 'brief.md'\n").expect("task is additive");
+        assert_eq!(spec.workers[0].task.as_deref(), Some("ship control deck"));
     }
 
     #[test]
@@ -607,10 +620,10 @@ brief = "briefs/reviewer-1.md"
         assert!(plan.contains("god: self"));
         assert!(plan.contains("setup: ./scripts/worktree-setup.sh"));
         assert!(plan.contains(
-            "builder-1: agent=claude role=builder worktree=true branch=feat/wave3-builder-1 brief=briefs/builder-1.md"
+            "builder-1: agent=claude role=builder task=none worktree=true branch=feat/wave3-builder-1 brief=briefs/builder-1.md"
         ));
         assert!(plan.contains(
-            "reviewer-1: agent=codex role=reviewer worktree=false branch=none brief=briefs/reviewer-1.md"
+            "reviewer-1: agent=codex role=reviewer task=none worktree=false branch=none brief=briefs/reviewer-1.md"
         ));
     }
 

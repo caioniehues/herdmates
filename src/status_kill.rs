@@ -13,7 +13,8 @@ use std::time::{SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
 
 const STATUS_USAGE: &str = "usage: herdr-agent-team status <run-dir> [--json]";
-const KILL_USAGE: &str = "usage: herdr-agent-team kill <run-dir> [--remove-worktrees]";
+const KILL_USAGE: &str =
+    "usage: herdr-agent-team kill <run-dir> [--remove-worktrees] [--worker <name>]";
 
 #[derive(Debug, Error)]
 pub enum StatusKillError {
@@ -80,8 +81,17 @@ pub fn status_command(args: &[String]) -> Result<(), StatusKillError> {
 }
 
 pub fn kill_command(args: &[String]) -> Result<(), StatusKillError> {
-    let (run_dir, remove_worktrees) = parse_command_args(args, "--remove-worktrees", KILL_USAGE)?;
-    kill_run(&run_dir, remove_worktrees, &HerdrClient::from_env())
+    let (run_dir, remove_worktrees, worker) = parse_kill_args(args)?;
+    if let Some(worker) = worker {
+        kill_worker(
+            &run_dir,
+            &worker,
+            remove_worktrees,
+            &HerdrClient::from_env(),
+        )
+    } else {
+        kill_run(&run_dir, remove_worktrees, &HerdrClient::from_env())
+    }
 }
 
 pub fn status_run(
@@ -99,6 +109,65 @@ pub fn kill_run(
 ) -> Result<(), StatusKillError> {
     let backend = SystemTeardown { herdr };
     kill_run_with_backend(run_dir, remove_worktrees, &backend)
+}
+
+pub fn kill_worker(
+    run_dir: &Path,
+    worker_name: &str,
+    remove_worktrees: bool,
+    herdr: &HerdrClient,
+) -> Result<(), StatusKillError> {
+    kill_worker_with_backend(
+        run_dir,
+        worker_name,
+        remove_worktrees,
+        &SystemTeardown { herdr },
+    )
+}
+
+fn parse_kill_args(args: &[String]) -> Result<(PathBuf, bool, Option<String>), StatusKillError> {
+    let mut run_dir = None;
+    let mut remove_worktrees = false;
+    let mut worker = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--remove-worktrees" if !remove_worktrees => remove_worktrees = true,
+            "--remove-worktrees" => {
+                return Err(StatusKillError::Usage(format!(
+                    "duplicate option --remove-worktrees; {KILL_USAGE}"
+                )))
+            }
+            "--worker" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| {
+                    StatusKillError::Usage(format!("--worker requires a name; {KILL_USAGE}"))
+                })?;
+                if worker.replace(value.clone()).is_some() {
+                    return Err(StatusKillError::Usage(format!(
+                        "duplicate option --worker; {KILL_USAGE}"
+                    )));
+                }
+            }
+            value if value.starts_with('-') => {
+                return Err(StatusKillError::Usage(format!(
+                    "unknown option {value}; {KILL_USAGE}"
+                )))
+            }
+            value if run_dir.replace(PathBuf::from(value)).is_some() => {
+                return Err(StatusKillError::Usage(format!(
+                    "expected one run directory; {KILL_USAGE}"
+                )))
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok((
+        run_dir.ok_or_else(|| StatusKillError::Usage(KILL_USAGE.to_owned()))?,
+        remove_worktrees,
+        worker,
+    ))
 }
 
 fn parse_command_args(
@@ -369,6 +438,82 @@ fn kill_run_with_backend(
     }
 }
 
+fn kill_worker_with_backend(
+    run_dir: &Path,
+    worker_name: &str,
+    remove_worktrees: bool,
+    backend: &impl TeardownBackend,
+) -> Result<(), StatusKillError> {
+    let mut run = load_run(run_dir)?;
+    if run.state.lifecycle == RunLifecycle::Ended {
+        return Ok(());
+    }
+    let worker = run.state.workers.get(worker_name).cloned().ok_or_else(|| {
+        StatusKillError::Usage(format!(
+            "unknown worker '{worker_name}' in {}; {KILL_USAGE}",
+            run_dir.display()
+        ))
+    })?;
+    if matches!(
+        worker.lifecycle,
+        WorkerLifecycle::Ended | WorkerLifecycle::Released | WorkerLifecycle::Failed
+    ) {
+        return Ok(());
+    }
+
+    if worker.adopted {
+        if let Some(pane_id) = worker.pane_id.as_deref() {
+            if let Err(error) = backend.pane_run(pane_id, &release_notice(&run.state.spec.name)) {
+                log_teardown_note("adopted pane", pane_id, &error);
+            }
+        }
+    } else if let Some(workspace_id) = worker.workspace_id.as_deref() {
+        if let Err(error) = backend.workspace_close(workspace_id) {
+            log_teardown_note("workspace", workspace_id, &error);
+        }
+    }
+
+    let mut dirty_paths = Vec::new();
+    if remove_worktrees && !worker.adopted {
+        if let Some(path) = worker.worktree_path.as_deref() {
+            match backend.worktree_is_dirty(path) {
+                Ok(true) => dirty_paths.push(path.to_path_buf()),
+                Ok(false) => {
+                    if let Err(error) = backend.worktree_remove(path) {
+                        log_teardown_note("worktree", &path.display().to_string(), &error);
+                    }
+                }
+                Err(error) => log_teardown_note("worktree", &path.display().to_string(), &error),
+            }
+        }
+    }
+    let terminal = if worker.adopted {
+        WorkerLifecycle::Released
+    } else {
+        WorkerLifecycle::Ended
+    };
+    run.state
+        .workers
+        .get_mut(worker_name)
+        .expect("worker was loaded above")
+        .lifecycle = terminal;
+    if run.state.workers.values().all(|state| {
+        matches!(
+            state.lifecycle,
+            WorkerLifecycle::Ended | WorkerLifecycle::Released | WorkerLifecycle::Failed
+        )
+    }) {
+        mark_ended(&mut run)?;
+    } else {
+        crate::run::save_run(&run)?;
+    }
+    if dirty_paths.is_empty() {
+        Ok(())
+    } else {
+        Err(StatusKillError::DirtyWorktrees { paths: dirty_paths })
+    }
+}
+
 fn release_adopted_workers(run: &mut RunBoard, backend: &impl TeardownBackend) {
     let pending = run
         .state
@@ -506,6 +651,7 @@ mod tests {
                 name: "builder".to_owned(),
                 agent: "codex".to_owned(),
                 role: "builder".to_owned(),
+                task: None,
                 worktree: true,
                 branch: Some("feat/builder".to_owned()),
                 brief: PathBuf::from("briefs/builder.md"),
@@ -514,12 +660,14 @@ mod tests {
                 name: "reviewer".to_owned(),
                 agent: "claude".to_owned(),
                 role: "reviewer".to_owned(),
+                task: None,
                 worktree: true,
                 branch: Some("feat/reviewer".to_owned()),
                 brief: PathBuf::from("briefs/reviewer.md"),
             },
         ];
         let runtime = |workspace: &str, pane: &str, worktree: &str| WorkerRunState {
+            task: None,
             workspace_id: Some(workspace.to_owned()),
             pane_id: Some(pane.to_owned()),
             agent_id: Some(format!("agent-{pane}")),
@@ -776,6 +924,31 @@ mod tests {
             ended.state.workers["reviewer"].lifecycle,
             WorkerLifecycle::Failed
         );
+    }
+
+    #[test]
+    fn kill_worker_leaves_other_workers_and_run_active_and_refuses_dirty_worktree() {
+        let temp = TempDir::new();
+        let state = run_state(temp.path());
+        let run = create_run(temp.path(), state).expect("create run");
+        let backend = FakeTeardown {
+            dirty: BTreeSet::from([run.state.workers["builder"].worktree_path.clone().unwrap()]),
+            ..Default::default()
+        };
+        let error = kill_worker_with_backend(&run.dir, "builder", true, &backend)
+            .expect_err("dirty worker must be preserved");
+        assert!(matches!(error, StatusKillError::DirtyWorktrees { .. }));
+        let persisted = load_run(&run.dir).expect("load run");
+        assert_eq!(persisted.state.lifecycle, RunLifecycle::Active);
+        assert_eq!(
+            persisted.state.workers["builder"].lifecycle,
+            WorkerLifecycle::Ended
+        );
+        assert_eq!(
+            persisted.state.workers["reviewer"].lifecycle,
+            WorkerLifecycle::Running
+        );
+        assert_eq!(backend.closed.into_inner(), ["workspace-builder"]);
     }
 
     #[test]

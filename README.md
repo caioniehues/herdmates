@@ -33,6 +33,24 @@ of polling.
   to the god. Mesh: workers also get a peer table and message each other through
   the same `msg` verb with a structured envelope.
 
+## Team control deck
+
+Open the native board as a durable tab with the `open-board` plugin action (or
+open the `board` pane with an `overlay` placement for a quick popup). It polls
+the newest active run by default, keeping collection outside its render tick.
+Use `j`/`k` to select a worker; `m` sends a message, `g` acknowledges attention,
+`K` kills only that worker, `o` opens its `report:` link, and `p` adopts a pane.
+
+Example Herdr keybinding:
+
+```toml
+[[keys.command]]
+key = "prefix+b"
+type = "plugin_action"
+command = "caioniehues.agent-team.open-board"
+description = "open agent-team control deck"
+```
+
 ## Why
 
 Nothing on the Herdr marketplace orchestrates *heterogeneous* agent teams. The

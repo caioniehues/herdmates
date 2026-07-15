@@ -466,6 +466,7 @@ mod tests {
                         name: worker_name.clone(),
                         agent: "codex".to_owned(),
                         role: "builder".to_owned(),
+                        task: None,
                         worktree: false,
                         branch: None,
                         brief: PathBuf::from("brief.md"),
@@ -476,6 +477,7 @@ mod tests {
                 workers: BTreeMap::from([(
                     worker_name,
                     WorkerRunState {
+                        task: None,
                         workspace_id: Some("worker-workspace".to_owned()),
                         pane_id: Some(worker_pane.to_owned()),
                         agent_id: Some("agent-1".to_owned()),
@@ -928,6 +930,7 @@ mod tests {
         run.state.workers.insert(
             "reviewer".to_owned(),
             WorkerRunState {
+                task: None,
                 workspace_id: Some("reviewer-workspace".to_owned()),
                 pane_id: Some("reviewer-pane".to_owned()),
                 agent_id: Some("agent-2".to_owned()),

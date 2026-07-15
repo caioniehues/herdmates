@@ -422,6 +422,7 @@ where
             (
                 worker.name.clone(),
                 WorkerRunState {
+                    task: worker.task.clone(),
                     workspace_id: None,
                     pane_id: None,
                     agent_id: None,
@@ -1188,6 +1189,7 @@ mod tests {
             name: name.to_owned(),
             agent: agent.to_owned(),
             role: "reviewer".to_owned(),
+            task: None,
             worktree: false,
             branch: None,
             brief,

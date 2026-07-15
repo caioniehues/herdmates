@@ -317,6 +317,7 @@ fn adopt_resolved<H: HerdrApi>(
         name: arguments.name,
         agent,
         role: arguments.role,
+        task: None,
         worktree: false,
         branch: None,
         brief: arguments.brief.clone().unwrap_or_default(),
@@ -456,6 +457,7 @@ fn insert_adopted_worker(state: &mut RunState, worker: &WorkerSpec, pane: &PaneI
     state.workers.insert(
         worker.name.clone(),
         WorkerRunState {
+            task: worker.task.clone(),
             workspace_id: Some(pane.workspace_id.clone()),
             pane_id: Some(pane.pane_id.clone()),
             agent_id: pane.agent_id.clone(),
@@ -621,6 +623,7 @@ mod tests {
             name: "existing".to_owned(),
             agent: "claude".to_owned(),
             role: "existing worker".to_owned(),
+            task: None,
             worktree: false,
             branch: None,
             brief: root.join("existing.md"),
@@ -641,6 +644,7 @@ mod tests {
                 workers: BTreeMap::from([(
                     "existing".to_owned(),
                     WorkerRunState {
+                        task: None,
                         workspace_id: Some("workspace-existing".to_owned()),
                         pane_id: Some("pane-existing".to_owned()),
                         agent_id: Some("session-existing".to_owned()),

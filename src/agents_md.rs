@@ -199,6 +199,7 @@ mod tests {
             name: name.to_owned(),
             agent: "codex".to_owned(),
             role: role.to_owned(),
+            task: None,
             worktree,
             branch: worktree.then(|| format!("feat/{name}")),
             brief: PathBuf::from(format!("briefs/{name}.md")),
@@ -220,6 +221,7 @@ mod tests {
             workers,
         };
         let worker_state = |workspace_id: &str, worktree_path: Option<&str>| WorkerRunState {
+            task: None,
             workspace_id: Some(workspace_id.to_owned()),
             pane_id: Some(format!("{workspace_id}-pane")),
             agent_id: None,

@@ -26,6 +26,31 @@ title = "Kill team"
 contexts = ["workspace"]
 command = ["target/release/herdr-agent-team", "kill"]
 
+[[actions]]
+id = "open-board"
+title = "Open team control deck"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin caioniehues.agent-team --entrypoint board --placement tab"]
+
+[[actions]]
+id = "open-report"
+title = "Open team report"
+contexts = ["pane"]
+command = ["target/release/herdr-agent-team", "open-report"]
+
+[[panes]]
+id = "board"
+title = "Agent Team control deck"
+description = "Keyboard-driven worker controls; open as a tab or override placement for a quick popup."
+placement = "tab"
+command = ["target/release/herdr-agent-team", "board"]
+
+[[link_handlers]]
+id = "report"
+title = "Open team report"
+pattern = "^report:.+$"
+action = "open-report"
+
 # Report flow: worker status flips -> inbox append + pointer injection into the
 # god pane (ADR-0002). The manifest uses the live-verified dot-form event name;
 # HERDR_PLUGIN_EVENT_JSON uses the underscore form (spec section 9).
