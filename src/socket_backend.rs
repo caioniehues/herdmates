@@ -6,7 +6,8 @@
 use crate::board::{BoardCollector, BoardError, BoardSnapshot};
 use crate::god_cli::{GodCliError, GodCollector, GodSnapshot};
 use crate::herdr::{
-    AgentInfo, HerdrApi, HerdrError, PaneInfo, WaitOutcome, WorkspaceRef, WorktreeRef,
+    AgentInfo, HerdrApi, HerdrError, PaneInfo, PaneLayoutSnapshot, WaitOutcome, WorkspaceRef,
+    WorktreeRef,
 };
 use crate::metadata::MetadataUpdate;
 use crate::socket::{
@@ -285,6 +286,15 @@ impl<C: HerdrApi> HerdrApi for SocketClient<C> {
     fn pane_split(&self, w: &str, c: &Path) -> Result<PaneInfo, HerdrError> {
         self.fallback().pane_split(w, c)
     }
+    fn pane_split_pane(
+        &self,
+        target_pane_id: &str,
+        direction: &str,
+        ratio: Option<f64>,
+    ) -> Result<PaneInfo, HerdrError> {
+        self.fallback()
+            .pane_split_pane(target_pane_id, direction, ratio)
+    }
     fn pane_run(&self, p: &str, i: &str) -> Result<(), HerdrError> {
         self.fallback().pane_run(p, i)
     }
@@ -294,6 +304,12 @@ impl<C: HerdrApi> HerdrApi for SocketClient<C> {
     fn pane_rename(&self, p: &str, t: &str) -> Result<(), HerdrError> {
         self.fallback().pane_rename(p, t)
     }
+    fn pane_close(&self, p: &str) -> Result<(), HerdrError> {
+        self.fallback().pane_close(p)
+    }
+    fn pane_resize(&self, p: &str, direction: &str, amount: Option<f64>) -> Result<(), HerdrError> {
+        self.fallback().pane_resize(p, direction, amount)
+    }
     fn agent_wait(&self, p: &str, s: &str, t: Duration) -> Result<WaitOutcome, HerdrError> {
         self.fallback().agent_wait(p, s, t)
     }
@@ -302,6 +318,12 @@ impl<C: HerdrApi> HerdrApi for SocketClient<C> {
     }
     fn pane_get(&self, p: &str) -> Result<PaneInfo, HerdrError> {
         self.fallback().pane_get(p)
+    }
+    fn pane_list(&self, w: Option<&str>) -> Result<Vec<PaneInfo>, HerdrError> {
+        self.fallback().pane_list(w)
+    }
+    fn pane_layout(&self, p: &str) -> Result<PaneLayoutSnapshot, HerdrError> {
+        self.fallback().pane_layout(p)
     }
     fn api_schema(&self) -> Result<String, HerdrError> {
         self.fallback().api_schema()

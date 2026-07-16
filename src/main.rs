@@ -7,28 +7,7 @@
 use std::fmt::Display;
 use std::process::ExitCode;
 
-pub mod adopt;
-pub mod agents_md;
-pub mod board;
-pub mod god_cli;
-pub mod herdr;
-pub mod hook;
-pub mod launcher;
-pub mod metadata;
-pub mod msg;
-pub mod paths;
-pub mod pump;
-pub mod reconcile;
-pub mod run;
-pub mod socket;
-#[cfg(unix)]
-pub mod socket_backend;
-pub mod spawn;
-pub mod spec;
-pub mod status_kill;
-pub mod teamfiles;
-pub mod tokens;
-pub mod types;
+use herdmates::*;
 
 fn main() -> ExitCode {
     paths::hydrate_environment();
