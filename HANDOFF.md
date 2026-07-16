@@ -20,18 +20,18 @@ backlog.
 
 ## Foundation checklist (execution order, ADR-0012 §Execution)
 
-1. [ ] Gate `integrate/program-wave1` centrally (fmt/clippy/tests, worktree
+1. [x] Gate `integrate/program-wave1` centrally (fmt/clippy/tests, worktree
        `~/Projects/herdr-agent-team-loops/integration`), bump manifest
        version → 1.1.0, merge → main, tag `v1.1.0`, push (Caio authorized
        2026-07-16 in the pivot session).
-2. [ ] Commit pivot docs on main (ADR-0012, CONTEXT.md, HANDOFF.md,
+2. [x] Commit pivot docs on main (ADR-0012, CONTEXT.md, HANDOFF.md,
        CLAUDE.md, program learnings + docs/reviews records).
-3. [ ] Close issues #66–#83 wontfix with pivot comment linking ADR-0012
+3. [x] Close issues #66–#83 wontfix with pivot comment linking ADR-0012
        (#77/#79: comment "moot under pivot").
-4. [ ] Delete empty batch worktrees + branches: fix-teardown-batch,
+4. [x] Delete empty batch worktrees + branches: fix-teardown-batch,
        fix-hook-batch, fix-godcli-batch, fix-msg-batch (under
        `~/Projects/herdr-agent-team-loops/`).
-5. [ ] Rename repo → `caioniehues/herdmates` (`gh repo rename`), then
+5. [x] Rename repo → `caioniehues/herdmates` (`gh repo rename`), then
        first 2.0.0-line commit: manifest id `herdmates`, name "Herdmates",
        description "Claude Code teammates, native in herdr".
 
