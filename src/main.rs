@@ -27,6 +27,7 @@ pub mod spawn;
 pub mod spec;
 pub mod status_kill;
 pub mod teamfiles;
+pub mod tmuxargs;
 pub mod types;
 
 fn main() -> ExitCode {
