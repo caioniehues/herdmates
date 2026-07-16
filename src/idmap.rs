@@ -98,6 +98,19 @@ impl IdMap {
         self.entries.get(tmux_id).map(String::as_str)
     }
 
+    /// Look up the tmux `%N`/`@N` id that maps to a given herdr id — needed
+    /// to translate a herdr response (e.g. a pane's `tab_id`) back into the
+    /// tmux-shaped id Claude Code expects (issue #85 commit 4). The mapping
+    /// is bijective in practice (each herdr id is registered under exactly
+    /// one tmux id), so a linear scan over this session's small table is
+    /// simple and sufficient — no reverse index to keep in sync.
+    pub fn reverse_lookup(&self, herdr_id: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(_, value)| value.as_str() == herdr_id)
+            .map(|(key, _)| key.as_str())
+    }
+
     /// Insert (or overwrite) `tmux_id` → `herdr_id`, persisting the change
     /// under a fresh locked load-mutate-save transaction.
     pub fn insert(
@@ -301,6 +314,18 @@ mod tests {
         let path = temp_state_path();
         IdMap::remove(&path, "%9").expect("removing an absent key must not error");
         assert_eq!(IdMap::load(&path).unwrap().lookup("%9"), None);
+    }
+
+    #[test]
+    fn reverse_lookup_finds_the_tmux_id_for_a_herdr_id() {
+        let path = temp_state_path();
+        IdMap::insert(&path, "%1", "w1A:p6").unwrap();
+        IdMap::insert(&path, "@0", "w1A:t1").unwrap();
+
+        let map = IdMap::load(&path).unwrap();
+        assert_eq!(map.reverse_lookup("w1A:p6"), Some("%1"));
+        assert_eq!(map.reverse_lookup("w1A:t1"), Some("@0"));
+        assert_eq!(map.reverse_lookup("w1A:p99"), None);
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub struct WorktreeRef {
 pub struct PaneInfo {
     pub pane_id: String,
     pub workspace_id: String,
+    pub tab_id: Option<String>,
     pub agent: Option<String>,
     pub agent_id: Option<String>,
     pub agent_session: Option<AgentSession>,
@@ -86,6 +87,8 @@ pub struct AgentSession {
 struct PaneInfoWire {
     pane_id: String,
     workspace_id: String,
+    #[serde(default)]
+    tab_id: Option<String>,
     agent: Option<String>,
     agent_session: Option<AgentSession>,
     agent_status: Option<String>,
@@ -105,6 +108,7 @@ impl<'de> Deserialize<'de> for PaneInfo {
         Ok(Self {
             pane_id: wire.pane_id,
             workspace_id: wire.workspace_id,
+            tab_id: wire.tab_id,
             agent: wire.agent,
             agent_id,
             agent_session: wire.agent_session,
@@ -188,6 +192,9 @@ pub trait HerdrApi {
         Err(unsupported_api())
     }
     fn pane_get(&self, _: &str) -> Result<PaneInfo, HerdrError> {
+        Err(unsupported_api())
+    }
+    fn pane_list(&self, _workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, HerdrError> {
         Err(unsupported_api())
     }
     fn api_schema(&self) -> Result<String, HerdrError> {
@@ -345,6 +352,16 @@ impl HerdrClient {
         parse_pane_info(&stdout).map_err(|message| self.invalid_response(&args, message))
     }
 
+    pub fn pane_list(&self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, HerdrError> {
+        let mut command = args(["pane", "list"]);
+        if let Some(workspace_id) = workspace_id {
+            command = command.with("--workspace").with(workspace_id);
+        }
+        let args = command.finish();
+        let stdout = self.invoke(&args)?;
+        parse_pane_list(&stdout).map_err(|message| self.invalid_response(&args, message))
+    }
+
     pub fn api_schema(&self) -> Result<String, HerdrError> {
         self.invoke(&args(["api", "schema", "--json"]).finish())
     }
@@ -470,6 +487,9 @@ impl HerdrApi for HerdrClient {
     fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
         Self::pane_get(self, pane_id)
     }
+    fn pane_list(&self, workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, HerdrError> {
+        Self::pane_list(self, workspace_id)
+    }
     fn api_schema(&self) -> Result<String, HerdrError> {
         Self::api_schema(self)
     }
@@ -569,6 +589,7 @@ pub(crate) mod test_support {
         pub require_empty_submit: SyncCell<bool>,
         pub empty_submit_seen: SyncCell<bool>,
         pub pane: SyncRefCell<Option<PaneInfo>>,
+        pub panes: SyncRefCell<Vec<PaneInfo>>,
         pub agents: SyncRefCell<Vec<AgentInfo>>,
         pub waits: SyncRefCell<VecDeque<WaitOutcome>>,
     }
@@ -741,6 +762,7 @@ pub(crate) mod test_support {
             Ok(PaneInfo {
                 pane_id: pane_id.to_owned(),
                 workspace_id: pane_id.replace("pane", "workspace"),
+                tab_id: None,
                 agent: agent_detected.then(|| {
                     if pane_id == "pane-1" {
                         "claude".to_owned()
@@ -761,6 +783,10 @@ pub(crate) mod test_support {
                 agent_status: Some("idle".to_owned()),
                 cwd: None,
             })
+        }
+        fn pane_list(&self, _workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, HerdrError> {
+            self.calls.borrow_mut().push("pane_list".to_owned());
+            Ok(self.panes.borrow().clone())
         }
         fn api_schema(&self) -> Result<String, HerdrError> {
             self.calls.borrow_mut().push("api_schema".to_owned());
@@ -916,6 +942,13 @@ struct AgentStatusEventData {
 }
 
 #[derive(Debug, Deserialize)]
+struct PaneListResult {
+    #[serde(rename = "type")]
+    kind: String,
+    panes: Vec<PaneInfo>,
+}
+
+#[derive(Debug, Deserialize)]
 struct AgentListResult {
     #[serde(rename = "type")]
     kind: String,
@@ -1026,6 +1059,12 @@ fn parse_agent_wait(stdout: &str, pane_id: &str, status: &str) -> Result<(), Str
             Ok(())
         }
     }
+}
+
+fn parse_pane_list(stdout: &str) -> Result<Vec<PaneInfo>, String> {
+    let result: PaneListResult = parse_response(stdout)?;
+    expect_kind(&result.kind, "pane_list")?;
+    Ok(result.panes)
 }
 
 fn parse_agent_list(stdout: &str) -> Result<Vec<AgentInfo>, String> {

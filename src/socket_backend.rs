@@ -303,6 +303,9 @@ impl<C: HerdrApi> HerdrApi for SocketClient<C> {
     fn pane_get(&self, p: &str) -> Result<PaneInfo, HerdrError> {
         self.fallback().pane_get(p)
     }
+    fn pane_list(&self, w: Option<&str>) -> Result<Vec<PaneInfo>, HerdrError> {
+        self.fallback().pane_list(w)
+    }
     fn api_schema(&self) -> Result<String, HerdrError> {
         self.fallback().api_schema()
     }
