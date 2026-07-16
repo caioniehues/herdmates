@@ -12,19 +12,19 @@ command = ["cargo", "build", "--release"]
 id = "spawn"
 title = "Spawn agent team"
 contexts = ["workspace"]
-command = ["target/release/herdr-agent-team", "spawn"]
+command = ["target/release/herdmates", "spawn"]
 
 [[actions]]
 id = "status"
 title = "Team status"
 contexts = ["workspace"]
-command = ["target/release/herdr-agent-team", "status"]
+command = ["target/release/herdmates", "status"]
 
 [[actions]]
 id = "kill"
 title = "Kill team"
 contexts = ["workspace"]
-command = ["target/release/herdr-agent-team", "kill"]
+command = ["target/release/herdmates", "kill"]
 
 [[actions]]
 id = "open-board"
@@ -36,14 +36,14 @@ command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin caioniehue
 id = "open-report"
 title = "Open team report"
 contexts = ["pane"]
-command = ["target/release/herdr-agent-team", "open-report"]
+command = ["target/release/herdmates", "open-report"]
 
 [[panes]]
 id = "board"
 title = "Agent Team control deck"
 description = "Keyboard-driven worker controls; open as a tab or override placement for a quick popup."
 placement = "tab"
-command = ["target/release/herdr-agent-team", "board"]
+command = ["target/release/herdmates", "board"]
 
 [[link_handlers]]
 id = "report"
@@ -56,28 +56,28 @@ action = "open-report"
 # HERDR_PLUGIN_EVENT_JSON uses the underscore form (spec section 9).
 [[events]]
 on = "pane.agent_status_changed"
-command = ["target/release/herdr-agent-team", "on-agent-status"]
+command = ["target/release/herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.moved"
-command = ["target/release/herdr-agent-team", "on-agent-status"]
+command = ["target/release/herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.exited"
-command = ["target/release/herdr-agent-team", "on-agent-status"]
+command = ["target/release/herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.closed"
-command = ["target/release/herdr-agent-team", "on-agent-status"]
+command = ["target/release/herdmates", "on-agent-status"]
 
 [[events]]
 on = "workspace.closed"
-command = ["target/release/herdr-agent-team", "on-agent-status"]
+command = ["target/release/herdmates", "on-agent-status"]
 
 [[events]]
 on = "worktree.removed"
-command = ["target/release/herdr-agent-team", "on-agent-status"]
+command = ["target/release/herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.agent_detected"
-command = ["target/release/herdr-agent-team", "on-agent-status"]
+command = ["target/release/herdmates", "on-agent-status"]

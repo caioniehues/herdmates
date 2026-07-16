@@ -4,7 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-pub const PLUGIN_ID: &str = "caioniehues.agent-team";
+pub const PLUGIN_ID: &str = "caioniehues.herdmates";
 
 #[derive(Debug, Error)]
 pub enum PathError {
