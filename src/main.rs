@@ -12,6 +12,7 @@ pub mod agents_md;
 pub mod attention;
 pub mod audit;
 pub mod board;
+pub mod focus_pane;
 pub mod focusfile;
 pub mod god_cli;
 pub mod herdr;
@@ -60,9 +61,10 @@ fn main() -> ExitCode {
         "on-agent-status" => exit(hook::hook_command()),
         "pump-board" => exit(pump::pump_board_command(&args)),
         "jump" => exit(jump::jump_command(&args)),
+        "focus" => exit(focus_pane::focus_pane_command(&args)),
         "" | "help" | "--help" | "-h" => {
             eprintln!(
-                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|jump>"
+                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|jump|focus>"
             );
             ExitCode::SUCCESS
         }

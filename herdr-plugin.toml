@@ -51,6 +51,19 @@ description = "Keyboard-driven worker controls; open as a tab or override placem
 placement = "tab"
 command = ["target/release/herdmates", "board"]
 
+[[panes]]
+id = "focus"
+title = "Focus"
+description = "One-next-action focus file + decision queue. A real split/overlay pane — never a popup."
+placement = "split"
+command = ["target/release/herdmates", "focus"]
+
+[[actions]]
+id = "open-focus"
+title = "Open focus pane"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin caioniehues.herdmates --entrypoint focus --placement split"]
+
 [[link_handlers]]
 id = "report"
 title = "Open team report"

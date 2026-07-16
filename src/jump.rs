@@ -79,8 +79,10 @@ pub fn jump_command(_args: &[String]) -> Result<(), JumpError> {
 /// `~/.local/share/herdmates/focus.md` — fixed, never overridable (see
 /// `docs/focus-file.md`'s "not XDG-resolved, not overridable via env var"
 /// ownership rule; unlike `HERDR_PLUGIN_STATE_DIR`, this is a stable
-/// contract commitment, not a test seam).
-fn default_focus_file_path() -> PathBuf {
+/// contract commitment, not a test seam). `pub(crate)` so the focus-pane
+/// TUI (#86 commit 6) resolves the same fixed path rather than
+/// duplicating this decision.
+pub(crate) fn default_focus_file_path() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
     home.join(".local/share/herdmates/focus.md")
 }
