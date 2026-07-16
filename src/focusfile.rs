@@ -162,7 +162,7 @@ fn parse_decision_line(
 }
 
 fn unique_id(text: &str, seen_ids: &mut std::collections::BTreeMap<String, u32>) -> String {
-    let base = format!("{:016x}", fnv1a_hash(text));
+    let base = stable_id(text);
     let count = seen_ids.entry(base.clone()).or_insert(0);
     *count += 1;
     if *count == 1 {
@@ -172,8 +172,16 @@ fn unique_id(text: &str, seen_ids: &mut std::collections::BTreeMap<String, u32>)
     }
 }
 
-/// FNV-1a, 64-bit. Deterministic by construction — see module docs for why
-/// this can't be `std::collections::hash_map::DefaultHasher`.
+/// A stable, content-derived id (FNV-1a, 64-bit, hex-encoded) — deterministic
+/// across parses and binary rebuilds (see module docs for why this can't be
+/// `std::collections::hash_map::DefaultHasher`). Shared with the `attention`
+/// module (#86 commit 3) so inbox-message attention items get ids from the
+/// same stable scheme as decision entries, without a second hash implementation.
+pub(crate) fn stable_id(text: &str) -> String {
+    format!("{:016x}", fnv1a_hash(text))
+}
+
+/// FNV-1a, 64-bit.
 fn fnv1a_hash(text: &str) -> u64 {
     const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
