@@ -1,10 +1,10 @@
 [package]
-name = "herdr-agent-team"
+name = "herdmates"
 version = "1.0.0"
 edition = "2021"
 license = "MIT"
-description = "Herdr plugin: heterogeneous coding-agent teams under a coordinating god session"
-repository = "https://github.com/caioniehues/herdr-agent-team"
+description = "Herdr plugin: Claude Code teammates, native in herdr — shim, agent board, focus pane"
+repository = "https://github.com/caioniehues/herdmates"
 
 [dependencies]
 crossterm = "0.28"

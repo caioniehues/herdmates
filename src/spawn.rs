@@ -1,4 +1,5 @@
 //! Team preflight and worker launch flow from `docs/spec.md` section 4.
+//! Frozen at v1.1.0 (ADR-0012): no further investment; removal is a 2.0.0-scope decision.
 
 use crate::agents_md::{render_agents_md, AgentsMdError};
 use crate::herdr::{HerdrApi, HerdrClient, HerdrError, PaneInfo, WaitOutcome};

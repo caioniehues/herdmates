@@ -1,7 +1,8 @@
-//! herdr-agent-team — Herdr plugin binary.
+//! herdmates — Herdr plugin binary.
 //!
-//! Subcommand dispatch follows `docs/spec.md`: the CLI half is `adopt`,
-//! `spawn`, `status`, `kill`, and `msg`; the event half is `on-agent-status`.
+//! Legacy subcommands (`adopt`, `spawn`, `status`, `kill`, `msg`, `on-agent-status`)
+//! are frozen at v1.1.0 (ADR-0012); new surfaces are `pump-board` (D1) and
+//! focus-pane (D3).
 
 use std::fmt::Display;
 use std::process::ExitCode;
@@ -16,6 +17,7 @@ pub mod launcher;
 pub mod metadata;
 pub mod msg;
 pub mod paths;
+pub mod pump;
 pub mod reconcile;
 pub mod run;
 pub mod socket;
@@ -24,6 +26,8 @@ pub mod socket_backend;
 pub mod spawn;
 pub mod spec;
 pub mod status_kill;
+pub mod teamfiles;
+pub mod tokens;
 pub mod types;
 
 fn main() -> ExitCode {
@@ -50,9 +54,10 @@ fn main() -> ExitCode {
         },
         "msg" => exit(msg::msg_command(&args)),
         "on-agent-status" => exit(hook::hook_command()),
+        "pump-board" => exit(pump::pump_board_command(&args)),
         "" | "help" | "--help" | "-h" => {
             eprintln!(
-                "herdr-agent-team <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status>"
+                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board>"
             );
             ExitCode::SUCCESS
         }

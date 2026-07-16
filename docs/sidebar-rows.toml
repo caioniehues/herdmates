@@ -1,0 +1,54 @@
+# herdmates D1 sidebar-token agent board (ADR-0012, issue #84).
+#
+# Merge the [ui.sidebar.agents] table below into your own
+# ~/.config/herdr/config.toml — merge into any existing [ui] table, do not
+# duplicate a second [ui] header. Verified against a live herdr 0.7.4
+# install as part of the issue #84 prototype spike (see the issue #84
+# comment thread for the full write-up).
+#
+# --- token vocabulary --------------------------------------------------
+#
+# Two kinds of row cell:
+#   - Builtin (bare name, no `$`): state_icon, agent, state_text.
+#     NOTE: the builtin is `state_text` — NOT `state_label`. That name
+#     does not exist; typo it and you silently get nothing (see warning
+#     below), not an error.
+#   - Custom (from `pane report-metadata --token NAME=VALUE`): `$name`.
+#     herdmates' board pump (src/pump.rs, src/tokens.rs) publishes `$task`
+#     and `$status` for each native team's lead, under source id
+#     `herdmates-board`.
+#
+# A row is omitted entirely — not rendered blank — when every token cell
+# in it resolves to nothing for a given pane. Safe to always include a
+# `$task` row even for panes that will never populate it.
+#
+# --- WARNING: invalid tokens fail silently ------------------------------
+#
+# `herdr server reload-config` returns status "partial" when a row
+# references an unknown token name (typo, stale reference, wrong builtin
+# name) and keeps running the OLD sidebar layout — no crash, no loud
+# error, the UI just doesn't change. If an edit to this file "does
+# nothing" after a reload, that is the symptom: run `herdr config check`
+# and re-verify every bare and `$`-prefixed name against this file before
+# assuming the pump itself is broken.
+#
+# --- keep token values telegraphic --------------------------------------
+#
+# `ui.sidebar_width` defaults to 26 columns (`ui.sidebar_max_width`
+# defaults to 36) — the practical visible width for a token value is
+# roughly 20 characters, well under the 80-character wire limit herdmates
+# enforces in src/tokens.rs (MAX_TOKEN_VALUE_CHARS). Don't rely on
+# truncation to make a value fit; keep task/status text short on purpose.
+#
+# --- scope -----------------------------------------------------------
+#
+# Only panes with a detected agent session (Claude, Codex, etc.) ever
+# appear in the sidebar at all — agent-less panes are never listed here,
+# regardless of this rows config.
+
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "agent", "state_text"],
+  ["$task"],
+  ["$status"],
+]

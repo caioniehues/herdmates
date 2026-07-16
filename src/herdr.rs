@@ -196,6 +196,19 @@ pub trait HerdrApi {
     fn pane_report_metadata(&self, _: &str, _: &MetadataUpdate) -> Result<(), HerdrError> {
         Err(unsupported_api())
     }
+    /// Report named, display-only sidebar tokens (herdr 0.7.4 `--token
+    /// NAME=VALUE`, live-verified 2026-07-16; distinct from the single-value
+    /// `state_labels` carried by [`MetadataUpdate`]). Used by the D1 agent
+    /// board pump (ADR-0012); `tokens` is ordered, callers pass their own
+    /// budget-enforced set (`crate::tokens::build_token_set`).
+    fn pane_report_tokens(
+        &self,
+        _pane_id: &str,
+        _source: &str,
+        _tokens: &[(String, String)],
+    ) -> Result<(), HerdrError> {
+        Err(unsupported_api())
+    }
     fn notification_show(&self, _: &str, _: &str, _: &str) -> Result<(), HerdrError> {
         Err(unsupported_api())
     }
@@ -382,6 +395,23 @@ impl HerdrClient {
         Ok(())
     }
 
+    pub fn pane_report_tokens(
+        &self,
+        pane_id: &str,
+        source: &str,
+        tokens: &[(String, String)],
+    ) -> Result<(), HerdrError> {
+        let mut command = args(["pane", "report-metadata"])
+            .with(pane_id)
+            .with("--source")
+            .with(source);
+        for (name, value) in tokens {
+            command = command.with("--token").with(format!("{name}={value}"));
+        }
+        self.invoke(&command.finish())?;
+        Ok(())
+    }
+
     pub fn notification_show(
         &self,
         title: &str,
@@ -479,6 +509,14 @@ impl HerdrApi for HerdrClient {
         update: &MetadataUpdate,
     ) -> Result<(), HerdrError> {
         Self::pane_report_metadata(self, pane_id, update)
+    }
+    fn pane_report_tokens(
+        &self,
+        pane_id: &str,
+        source: &str,
+        tokens: &[(String, String)],
+    ) -> Result<(), HerdrError> {
+        Self::pane_report_tokens(self, pane_id, source, tokens)
     }
     fn notification_show(&self, title: &str, body: &str, sound: &str) -> Result<(), HerdrError> {
         Self::notification_show(self, title, body, sound)
@@ -774,6 +812,22 @@ pub(crate) mod test_support {
             self.calls
                 .borrow_mut()
                 .push(format!("pane_report_metadata:{pane_id}"));
+            Ok(())
+        }
+        fn pane_report_tokens(
+            &self,
+            pane_id: &str,
+            source: &str,
+            tokens: &[(String, String)],
+        ) -> Result<(), HerdrError> {
+            let pairs = tokens
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.calls
+                .borrow_mut()
+                .push(format!("pane_report_tokens:{pane_id}:{source}:{pairs}"));
             Ok(())
         }
         fn notification_show(
