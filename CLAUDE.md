@@ -81,11 +81,21 @@ installed (feature-interaction bugs, marketplace-notes.md pattern #3).
 
 ## Reference material in-repo
 
+- `docs/research/spike-tmux-verbs-2026-07-16/` — the shim's ground truth:
+  verb inventory, kill-signal checks, verb→herdr mapping.
+- `docs/research/cmux-comparative-2026-07-16/` — prior art:
+  manaflow-ai/cmux ships this exact shim in production (macOS-only,
+  nightly, known bug); architecture report + product survey with
+  STEAL/ADAPT/SKIP verdicts (Feed pattern → #86, agent-agnostic shim
+  binding on #85). Read before designing any new surface.
 - `docs/reviews/` — executed v1.x review program (loops, slices, Stage 0
   evidence) + `frontier-plan-2026-07-16.md` (SUPERSEDED by ADR-0012,
   record only).
 - `docs/learnings/` — wave learnings incl. worker traps (claude startup
-  crash, Enter-swallow, gh flag silent no-ops).
+  crash, Enter-swallow, gh flag silent no-ops);
+  `herdmates-wave1-2026-07-16.md` adds pivot-wave herdr facts (same-tab
+  pane move no-op, layout.apply socket-only, background-tab `done`,
+  `state_text`/partial-reload trap) and the worker push protocol.
 - `docs/marketplace-notes.md` + `docs/marketplace-survey-2026-07-14.json`
   — marketplace survey conclusions.
 
