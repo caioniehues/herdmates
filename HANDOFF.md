@@ -1,104 +1,102 @@
-# Handoff — PIVOT to herdmates (ADR-0012); foundation in progress
+# Handoff — herdmates wave 1 executed; STOPPED before final E2E + release
 
-Updated 2026-07-16, after the pivot grilling session with Caio.
+Updated 2026-07-16 EOD, after Caio's stop-all-agents order. Previous
+handoff (pivot/foundation) is fully superseded; foundation + wave 1 are
+done. Read `docs/adr/0012-pivot-to-herdmates.md` first if you lack pivot
+context, then this file.
 
-## What changed
+## Where things stand (all local, NOTHING pushed since 9c3c781)
 
-The project direction pivoted (decision record: `docs/adr/0012-pivot-to-herdmates.md`
-— read it FIRST, it contains the full context, verified facts, and every
-decision). One-paragraph version:
+- **#84 D1 sidebar agent board: MERGED + closed** (in main since 3120c5d).
+  Dogfooded live all wave as the fleet board.
+- **#85 teammux shim: MERGED to main** (`ace14b4`), after adversarial
+  review MERGE-WITH-NITS (`REVIEW-85` — see Review artifacts below) and
+  the geometry-dispatch fix (`11fbe9a`). Coordinator commit 8 (launcher,
+  `herdmates teammux-launch`) done on main: `c9bebea`, 286 tests.
+  **Commit 9 (live E2E: real 2-teammate team through the shim, evidence
+  under docs/research/, claude version pinned) NOT RUN — stop order.**
+- **#86 focus pane: worker commits 1–8 ALL on `feat/86-focus-pane`**
+  (worktree `~/Projects/herdmates-issue84`; e347ae5, 8e2426b, 95db411,
+  44ecfdf, 35e9ca0, a89d6f5, 3dee064, c326efc; 261 tests). Adversarial
+  review verdict MERGE-WITH-NITS (`REVIEW-86`) with fixes required
+  before merge; fixes were dispatched to the worker, which was **HALTED
+  mid-fix** by the stop order. **Its worktree may hold uncommitted
+  partial fix state — inspect/salvage (`git status` + semantic diff)
+  before re-briefing anything there.** NOT merged. Step 9 (live E2E)
+  not run.
+- Fleet: shim pane closed (scope done). build:86 pane and reviewer
+  (spike) pane were told to stand by; they may or may not still exist.
 
-Claude Code native agent teams own orchestration from now on — we stop
-building our own (Caio: "no point reinventing the wheel; it will be
-worse"). This repo becomes **herdmates**: (1) a **shim** ("teammux") that
-fakes tmux inside herdr panes so native split-pane teammates land as real
-herdr panes, (2) an **agent board** (sidebar tokens first, TUI plugin pane
-later), (3) a **focus pane** for the human (one next action + decision
-queue, file contract at `~/.local/share/herdmates/focus.md`). Old frontier
-#66–#83 closed wontfix; zero install base assessed, no maintenance
-backlog.
+## Exact next steps (in order)
 
-## Foundation checklist (execution order, ADR-0012 §Execution)
+1. Salvage check `~/Projects/herdmates-issue84` (uncommitted review-fix
+   state), then finish the three REVIEW-86 findings:
+   1. HIGH `src/attention.rs`/`src/audit.rs`: blocked/inbox attention ids
+      are not occurrence-unique — a pane that blocks a second time is
+      permanently swallowed by the append-only consumed set. Fix via
+      occurrence nonce/timestamp in the id OR time-scoped consumed
+      membership; add the missing cross-time collision test.
+   2. MEDIUM `skills/atomizer/atomize.sh`: decisions regex
+      `^-[[:space:]]*\[` accepts zero spaces; tighten to literal `^- \[`
+      to match `focusfile.rs` and docs/focus-file.md.
+   3. LOW `src/focus_pane.rs`: `QueueAction::Jump` discards jump errors
+      (`let _ =`); surface a status line.
+2. Gate + commit fixes; merge `feat/86-focus-pane` → main (expect a
+   small conflict vs the #85 lib.rs restructure — main.rs is now
+   `use herdmates::*` with modules in src/lib.rs; add #86's new modules
+   there: focusfile, attention, audit, jump, focus_pane).
+3. #85 commit 9: live E2E — `herdmates teammux-launch` a real
+   2-teammate team (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`) inside
+   herdr; archive log + pane snapshots under `docs/research/`; pin the
+   claude version tested.
+4. #86 step 9: live E2E evidence for the focus pane (open via
+   plugin.pane.open split, exercise jump/done against a real team).
+5. Release call to Caio: version bump (manifest is 2.0.0 line;
+   Cargo.toml still says 1.0.0 — reconcile), tag, push. Pushes to main
+   are releases; Caio's word required.
+6. File follow-up issues (triage candidates): REVIEW-85 finding 2
+   (resize-pane -x fixed-right direction is geometrically unsound —
+   needs ADR note), finding 3 (HerdrClient real CLI paths untested —
+   thin integration test once herdr is scriptable in CI).
 
-1. [x] Gate `integrate/program-wave1` centrally (fmt/clippy/tests, worktree
-       `~/Projects/herdr-agent-team-loops/integration`), bump manifest
-       version → 1.1.0, merge → main, tag `v1.1.0`, push (Caio authorized
-       2026-07-16 in the pivot session).
-2. [x] Commit pivot docs on main (ADR-0012, CONTEXT.md, HANDOFF.md,
-       CLAUDE.md, program learnings + docs/reviews records).
-3. [x] Close issues #66–#83 wontfix with pivot comment linking ADR-0012
-       (#77/#79: comment "moot under pivot").
-4. [x] Delete empty batch worktrees + branches: fix-teardown-batch,
-       fix-hook-batch, fix-godcli-batch, fix-msg-batch (under
-       `~/Projects/herdr-agent-team-loops/`).
-5. [x] Rename repo → `caioniehues/herdmates` (`gh repo rename`), then
-       first 2.0.0-line commit: manifest id `herdmates`, name "Herdmates",
-       description "Claude Code teammates, native in herdr".
+## Review artifacts (not in repo — coordinator workspace)
 
-## Next work after foundation
+`/home/caio/Projects/herdmates-spike-recon/REVIEW-85.md` and
+`REVIEW-86.md` (+ the BRIEF-review-*.md contracts). Consider archiving
+under `docs/reviews/` with the wave records before the release.
 
-1. **Recon spike** (shim go/no-go, ~1 worker-day): logging `tmux` wrapper
-   first on PATH in a REAL tmux session; run a real native team
-   (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, `teammateMode: tmux`);
-   capture complete argv inventory; map verbs → herdr CLI. Kill signals:
-   control mode (`tmux -C`) or unmappable verbs. Shim death ≠ pivot death:
-   boards work over in-process teams; fallback includes upstream feature
-   request for pluggable `teammateMode` backend.
-2. **D1 sidebar-token agent board**: hook pumps team-file state
-   (`~/.claude/teams/*/config.json` + `inboxes/*.json`) into
-   `pane report-metadata --token …`; ship `[ui.sidebar.agents] rows`
-   config. Exercises all data plumbing D3 reuses.
-3. **D3 focus pane**: plugin pane rendering the focus file; companion
-   atomizer skill (human-harness pattern, copy not depend).
-4. **D2 rich TUI board / shim build** per spike verdict.
+## What shipped in wave 1 (for the release notes)
 
-## Key verified facts for the new work (2026-07-16, full citations in ADR-0012)
+- D1 agent board: team-file → sidebar-token pump, board/pump-board
+  commands, event wiring (#84).
+- teammux shim: idmap (flock-transactional %N/@N), static probes,
+  structural reads, split-window, lifecycle verbs, styling no-ops
+  (logged under TEAMMUX_LOG), geometry format-string dispatch from live
+  pane layout, `teammux-launch` lead launcher with fake TMUX env +
+  scoped `{"teammateMode":"tmux"}` settings (#85).
+- Focus pane (unmerged, pending fixes): focus-file contract + parser
+  (FNV-1a stable decision ids), docs/focus-file.md, attention queue
+  (blocked > decisions > lead inbox), JSONL audit log, `jump`
+  subcommand, ratatui TUI with selectable queue (Enter=jump, d=done),
+  atomizer skill (#86).
 
-- `teammateMode` split-pane = tmux + iTerm2 only, hardcoded; Ghostty
-  explicitly unsupported; no pluggable backend. Teams experimental
-  (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`). Teammates = full independent
-  `claude` sessions. No external-session adoption; membership fixed at
-  spawn in `~/.claude/teams/{team}/config.json`; mailboxes JSON under
-  `inboxes/`.
-- Herdr has zero tmux surface (no `TMUX`, no control mode, "Herdr is not
-  tmux"). Child processes create panes only via `herdr pane split
-  --current` over `HERDR_SOCKET_PATH`.
-- Herdr 0.7.4 observability surface: plugin panes
-  (overlay/split/tab/zoomed, `plugin.pane.open`), popup panes
-  (session-modal, NO pane id, invisible to pane/agent APIs — never the
-  board's home), `pane report-metadata` (tokens ≤80 chars, ≤16/report,
-  ≤32/pane, TTL, seq; display-only), `session.snapshot`,
-  `workspace.metadata_updated` + `layout.updated` events,
-  `terminal session observe`. Native non-terminal plugin UI = future,
-  does not exist.
-- Unreleased in upstream docs/next: per-token sidebar styling
-  (fg/bold/dim) — relevant to D1 polish.
+## Key wave learnings (full detail: docs/learnings/herdmates-wave1-2026-07-16.md)
 
-## State inherited from the orchestration line (context, not tasks)
-
-- v1.0.0 released (`aa0c0e0`). Implementation-review program #46–#58 fully
-  executed 2026-07-15 (Stage 0 twice-run E2E, 5 RED-first loops GREEN, 6
-  review slices, Stage 3 vocabulary) + wave fixes #59/#61–#65. All on
-  `integrate/program-wave1`: 197 tests, fmt/clippy clean — becomes v1.1.0
-  (tombstone release of the orchestration line; 2.0.0 = pivot work).
-- Reports: `docs/reviews/loops/`, `docs/reviews/slices/`; Stage 0 evidence
-  `docs/reviews/evidence/stage0/`; learnings
-  `docs/learnings/program-execution-2026-07-15.md` (worker traps: claude
-  startup crash, Enter-swallow, gh flag no-ops — still relevant to future
-  pane workers).
-- `docs/reviews/frontier-plan-2026-07-16.md` is SUPERSEDED by ADR-0012
-  (tickets closed, worktrees deleted). Keep as record only.
-- Research branch `research/current-upstream-runtime-constraints`
-  (worktree `/tmp/herdr-agent-team-constraints`, commit `8e5f105`) stays
-  unmerged/unpushed — reference material; do not silently publish.
+- Worker-push protocol (workers `pane run` the coordinator at step
+  boundaries) replaced polling; watches only for blocked/crash.
+- Mid-wave `/compact` of worker panes at step boundaries works cleanly —
+  send the literal text `/compact` via `pane run`, wait for "Compacted",
+  then re-point at BRIEF + task_plan.
+- Session usage limits hit all worker panes at once (same account) —
+  wake after reset, re-brief with pointers, nothing lost if state was
+  committed at boundaries.
+- Merge order trap: branches created before the lib.rs split need
+  their new modules grafted into src/lib.rs (see step 2 above).
 
 ## Standing rules unchanged
 
-- Pushes to main are releases — every push gated (fmt/clippy/tests),
-  version bump on behavior change, tag releases, Caio's word required.
-- Delegate implementation to claude workers in herdr panes; coordinator
-  never implements in this repo. Fresh claude panes crash intermittently
-  at startup (config-borne, unsolved) — verify alive before briefing.
-- Verify external claims via ctx7/upstream source before building
-  (ADR-0010 evidence hierarchy). The local `~/Projects/herdr-upstream`
-  clone goes stale — `git pull` before citing it.
+- Pushes to main are releases — gated, version-bumped, tagged, Caio's
+  word required.
+- Coordinator owns all git; workers never mutate git.
+- Verify external claims via ctx7/upstream source (ADR-0010);
+  `~/Projects/herdr-upstream` goes stale — pull before citing.
