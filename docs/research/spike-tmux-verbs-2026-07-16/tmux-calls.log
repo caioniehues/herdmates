@@ -1,0 +1,36 @@
+2026-07-16T11:16:46+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	show -Av mouse 
+2026-07-16T11:16:46+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	show -gv focus-events 
+2026-07-16T11:16:46+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	display-message -p \#\{client_termtype\} 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default display-message -t %0 -p \#\{window_id\} 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default list-panes -t @0 -F \#\{pane_id\} 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default split-window -d -t %0 -h -l 70% -P -F \#\{pane_id\} -- cat 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %1 window-style bg=default\,fg=blue 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %1 pane-border-style fg=blue 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %1 pane-active-border-style fg=blue 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default select-pane -t %1 -T alpha 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %1 pane-border-format \#\[fg=blue\,bold\]\ #\{pane_title\}\ #\[default\] 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default list-panes -t @0 -F \#\{pane_id\} 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -w -t @0 pane-border-status top 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %1 remain-on-exit failed 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default respawn-pane -k -t %1 -- cd\ /home/caio/Projects/herdmates-spike-recon\ \&\&\ env\ CLAUDECODE=1\ CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1\ /home/caio/.local/share/claude/versions/2.1.211\ --agent-id\ alpha@session-620e0f77\ --agent-name\ alpha\ --team-name\ session-620e0f77\ --agent-color\ blue\ --parent-session-id\ 620e0f77-a2a2-4360-b8e0-2b79ced4d59e\ --dangerously-skip-permissions\ --effort\ medium\ --settings\ /home/caio/Projects/herdmates-spike-recon/spike-settings.json\ --model\ claude-opus-4-8 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	show -gv focus-events 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	show -Av mouse 
+2026-07-16T11:18:23+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	display-message -p \#\{client_termtype\} 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default list-panes -t @0 -F \#\{pane_id\} 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default list-panes -t @0 -F \#\{pane_id\} 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default split-window -d -t %1 -v -P -F \#\{pane_id\} -- cat 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %2 window-style bg=default\,fg=green 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %2 pane-border-style fg=green 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %2 pane-active-border-style fg=green 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default select-pane -t %2 -T beta 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %2 pane-border-format \#\[fg=green\,bold\]\ #\{pane_title\}\ #\[default\] 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default list-panes -t @0 -F \#\{pane_id\} 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default select-layout -t @0 main-vertical 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default resize-pane -t %0 -x 30% 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default set-option -p -t %2 remain-on-exit failed 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default respawn-pane -k -t %2 -- cd\ /home/caio/Projects/herdmates-spike-recon\ \&\&\ env\ CLAUDECODE=1\ CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1\ /home/caio/.local/share/claude/versions/2.1.211\ --agent-id\ beta@session-620e0f77\ --agent-name\ beta\ --team-name\ session-620e0f77\ --agent-color\ green\ --parent-session-id\ 620e0f77-a2a2-4360-b8e0-2b79ced4d59e\ --dangerously-skip-permissions\ --effort\ medium\ --settings\ /home/caio/Projects/herdmates-spike-recon/spike-settings.json\ --model\ claude-opus-4-8 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	show -Av mouse 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	show -gv focus-events 
+2026-07-16T11:18:29+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	display-message -p \#\{client_termtype\} 
+2026-07-16T11:19:15+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default kill-pane -t %2 
+2026-07-16T11:19:51+01:00	stdin=notty	TMUX=/tmp/tmux-1000/default,54964,0	-S /tmp/tmux-1000/default kill-pane -t %1 
