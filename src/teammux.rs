@@ -39,10 +39,23 @@
 //! mapping from tmux's absolute-size target onto herdr's directional
 //! border-move model, see `resize_pane`'s doc comment).
 //!
-//! Every other successfully-*parsed* verb (styling — commit 7) is still a
-//! deliberate, labeled "not yet implemented" placeholder, not a
-//! translate-don't-emulate failure: it is recognized by `tmuxargs`, just
-//! not yet handled here.
+//! Commit 7 (final worker commit — commits 8-9 are coordinator-gated) adds
+//! the styling verbs: `set-option` (window-style, pane-border-style,
+//! pane-active-border-style, pane-border-format, pane-border-status,
+//! remain-on-exit) and `select-layout`. Herdr has no color/border/layout
+//! styling surface at all (`docs/herdr-api-schema.snapshot.json` has no
+//! matching params; findings.md's verb→herdr table records "no herdr
+//! equivalent" for every one) — these are herdr-native no-ops: parse
+//! successfully, do nothing, exit 0 (never a translate-don't-emulate
+//! failure, since the shape *is* recognized), and log the drop to stderr
+//! when `TEAMMUX_LOG` is set so a human debugging a teammate's missing
+//! color-coded border knows the shim silently dropped it rather than
+//! herdr rejecting it. `select_pane_title` (commit 6) already picked off
+//! the shim's one true style-ish verb; there's no split verb that would
+//! need it. Reading `TEAMMUX_LOG` directly inside the no-op handlers (not
+//! deferred to `run()`) is safe under parallel `cargo test`, unlike
+//! `TEAMMUX_STATE_PATH`'s commit-4 race: no test ever sets or unsets this
+//! var, so every thread's read is stable.
 
 use crate::herdr::HerdrApi;
 use crate::idmap::IdMap;
@@ -92,9 +105,50 @@ pub fn dispatch<H: HerdrApi>(
         Verb::KillPane { pane } => kill_pane(herdr, idmap, &pane),
         Verb::SelectPaneTitle { pane, title } => select_pane_title(herdr, idmap, &pane, &title),
         Verb::ResizePane { pane, amount } => resize_pane(herdr, idmap, &pane, &amount),
+        Verb::SetWindowStyle { pane, style } => styling_noop(format!(
+            "set-option -p -t {} window-style {style}",
+            pane.as_str()
+        )),
+        Verb::SetPaneBorderStyle { pane, style } => styling_noop(format!(
+            "set-option -p -t {} pane-border-style {style}",
+            pane.as_str()
+        )),
+        Verb::SetPaneActiveBorderStyle { pane, style } => styling_noop(format!(
+            "set-option -p -t {} pane-active-border-style {style}",
+            pane.as_str()
+        )),
+        Verb::SetPaneBorderFormat { pane, format } => styling_noop(format!(
+            "set-option -p -t {} pane-border-format {format}",
+            pane.as_str()
+        )),
+        Verb::SetPaneBorderStatusTop { window } => styling_noop(format!(
+            "set-option -w -t {} pane-border-status top",
+            window.as_str()
+        )),
+        Verb::SetRemainOnExit { pane, mode } => styling_noop(format!(
+            "set-option -p -t {} remain-on-exit {mode}",
+            pane.as_str()
+        )),
+        Verb::SelectLayout { window, layout } => {
+            styling_noop(format!("select-layout -t {} {layout}", window.as_str()))
+        }
         other => DispatchOutcome::Error {
-            message: format!("teammux: {other:?} not yet implemented (issue #85 commit 7 pending)"),
+            message: format!("teammux: {other:?} not yet implemented"),
         },
+    }
+}
+
+/// A herdr-native no-op for a recognized-but-unsupported styling verb
+/// (issue #85 commit 7): herdr has no color/border/layout styling surface,
+/// so these always succeed without doing anything. Logs `call` to stderr
+/// when `TEAMMUX_LOG` is set, so a human debugging a teammate's missing
+/// styling knows the shim silently dropped it.
+fn styling_noop(call: String) -> DispatchOutcome {
+    if std::env::var_os("TEAMMUX_LOG").is_some() {
+        eprintln!("teammux: no-op (no herdr equivalent): {call}");
+    }
+    DispatchOutcome::Ok {
+        stdout: String::new(),
     }
 }
 
@@ -492,13 +546,16 @@ mod tests {
 
     #[test]
     fn recognized_but_unhandled_verbs_are_a_labeled_placeholder_not_a_silent_success() {
+        // The tmux geometry format-string queries are parsed (cmux
+        // correction b, commit 2) but have no handler yet — every other
+        // Verb shape is now dispatched as of commit 7.
         let idmap = temp_idmap(&[]);
         let outcome = dispatch(
             &FakeHerdr::default(),
             &idmap,
-            call(Verb::SetWindowStyle {
-                pane: TmuxId::parse("%0").unwrap(),
-                style: "bg=default".to_owned(),
+            call(Verb::DisplayMessage {
+                target: Some(TmuxId::parse("%1").unwrap()),
+                field: DisplayField::PaneWidth,
             }),
         );
         match outcome {
@@ -1019,6 +1076,57 @@ mod tests {
             DispatchOutcome::Error { message } => assert!(message.contains("unsupported amount")),
             other => panic!("expected an Error outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn styling_verbs_are_a_herdr_native_no_op_not_a_placeholder_error() {
+        // Every set-option shape (findings.md: "no herdr equivalent" for
+        // all of them) and select-layout succeed with empty stdout — never
+        // an error, since these are recognized-and-handled, just handled
+        // as a documented drop.
+        let idmap = temp_idmap(&[]);
+        let fake = FakeHerdr::default();
+        let cases = [
+            call(Verb::SetWindowStyle {
+                pane: TmuxId::parse("%1").unwrap(),
+                style: "bg=default,fg=blue".to_owned(),
+            }),
+            call(Verb::SetPaneBorderStyle {
+                pane: TmuxId::parse("%1").unwrap(),
+                style: "fg=blue".to_owned(),
+            }),
+            call(Verb::SetPaneActiveBorderStyle {
+                pane: TmuxId::parse("%1").unwrap(),
+                style: "fg=blue".to_owned(),
+            }),
+            call(Verb::SetPaneBorderFormat {
+                pane: TmuxId::parse("%1").unwrap(),
+                format: "#[fg=blue] #{pane_title}".to_owned(),
+            }),
+            call(Verb::SetPaneBorderStatusTop {
+                window: TmuxId::parse("@0").unwrap(),
+            }),
+            call(Verb::SetRemainOnExit {
+                pane: TmuxId::parse("%1").unwrap(),
+                mode: "failed".to_owned(),
+            }),
+            call(Verb::SelectLayout {
+                window: TmuxId::parse("@0").unwrap(),
+                layout: "main-vertical".to_owned(),
+            }),
+        ];
+        for parsed in cases {
+            let outcome = dispatch(&fake, &idmap, parsed.clone());
+            assert_eq!(
+                outcome,
+                DispatchOutcome::Ok {
+                    stdout: String::new()
+                },
+                "{parsed:?}"
+            );
+        }
+        // No-ops never touch herdr or the idmap.
+        assert!(fake.calls().is_empty());
     }
 
     // `run()` itself (env var + real HerdrClient wiring) is intentionally not
