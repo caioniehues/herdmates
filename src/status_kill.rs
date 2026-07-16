@@ -1,4 +1,5 @@
 //! Team status and teardown commands from `docs/spec.md` sections 6 and 12.
+//! Frozen at v1.1.0 (ADR-0012): no further investment; removal is a 2.0.0-scope decision.
 
 use crate::herdr::{AgentInfo, HerdrApi, HerdrClient, HerdrError};
 use crate::run::{load_run, update_run_with_hook, RunBoard, RunError};

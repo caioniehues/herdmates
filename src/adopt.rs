@@ -1,4 +1,5 @@
 //! Existing-pane adoption from `docs/spec.md` section 12 and ADR-0009.
+//! Frozen at v1.1.0 (ADR-0012): no further investment; removal is a 2.0.0-scope decision.
 
 use crate::herdr::{HerdrApi, HerdrClient, HerdrError, PaneInfo};
 use crate::launcher::{conservative_adopted_launcher, load_from_env, LauncherError};

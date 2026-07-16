@@ -1,4 +1,5 @@
 //! Durable god-side inbox, report, and wait verbs (spec section 13).
+//! Frozen at v1.1.0 (ADR-0012): no further investment; removal is a 2.0.0-scope decision.
 
 use crate::agents_md::COMPLETION_SENTINEL;
 use crate::paths;

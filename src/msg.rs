@@ -1,4 +1,5 @@
 //! Name-addressed worker messaging and deferred delivery from `docs/spec.md` section 11.
+//! Frozen at v1.1.0 (ADR-0012): no further investment; removal is a 2.0.0-scope decision.
 
 use crate::herdr::{HerdrApi, HerdrClient, HerdrError, WaitOutcome};
 use crate::launcher::{

@@ -1,4 +1,5 @@
 //! Push-based worker status report and outbox hook from `docs/spec.md` sections 5 and 11.
+//! Frozen at v1.1.0 (ADR-0012): no further investment; removal is a 2.0.0-scope decision.
 
 use crate::herdr::{HerdrApi, HerdrClient};
 use crate::metadata::{map_facts, MetadataCapabilities, MetadataFacts};
