@@ -24,7 +24,8 @@ use thiserror::Error;
 pub struct TmuxId(String);
 
 impl TmuxId {
-    fn parse(raw: &str) -> Result<Self, ParseError> {
+    /// Validate that `raw` carries the `%`/`@` prefix tmux ids always have.
+    pub fn parse(raw: &str) -> Result<Self, ParseError> {
         if raw.starts_with('%') || raw.starts_with('@') {
             Ok(Self(raw.to_owned()))
         } else {
