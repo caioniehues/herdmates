@@ -17,6 +17,7 @@ pub mod launcher;
 pub mod metadata;
 pub mod msg;
 pub mod paths;
+pub mod pump;
 pub mod reconcile;
 pub mod run;
 pub mod socket;
@@ -53,6 +54,7 @@ fn main() -> ExitCode {
         },
         "msg" => exit(msg::msg_command(&args)),
         "on-agent-status" => exit(hook::hook_command()),
+        "pump-board" => exit(pump::pump_board_command(&args)),
         "" | "help" | "--help" | "-h" => {
             eprintln!(
                 "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board>"
