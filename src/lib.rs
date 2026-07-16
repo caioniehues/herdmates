@@ -28,6 +28,7 @@ pub mod spec;
 pub mod status_kill;
 pub mod teamfiles;
 pub mod teammux;
+pub mod teammux_launch;
 pub mod tmuxargs;
 pub mod tokens;
 pub mod types;
