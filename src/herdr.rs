@@ -176,6 +176,18 @@ pub trait HerdrApi {
     fn pane_split(&self, _: &str, _: &Path) -> Result<PaneInfo, HerdrError> {
         Err(unsupported_api())
     }
+    /// Split off an existing pane (as opposed to [`HerdrApi::pane_split`],
+    /// which splits a freshly created workspace's root pane in a fixed
+    /// direction) — the shape `teammux`'s `split-window` needs (issue #85
+    /// commit 5): a target pane, a direction, and an optional ratio.
+    fn pane_split_pane(
+        &self,
+        _target_pane_id: &str,
+        _direction: &str,
+        _ratio: Option<f64>,
+    ) -> Result<PaneInfo, HerdrError> {
+        Err(unsupported_api())
+    }
     fn pane_run(&self, _: &str, _: &str) -> Result<(), HerdrError> {
         Err(unsupported_api())
     }
@@ -289,6 +301,25 @@ impl HerdrClient {
             .with(cwd)
             .with("--no-focus")
             .finish();
+        let stdout = self.invoke(&args)?;
+        parse_pane_info(&stdout).map_err(|message| self.invalid_response(&args, message))
+    }
+
+    pub fn pane_split_pane(
+        &self,
+        target_pane_id: &str,
+        direction: &str,
+        ratio: Option<f64>,
+    ) -> Result<PaneInfo, HerdrError> {
+        let mut command = args(["pane", "split"])
+            .with(target_pane_id)
+            .with("--direction")
+            .with(direction)
+            .with("--no-focus");
+        if let Some(ratio) = ratio {
+            command = command.with("--ratio").with(ratio.to_string());
+        }
+        let args = command.finish();
         let stdout = self.invoke(&args)?;
         parse_pane_info(&stdout).map_err(|message| self.invalid_response(&args, message))
     }
@@ -464,6 +495,14 @@ impl HerdrApi for HerdrClient {
     fn pane_split(&self, workspace_id: &str, cwd: &Path) -> Result<PaneInfo, HerdrError> {
         Self::pane_split(self, workspace_id, cwd)
     }
+    fn pane_split_pane(
+        &self,
+        target_pane_id: &str,
+        direction: &str,
+        ratio: Option<f64>,
+    ) -> Result<PaneInfo, HerdrError> {
+        Self::pane_split_pane(self, target_pane_id, direction, ratio)
+    }
     fn pane_run(&self, pane_id: &str, input: &str) -> Result<(), HerdrError> {
         Self::pane_run(self, pane_id, input)
     }
@@ -566,6 +605,7 @@ pub(crate) mod test_support {
         PaneRun(String, String),
         AgentWait(String, String),
         Notification(String, String, String),
+        PaneSplitPane(String, String),
     }
 
     #[derive(Default)]
@@ -590,6 +630,8 @@ pub(crate) mod test_support {
         pub empty_submit_seen: SyncCell<bool>,
         pub pane: SyncRefCell<Option<PaneInfo>>,
         pub panes: SyncRefCell<Vec<PaneInfo>>,
+        pub split_result: SyncRefCell<Option<PaneInfo>>,
+        pub fail_split: SyncCell<bool>,
         pub agents: SyncRefCell<Vec<AgentInfo>>,
         pub waits: SyncRefCell<VecDeque<WaitOutcome>>,
     }
@@ -787,6 +829,36 @@ pub(crate) mod test_support {
         fn pane_list(&self, _workspace_id: Option<&str>) -> Result<Vec<PaneInfo>, HerdrError> {
             self.calls.borrow_mut().push("pane_list".to_owned());
             Ok(self.panes.borrow().clone())
+        }
+        fn pane_split_pane(
+            &self,
+            target_pane_id: &str,
+            direction: &str,
+            ratio: Option<f64>,
+        ) -> Result<PaneInfo, HerdrError> {
+            self.calls.borrow_mut().push(format!(
+                "pane_split_pane:{target_pane_id}:{direction}:{ratio:?}"
+            ));
+            self.typed_calls.borrow_mut().push(FakeCall::PaneSplitPane(
+                target_pane_id.to_owned(),
+                direction.to_owned(),
+            ));
+            if self.fail_split.get() {
+                return Err(Self::command_error());
+            }
+            match self.split_result.borrow().clone() {
+                Some(pane) => Ok(pane),
+                None => Ok(PaneInfo {
+                    pane_id: format!("{target_pane_id}-split"),
+                    workspace_id: "workspace-split".to_owned(),
+                    tab_id: None,
+                    agent: None,
+                    agent_id: None,
+                    agent_session: None,
+                    agent_status: None,
+                    cwd: None,
+                }),
+            }
         }
         fn api_schema(&self) -> Result<String, HerdrError> {
             self.calls.borrow_mut().push("api_schema".to_owned());

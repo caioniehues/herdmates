@@ -1,4 +1,4 @@
-//! `teammux` dispatcher core (issue #85 commit 3, extended commit 4).
+//! `teammux` dispatcher core (issue #85 commit 3, extended commits 4-5).
 //!
 //! One reusable dispatch entry point, per cmux's `__tmux-compat` pattern
 //! (`docs/research/cmux-comparative-2026-07-16/REPORT.md`, correction c):
@@ -26,10 +26,15 @@
 //! time teammux runs, the launcher has already registered every pane it
 //! created, so an orphan means something is wrong, not that it's optional.
 //!
-//! Every other successfully-*parsed* verb (split-window, lifecycle, styling
-//! — commits 5-7) is still a deliberate, labeled "not yet implemented"
-//! placeholder, not a translate-don't-emulate failure: it is recognized by
-//! `tmuxargs`, just not yet handled here.
+//! Commit 5 adds `split-window`: `herdr pane split` targeting the resolved
+//! herdr pane, then [`IdMap::allocate`] registers the new pane under a
+//! freshly minted `%N` (ids are allocated freely — no real tmux session to
+//! shadow, cmux comparative research correction a) before printing it.
+//!
+//! Every other successfully-*parsed* verb (lifecycle, styling — commits
+//! 6-7) is still a deliberate, labeled "not yet implemented" placeholder,
+//! not a translate-don't-emulate failure: it is recognized by `tmuxargs`,
+//! just not yet handled here.
 
 use crate::herdr::HerdrApi;
 use crate::idmap::IdMap;
@@ -69,12 +74,82 @@ pub fn dispatch<H: HerdrApi>(
             field: DisplayField::WindowId,
         } => display_window_id(herdr, idmap, &pane),
         Verb::ListPaneIds { window } => list_pane_ids(herdr, idmap, &window),
+        Verb::SplitWindow {
+            target,
+            direction,
+            size,
+            ..
+        } => split_window(herdr, idmap, &target, direction, size.as_deref()),
         other => DispatchOutcome::Error {
             message: format!(
-                "teammux: {other:?} not yet implemented (issue #85 commits 5-7 pending)"
+                "teammux: {other:?} not yet implemented (issue #85 commits 6-7 pending)"
             ),
         },
     }
+}
+
+/// `split-window -h/-v [-l SIZE] -P -F #{pane_id} -- cat`: split `target`
+/// via `herdr pane split`, register the new pane under a freshly allocated
+/// `%N` (no real tmux session to shadow — cmux comparative research
+/// correction a — so allocation only has to be internally consistent with
+/// this table), and print that new id. The `-- cat` placeholder is not run:
+/// herdr's own default pane process serves the same "keep the pane alive
+/// and idle" role tmux's `cat` placeholder does; the real teammate process
+/// is launched later, by `respawn-pane -k` (commit 6).
+fn split_window<H: HerdrApi>(
+    herdr: &H,
+    idmap: &IdMap,
+    target: &TmuxId,
+    direction: tmuxargs::SplitDirection,
+    size: Option<&str>,
+) -> DispatchOutcome {
+    let herdr_target = match idmap.lookup(target.as_str()) {
+        Some(id) => id.to_owned(),
+        None => return unknown_tmux_id("split-window", target.as_str()),
+    };
+    let herdr_direction = match direction {
+        tmuxargs::SplitDirection::Horizontal => "right",
+        tmuxargs::SplitDirection::Vertical => "down",
+    };
+    let ratio = match size {
+        None => None,
+        Some(size) => match parse_percentage(size) {
+            Some(ratio) => Some(ratio),
+            None => {
+                return DispatchOutcome::Error {
+                    message: format!(
+                        "teammux: split-window: unsupported size `{size}` (expected a percentage like `70%`)"
+                    ),
+                }
+            }
+        },
+    };
+    let info = match herdr.pane_split_pane(&herdr_target, herdr_direction, ratio) {
+        Ok(info) => info,
+        Err(error) => {
+            return DispatchOutcome::Error {
+                message: format!("teammux: split-window: herdr pane split failed: {error}"),
+            }
+        }
+    };
+    match IdMap::allocate(idmap.path(), '%', info.pane_id) {
+        Ok(new_tmux_id) => DispatchOutcome::Ok {
+            stdout: format!("{new_tmux_id}\n"),
+        },
+        Err(error) => DispatchOutcome::Error {
+            message: format!("teammux: split-window: failed to register new pane: {error}"),
+        },
+    }
+}
+
+/// Parse tmux's `-l SIZE` percentage shape (e.g. `"70%"`) into a 0–1 ratio —
+/// the only shape herdr's `--ratio` float accepts (confirmed against
+/// `docs/herdr-api-schema.snapshot.json`'s `PaneSplitParams.ratio`, a plain
+/// nullable float, not a percentage string).
+fn parse_percentage(size: &str) -> Option<f64> {
+    let digits = size.strip_suffix('%')?;
+    let percent: f64 = digits.parse().ok()?;
+    Some(percent / 100.0)
 }
 
 /// `display-message -t %N -p #{window_id}`: resolve the tmux window id that
@@ -476,6 +551,152 @@ mod tests {
                 stdout: String::new()
             }
         );
+    }
+
+    #[test]
+    fn split_window_horizontal_with_ratio_registers_and_prints_a_new_pane_id() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1")]);
+        let fake = FakeHerdr::default();
+        *fake.split_result.borrow_mut() = Some(pane("w1A:p2", Some("w1A:t1")));
+
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%0").unwrap(),
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: Some("70%".to_owned()),
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: "%1\n".to_owned()
+            }
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.7)"));
+
+        // The new mapping is persisted, not just returned.
+        let reloaded = IdMap::load(idmap.path()).unwrap();
+        assert_eq!(reloaded.lookup("%1"), Some("w1A:p2"));
+    }
+
+    #[test]
+    fn split_window_vertical_without_size_omits_ratio() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1")]);
+        let fake = FakeHerdr::default();
+        *fake.split_result.borrow_mut() = Some(pane("w1A:p3", Some("w1A:t1")));
+
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%0").unwrap(),
+                direction: tmuxargs::SplitDirection::Vertical,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: "%1\n".to_owned()
+            }
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_split_pane:w1A:p1:down:None"));
+    }
+
+    #[test]
+    fn split_window_allocates_past_the_highest_existing_pane_number() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1"), ("%1", "w1A:p2"), ("@0", "w1A:t1")]);
+        let fake = FakeHerdr::default();
+        *fake.split_result.borrow_mut() = Some(pane("w1A:p9", Some("w1A:t1")));
+
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%1").unwrap(),
+                direction: tmuxargs::SplitDirection::Vertical,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: "%2\n".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn split_window_fails_loudly_for_an_unregistered_target() {
+        let idmap = temp_idmap(&[]);
+        let outcome = dispatch(
+            &FakeHerdr::default(),
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%9").unwrap(),
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        match outcome {
+            DispatchOutcome::Error { message } => assert!(message.contains("unknown tmux id")),
+            other => panic!("expected an Error outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_window_fails_loudly_on_an_unsupported_size_shape() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1")]);
+        let outcome = dispatch(
+            &FakeHerdr::default(),
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%0").unwrap(),
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: Some("40cells".to_owned()),
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        match outcome {
+            DispatchOutcome::Error { message } => assert!(message.contains("unsupported size")),
+            other => panic!("expected an Error outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_window_surfaces_a_herdr_failure_loudly() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1")]);
+        let fake = FakeHerdr::default();
+        fake.fail_split.set(true);
+
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%0").unwrap(),
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        match outcome {
+            DispatchOutcome::Error { message } => {
+                assert!(message.contains("herdr pane split failed"))
+            }
+            other => panic!("expected an Error outcome, got {other:?}"),
+        }
     }
 
     // `run()` itself (env var + real HerdrClient wiring) is intentionally not

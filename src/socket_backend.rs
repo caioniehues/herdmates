@@ -285,6 +285,15 @@ impl<C: HerdrApi> HerdrApi for SocketClient<C> {
     fn pane_split(&self, w: &str, c: &Path) -> Result<PaneInfo, HerdrError> {
         self.fallback().pane_split(w, c)
     }
+    fn pane_split_pane(
+        &self,
+        target_pane_id: &str,
+        direction: &str,
+        ratio: Option<f64>,
+    ) -> Result<PaneInfo, HerdrError> {
+        self.fallback()
+            .pane_split_pane(target_pane_id, direction, ratio)
+    }
     fn pane_run(&self, p: &str, i: &str) -> Result<(), HerdrError> {
         self.fallback().pane_run(p, i)
     }

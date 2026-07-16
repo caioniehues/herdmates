@@ -76,6 +76,7 @@ struct IdMapWire {
 /// update race a fresh-process-per-invocation model would otherwise invite).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdMap {
+    path: PathBuf,
     entries: BTreeMap<String, String>,
 }
 
@@ -89,8 +90,17 @@ impl IdMap {
     /// invocation of a session).
     pub fn load(path: &Path) -> Result<Self, IdMapError> {
         Ok(Self {
+            path: path.to_owned(),
             entries: read_entries(path)?,
         })
+    }
+
+    /// The path this table was loaded from — so a caller holding only a
+    /// loaded snapshot can still reach the associated-function mutators
+    /// ([`IdMap::insert`], [`IdMap::remove`], [`IdMap::allocate`]) without a
+    /// path threaded separately through every layer above it.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Look up the herdr id for a tmux `%N`/`@N` id.
@@ -130,6 +140,33 @@ impl IdMap {
     pub fn remove(path: &Path, tmux_id: &str) -> Result<(), IdMapError> {
         transact(path, |entries| {
             entries.remove(tmux_id);
+        })
+    }
+
+    /// Allocate the next unused tmux id with the given `prefix` (`'%'` for a
+    /// pane, `'@'` for a window), register it against `herdr_id`, and return
+    /// the newly allocated tmux id — all under one locked transaction, so
+    /// concurrent allocations can never collide on the same number (issue
+    /// #85 commit 5). No real tmux session exists to shadow (cmux
+    /// comparative research correction a): allocation only has to be
+    /// internally consistent with this table, never matched against a real
+    /// tmux server's own numbering.
+    pub fn allocate(
+        path: &Path,
+        prefix: char,
+        herdr_id: impl Into<String>,
+    ) -> Result<String, IdMapError> {
+        let herdr_id = herdr_id.into();
+        transact(path, move |entries| {
+            let next = entries
+                .keys()
+                .filter_map(|key| key.strip_prefix(prefix))
+                .filter_map(|suffix| suffix.parse::<u32>().ok())
+                .max()
+                .map_or(0, |max| max + 1);
+            let tmux_id = format!("{prefix}{next}");
+            entries.insert(tmux_id.clone(), herdr_id);
+            tmux_id
         })
     }
 }
@@ -201,12 +238,13 @@ fn write_entries(path: &Path, entries: &BTreeMap<String, String>) -> Result<(), 
 }
 
 /// Serialize a fresh load-mutate-save transaction across cooperating shim
-/// processes: lock a dedicated sibling file, re-read `path`, apply `mutate`,
+/// processes: lock a dedicated sibling file, re-read `path`, apply `mutate`
+/// (which may compute a value from the fresh table, e.g. an allocated id),
 /// write the result back atomically, then unlock.
-fn transact(
+fn transact<T>(
     path: &Path,
-    mutate: impl FnOnce(&mut BTreeMap<String, String>),
-) -> Result<(), IdMapError> {
+    mutate: impl FnOnce(&mut BTreeMap<String, String>) -> T,
+) -> Result<T, IdMapError> {
     let lock_file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -224,8 +262,9 @@ fn transact(
 
     let result = (|| {
         let mut entries = read_entries(path)?;
-        mutate(&mut entries);
-        write_entries(path, &entries)
+        let value = mutate(&mut entries);
+        write_entries(path, &entries)?;
+        Ok(value)
     })();
 
     let unlock = FileExt::unlock(&lock_file).map_err(|source| IdMapError::Lock {
@@ -234,8 +273,8 @@ fn transact(
     });
     match (result, unlock) {
         (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
