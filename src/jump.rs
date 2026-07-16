@@ -66,13 +66,23 @@ pub fn jump_command(_args: &[String]) -> Result<(), JumpError> {
         .ok_or(JumpError::NoJumpablePane)?;
     let pane_id = target.pane_id.as_deref().expect("filtered for Some above");
 
+    jump_to_pane(&herdr, pane_id)?;
+
+    let _ = audit::append_consumed(&audit_path, &target.id, now_ms());
+    Ok(())
+}
+
+/// `pane get` (resolve `workspace_id`/`tab_id`) → `workspace focus` →
+/// `tab focus` — the 3-call sequence that stands in for the pane-focus-by-id
+/// verb herdr doesn't have (see module docs). `pub(crate)` so the focus-pane
+/// TUI's Enter-to-jump action (#86 commit 7) reuses this instead of
+/// duplicating the call sequence.
+pub(crate) fn jump_to_pane(herdr: &HerdrClient, pane_id: &str) -> Result<(), HerdrError> {
     let pane = herdr.pane_get(pane_id)?;
     herdr.workspace_focus(&pane.workspace_id)?;
     if let Some(tab_id) = &pane.tab_id {
         herdr.tab_focus(tab_id)?;
     }
-
-    let _ = audit::append_consumed(&audit_path, &target.id, now_ms());
     Ok(())
 }
 
@@ -87,11 +97,15 @@ pub(crate) fn default_focus_file_path() -> PathBuf {
     home.join(".local/share/herdmates/focus.md")
 }
 
-fn default_audit_log_path() -> Result<PathBuf, PathError> {
+/// `pub(crate)` so the focus-pane TUI (#86 commit 7) logs consumed items to
+/// the same audit file rather than picking its own path.
+pub(crate) fn default_audit_log_path() -> Result<PathBuf, PathError> {
     Ok(paths::state_dir()?.join(AUDIT_LOG_FILE))
 }
 
-fn now_ms() -> u64 {
+/// `pub(crate)` so the focus-pane TUI (#86 commit 7) stamps its own
+/// audit-log writes the same way.
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -101,7 +115,8 @@ fn now_ms() -> u64 {
 /// Resolve every known team's lead Teammate + its herdr pane id (`None`
 /// when unresolvable, matching `pump::pump_once`'s degrade policy — a team
 /// with no resolvable lead just contributes no inbox items, never an error).
-fn discover_team_leads(
+/// `pub(crate)` so the focus-pane TUI (#86 commit 7) reuses team discovery.
+pub(crate) fn discover_team_leads(
     teams_root: &std::path::Path,
     agents: &[crate::herdr::AgentInfo],
 ) -> Vec<(Teammate, Option<String>)> {
@@ -124,8 +139,9 @@ fn discover_team_leads(
 /// per-team (each team's lead has its own inbox), so
 /// `attention::build_attention_queue` is called once per team-lead and only
 /// its `InboxMessage` items are folded back in. Pure — no I/O — so it's
-/// unit-testable with injected data.
-fn merge_team_queues(
+/// unit-testable with injected data. `pub(crate)` so the focus-pane TUI
+/// (#86 commit 7) builds its live queue with the same merge logic.
+pub(crate) fn merge_team_queues(
     agents: &[crate::herdr::AgentInfo],
     focus: &FocusFile,
     team_leads: &[(Teammate, Option<String>)],

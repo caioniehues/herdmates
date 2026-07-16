@@ -1,17 +1,32 @@
-//! Focus pane TUI (D3, issue #86 commit 6): a real plugin pane (split or
-//! overlay, NEVER a popup — binding decision) that renders the focus file's
-//! task/next-action/decisions. Commit 6 is the static skeleton: read the
-//! focus file once, draw it, wait for a quit key. Live file-watch refresh
-//! and the attention-queue region are commit 7.
+//! Focus pane TUI (D3, issue #86 commit 7): adds the attention-queue region
+//! on top of commit 6's static task/next-action/decisions skeleton — a
+//! selectable list (j/k to move, Enter to jump to the selected item's pane,
+//! d to mark it done in the audit log), plus a live refresh loop so the pane
+//! reflects file/status changes made while it's open.
 //!
-//! Render model is pure and separate from terminal I/O, same split as
-//! `board.rs`'s `render`/`run_board`: `draw` only takes a `&mut Frame` and
-//! `&FocusFile`, so it can be exercised against `ratatui::backend::TestBackend`
-//! in tests without a real terminal — no `HerdrApi` call, no file I/O, no
-//! crossterm event loop inside it.
+//! herdr has no filesystem-watch primitive exposed to plugins, so "live
+//! file-watch refresh" here is poll-based, not inotify-based: the event
+//! loop polls for a keypress with a short timeout, and on every timeout
+//! (no key pressed) checks whether at least 1s has passed since the last
+//! state reload — that 1s floor is the "debounce": rapid underlying changes
+//! (a worker writing several inbox messages in a burst, editing the focus
+//! file a few times) collapse into at most one reload per second rather
+//! than one reload per 300ms poll tick. A reload failure never tears down
+//! the pane (ADR-0012 degrade policy) — the previous good state is kept.
+//!
+//! Render model stays pure and separate from terminal I/O (unchanged split
+//! from commit 6): `draw` only takes `&mut Frame` and `&AppState`, and
+//! `apply_key`/`clamp_selection` are plain functions with no ratatui/herdr
+//! types in their signatures, so all three are exercised in tests without a
+//! real terminal or a `HerdrApi` call.
 
+use crate::attention::{AttentionItem, AttentionKind};
+use crate::audit;
 use crate::focusfile::{self, FocusFile, FocusFileError};
+use crate::herdr::{HerdrClient, HerdrError};
 use crate::jump;
+use crate::paths::PathError;
+use crate::pump;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use ratatui::crossterm::terminal::{
@@ -21,27 +36,54 @@ use ratatui::crossterm::{execute, ExecutableCommand};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::io;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FocusPaneError {
     #[error(transparent)]
     FocusFile(#[from] FocusFileError),
+    #[error("cannot resolve the Claude Code team files directory: set HOME")]
+    UnresolvedTeamsRoot,
+    #[error(transparent)]
+    Herdr(#[from] HerdrError),
+    #[error(transparent)]
+    Path(#[from] PathError),
+    #[error(transparent)]
+    Audit(#[from] audit::AuditLogError),
     #[error("terminal I/O error: {0}")]
     Io(#[from] io::Error),
 }
 
+struct Runtime {
+    herdr: HerdrClient,
+    teams_root: PathBuf,
+    audit_path: PathBuf,
+}
+
+struct AppState {
+    focus: FocusFile,
+    queue: Vec<AttentionItem>,
+    selection: usize,
+}
+
 pub fn focus_pane_command(_args: &[String]) -> Result<(), FocusPaneError> {
-    let focus = focusfile::read_focus_file(&jump::default_focus_file_path())?;
+    let runtime = Runtime {
+        herdr: HerdrClient::from_env(),
+        teams_root: pump::default_teams_root().map_err(|_| FocusPaneError::UnresolvedTeamsRoot)?,
+        audit_path: jump::default_audit_log_path()?,
+    };
+    let state = load_state(&runtime)?;
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let result = run_until_quit(&mut terminal, &focus);
+    let result = run_until_quit(&mut terminal, &runtime, state);
 
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
@@ -49,35 +91,162 @@ pub fn focus_pane_command(_args: &[String]) -> Result<(), FocusPaneError> {
     result
 }
 
+fn load_state(runtime: &Runtime) -> Result<AppState, FocusPaneError> {
+    let focus = focusfile::read_focus_file(&jump::default_focus_file_path())?;
+    let agents = runtime.herdr.agent_list()?;
+    let team_leads = jump::discover_team_leads(&runtime.teams_root, &agents);
+    let consumed = audit::read_consumed_ids(&runtime.audit_path)?;
+    let queue = audit::filter_unconsumed(
+        jump::merge_team_queues(&agents, &focus, &team_leads),
+        &consumed,
+    );
+    Ok(AppState {
+        focus,
+        queue,
+        selection: 0,
+    })
+}
+
+/// Best-effort reload: any I/O failure keeps the previous state rather than
+/// tearing down the pane (ADR-0012 degrade policy).
+fn try_reload_state(runtime: &Runtime, previous: AppState) -> AppState {
+    match load_state(runtime) {
+        Ok(mut fresh) => {
+            fresh.selection = previous.selection.min(fresh.queue.len().saturating_sub(1));
+            fresh
+        }
+        Err(_) => previous,
+    }
+}
+
+const DEBOUNCE: Duration = Duration::from_secs(1);
+const POLL_INTERVAL: Duration = Duration::from_millis(300);
+
 fn run_until_quit(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    focus: &FocusFile,
+    runtime: &Runtime,
+    mut state: AppState,
 ) -> Result<(), FocusPaneError> {
+    let mut last_refresh = Instant::now();
     loop {
-        terminal.draw(|frame| draw(frame, focus))?;
-        if let Event::Key(key) = event::read()? {
-            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                return Ok(());
+        terminal.draw(|frame| draw(frame, &state))?;
+
+        if event::poll(POLL_INTERVAL)? {
+            if let Event::Key(key) = event::read()? {
+                match apply_key(key.code) {
+                    QueueAction::Move(delta) => {
+                        state.selection =
+                            clamp_selection(state.selection, state.queue.len(), delta);
+                    }
+                    QueueAction::Jump => {
+                        if let Some(pane_id) = state
+                            .queue
+                            .get(state.selection)
+                            .and_then(|item| item.pane_id.as_deref())
+                        {
+                            let _ = jump::jump_to_pane(&runtime.herdr, pane_id);
+                        }
+                    }
+                    QueueAction::MarkDone => {
+                        if let Some(item) = state.queue.get(state.selection) {
+                            let _ = audit::append_consumed(
+                                &runtime.audit_path,
+                                &item.id,
+                                jump::now_ms(),
+                            );
+                            state = try_reload_state(runtime, state);
+                        }
+                    }
+                    QueueAction::Quit => return Ok(()),
+                    QueueAction::None => {}
+                }
             }
+        } else if last_refresh.elapsed() >= DEBOUNCE {
+            state = try_reload_state(runtime, state);
+            last_refresh = Instant::now();
         }
     }
 }
 
-/// Pure render: task / next-action / decisions, top to bottom. No I/O.
-fn draw(frame: &mut Frame, focus: &FocusFile) {
-    let [task_area, next_action_area, decisions_area] = Layout::vertical([
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueAction {
+    Move(isize),
+    Jump,
+    MarkDone,
+    Quit,
+    None,
+}
+
+/// Pure keymap — no ratatui rendering, no I/O — tested directly.
+fn apply_key(key: KeyCode) -> QueueAction {
+    match key {
+        KeyCode::Char('j') | KeyCode::Down => QueueAction::Move(1),
+        KeyCode::Char('k') | KeyCode::Up => QueueAction::Move(-1),
+        KeyCode::Enter => QueueAction::Jump,
+        KeyCode::Char('d') => QueueAction::MarkDone,
+        KeyCode::Char('q') | KeyCode::Esc => QueueAction::Quit,
+        _ => QueueAction::None,
+    }
+}
+
+/// Move `selection` by `delta`, clamped to `[0, len - 1]` (or `0` when
+/// `len == 0`). Pure — tested directly.
+fn clamp_selection(selection: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (selection as isize + delta).clamp(0, len as isize - 1) as usize
+}
+
+/// Pure render: attention queue on top, then task / next-action / decisions.
+/// No I/O.
+fn draw(frame: &mut Frame, state: &AppState) {
+    let [queue_area, task_area, next_action_area, decisions_area] = Layout::vertical([
+        Constraint::Min(5),
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Min(3),
     ])
     .areas(frame.area());
 
-    frame.render_widget(section("Task", focus.task.as_deref()), task_area);
+    let mut list_state = ListState::default();
+    if !state.queue.is_empty() {
+        list_state.select(Some(state.selection));
+    }
+    frame.render_stateful_widget(queue_list(&state.queue), queue_area, &mut list_state);
+
+    frame.render_widget(section("Task", state.focus.task.as_deref()), task_area);
     frame.render_widget(
-        section("Next Action", focus.next_action.as_deref()),
+        section("Next Action", state.focus.next_action.as_deref()),
         next_action_area,
     );
-    frame.render_widget(decisions_section(focus), decisions_area);
+    frame.render_widget(decisions_section(&state.focus), decisions_area);
+}
+
+fn kind_label(kind: AttentionKind) -> &'static str {
+    match kind {
+        AttentionKind::Blocked => "BLOCKED",
+        AttentionKind::Decision => "DECISION",
+        AttentionKind::InboxMessage => "INBOX",
+    }
+}
+
+fn queue_list(items: &[AttentionItem]) -> List<'static> {
+    let rows: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new("(nothing needs attention)")]
+    } else {
+        items
+            .iter()
+            .map(|item| ListItem::new(format!("[{}] {}", kind_label(item.kind), item.summary)))
+            .collect()
+    };
+    List::new(rows)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Attention Queue (j/k move, Enter jump, d done)"),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
 }
 
 fn section(title: &str, body: Option<&str>) -> Paragraph<'static> {
@@ -112,16 +281,16 @@ fn decisions_section(focus: &FocusFile) -> Paragraph<'static> {
         .block(Block::default().borders(Borders::ALL).title("Decisions"))
 }
 
-/// Render `focus` into an off-screen buffer of the given size — the seam
+/// Render `state` into an off-screen buffer of the given size — the seam
 /// tests use to assert on rendered content without a real terminal.
 #[cfg(test)]
-fn render_to_buffer(focus: &FocusFile, width: u16, height: u16) -> ratatui::buffer::Buffer {
+fn render_to_buffer(state: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
     use ratatui::backend::TestBackend;
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test backend never fails to construct");
     terminal
-        .draw(|frame| draw(frame, focus))
+        .draw(|frame| draw(frame, state))
         .expect("draw into TestBackend never fails");
     terminal.backend().buffer().clone()
 }
@@ -139,48 +308,89 @@ mod tests {
             .collect::<String>()
     }
 
+    fn item(id: &str, kind: AttentionKind, summary: &str) -> AttentionItem {
+        AttentionItem {
+            id: id.to_owned(),
+            kind,
+            summary: summary.to_owned(),
+            pane_id: None,
+        }
+    }
+
     #[test]
-    fn empty_focus_file_shows_none_placeholders() {
-        let buffer = render_to_buffer(&FocusFile::default(), 40, 12);
-        let text = buffer_text(&buffer);
-        assert!(text.contains("Task"));
-        assert!(text.contains("Next Action"));
-        assert!(text.contains("Decisions"));
+    fn empty_state_shows_placeholders() {
+        let state = AppState {
+            focus: FocusFile::default(),
+            queue: vec![],
+            selection: 0,
+        };
+        let text = buffer_text(&render_to_buffer(&state, 60, 16));
+        assert!(text.contains("nothing needs attention"));
         assert_eq!(text.matches("(none)").count(), 3);
     }
 
     #[test]
-    fn task_and_next_action_text_render() {
-        let focus = FocusFile {
-            task: Some("Ship #86".to_owned()),
-            next_action: Some("Write the TUI skeleton".to_owned()),
-            decisions: vec![],
-        };
-        let text = buffer_text(&render_to_buffer(&focus, 60, 12));
-        assert!(text.contains("Ship #86"));
-        assert!(text.contains("Write the TUI skeleton"));
-    }
-
-    #[test]
-    fn unresolved_and_resolved_decisions_get_distinct_checkboxes() {
-        let focus = FocusFile {
-            task: None,
-            next_action: None,
-            decisions: vec![
-                DecisionEntry {
+    fn queue_items_and_focus_fields_render() {
+        let state = AppState {
+            focus: FocusFile {
+                task: Some("Ship #86".to_owned()),
+                next_action: Some("Wire the queue region".to_owned()),
+                decisions: vec![DecisionEntry {
                     id: "a".to_owned(),
                     text: "Pending call".to_owned(),
                     resolved: false,
-                },
-                DecisionEntry {
-                    id: "b".to_owned(),
-                    text: "Done call".to_owned(),
-                    resolved: true,
-                },
+                }],
+            },
+            queue: vec![
+                item("blocked:w1A:p1", AttentionKind::Blocked, "w1A:p1"),
+                item(
+                    "inbox:abc",
+                    AttentionKind::InboxMessage,
+                    "report from alpha",
+                ),
             ],
+            selection: 0,
         };
-        let text = buffer_text(&render_to_buffer(&focus, 60, 12));
+        let text = buffer_text(&render_to_buffer(&state, 70, 20));
+        assert!(text.contains("[BLOCKED] w1A:p1"));
+        assert!(text.contains("[INBOX] report from alpha"));
+        assert!(text.contains("Ship #86"));
+        assert!(text.contains("Wire the queue region"));
         assert!(text.contains("[ ] Pending call"));
-        assert!(text.contains("[x] Done call"));
+    }
+
+    #[test]
+    fn j_and_k_map_to_move_down_and_up() {
+        assert_eq!(apply_key(KeyCode::Char('j')), QueueAction::Move(1));
+        assert_eq!(apply_key(KeyCode::Down), QueueAction::Move(1));
+        assert_eq!(apply_key(KeyCode::Char('k')), QueueAction::Move(-1));
+        assert_eq!(apply_key(KeyCode::Up), QueueAction::Move(-1));
+    }
+
+    #[test]
+    fn enter_d_q_esc_map_to_expected_actions() {
+        assert_eq!(apply_key(KeyCode::Enter), QueueAction::Jump);
+        assert_eq!(apply_key(KeyCode::Char('d')), QueueAction::MarkDone);
+        assert_eq!(apply_key(KeyCode::Char('q')), QueueAction::Quit);
+        assert_eq!(apply_key(KeyCode::Esc), QueueAction::Quit);
+    }
+
+    #[test]
+    fn unmapped_key_is_a_no_op() {
+        assert_eq!(apply_key(KeyCode::Char('z')), QueueAction::None);
+    }
+
+    #[test]
+    fn clamp_selection_stays_within_bounds() {
+        assert_eq!(clamp_selection(0, 3, -1), 0);
+        assert_eq!(clamp_selection(2, 3, 1), 2);
+        assert_eq!(clamp_selection(1, 3, 1), 2);
+        assert_eq!(clamp_selection(1, 3, -1), 0);
+    }
+
+    #[test]
+    fn clamp_selection_on_empty_queue_is_always_zero() {
+        assert_eq!(clamp_selection(0, 0, 1), 0);
+        assert_eq!(clamp_selection(5, 0, -1), 0);
     }
 }
