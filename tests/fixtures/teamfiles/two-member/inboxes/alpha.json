@@ -1,0 +1,9 @@
+[
+  {
+    "fromAgentId": "alpha@session-fixture",
+    "toAgentId": "team-lead@session-fixture",
+    "content": "Task complete",
+    "timestamp": 1784197200000,
+    "unknownFutureField": "ignored"
+  }
+]

@@ -1,0 +1,32 @@
+{
+  "name": "session-620e0f77",
+  "createdAt": 1784197006229,
+  "leadAgentId": "team-lead@session-620e0f77",
+  "leadSessionId": "620e0f77-a2a2-4360-b8e0-2b79ced4d59e",
+  "members": [
+    {
+      "agentId": "team-lead@session-620e0f77",
+      "name": "team-lead",
+      "agentType": "team-lead",
+      "joinedAt": 1784197006229,
+      "tmuxPaneId": "leader",
+      "cwd": "/tmp/project",
+      "subscriptions": [],
+      "backendType": "in-process"
+    },
+    {
+      "agentId": "alpha@session-620e0f77",
+      "name": "alpha",
+      "color": "blue",
+      "joinedAt": 1784197103096,
+      "tmuxPaneId": "%1",
+      "subscriptions": [],
+      "model": "claude-opus-4-8",
+      "prompt": "Write ONE haiku (5-7-5) to alpha.txt.",
+      "planModeRequired": false,
+      "cwd": "/tmp/project",
+      "backendType": "tmux",
+      "isActive": true
+    }
+  ]
+}

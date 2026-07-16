@@ -1,0 +1,12 @@
+{
+  "name": "session-future",
+  "futureTopLevelField": 42,
+  "members": [
+    {
+      "agentId": "alpha@session-future",
+      "name": "alpha",
+      "tmuxPaneId": "%1",
+      "unknownMemberField": "ignored"
+    }
+  ]
+}
