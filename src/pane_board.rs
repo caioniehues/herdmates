@@ -29,6 +29,7 @@ use crate::herdr::{HerdrApi, HerdrClient, HerdrError};
 use crate::inbox_write::{self, InboxWriteError};
 use crate::jump;
 use crate::signal_engine::{self, AgentActivity, StalledThresholds};
+use crate::team_hook;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use ratatui::crossterm::execute;
@@ -39,6 +40,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
 use std::io;
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
@@ -403,6 +405,14 @@ fn run_until_quit<H: HerdrApi>(
     let mut ui = BoardUiState::new();
     ui.clamp_selection(model.agents.len());
 
+    // Issue #100 M4: hook spool is the push source, this poll loop stays
+    // the fallback. `spool_path` resolved once (team fixed for the loop's
+    // lifetime); `last_spool_len` baselines to the file's length *now* —
+    // same EOF-baseline semantics as recorder::consume_spool (#100 M3) —
+    // so pre-existing spool history doesn't trigger a spurious wake.
+    let spool_path = team_hook::default_spool_path(team);
+    let mut last_spool_len = spool_len(spool_path.as_deref());
+
     loop {
         terminal.draw(|frame| draw(frame, &model, &ui))?;
 
@@ -430,12 +440,31 @@ fn run_until_quit<H: HerdrApi>(
                     Action::None => {}
                 }
             }
-        } else if last_refresh.elapsed() >= interval {
-            model = gather_board(paths, team, herdr, thresholds, SystemTime::now());
-            last_refresh = Instant::now();
-            ui.clamp_selection(model.agents.len());
+        } else {
+            let current_spool_len = spool_len(spool_path.as_deref());
+            if spool_grew(last_spool_len, current_spool_len) || last_refresh.elapsed() >= interval {
+                model = gather_board(paths, team, herdr, thresholds, SystemTime::now());
+                last_refresh = Instant::now();
+                last_spool_len = current_spool_len;
+                ui.clamp_selection(model.agents.len());
+            }
         }
     }
+}
+
+/// Pure: did the spool grow since the last check? Trivial, but named and
+/// tested directly per #100 M4 (the wake decision, not the gather).
+fn spool_grew(last_len: u64, current_len: u64) -> bool {
+    current_len > last_len
+}
+
+/// Cheap stat, no read — a missing/unresolved spool is zero bytes, never
+/// an error (mirrors `team_hook`/`recorder`'s missing-file-is-empty rule).
+fn spool_len(spool_path: Option<&Path>) -> u64 {
+    spool_path
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0)
 }
 
 /// Honest, TUI-facing message for a failed nudge write — never silently
@@ -619,6 +648,14 @@ fn render_to_buffer(
 mod tests {
     use super::*;
     use crate::signal_engine::ObservedFacts;
+
+    #[test]
+    fn spool_grew_true_only_when_length_increased() {
+        assert!(spool_grew(0, 1));
+        assert!(spool_grew(100, 200));
+        assert!(!spool_grew(100, 100));
+        assert!(!spool_grew(200, 100)); // truncation/rotation: not a wake
+    }
 
     fn teammate(name: &str, is_lead: bool, facts: ObservedFacts) -> TeammateFacts {
         teammate_with_pane(name, is_lead, facts, None)

@@ -46,9 +46,16 @@ fn main() -> ExitCode {
         // signal-engine pipeline. Distinct from the legacy `board`
         // subcommand (frozen v1.1.0, different data model).
         "pane-board" => exit(pane_board::pane_board_command(&args)),
+        // Issue #100 stage 5 (ADR-0013 §93 stage 5, docs/spec.md §4):
+        // push source for the three Claude Code team hook events
+        // (TeammateIdle/TaskCreated/TaskCompleted) — appends to the spool
+        // the engine/recorder consume. Distinct module from the legacy
+        // `hook` (frozen v1.1.0, bound to `on-agent-status` above) —
+        // different event source, different payload shape, no shared code.
+        "hook" => team_hook::hook_command(&args),
         "" | "help" | "--help" | "-h" => {
             eprintln!(
-                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|teammux-launch|jump|focus|record|pane-board>"
+                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|teammux-launch|jump|focus|record|pane-board|hook>"
             );
             ExitCode::SUCCESS
         }

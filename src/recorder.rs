@@ -19,7 +19,9 @@
 use crate::gather::{self, GatherPaths, TeammateFacts};
 use crate::herdr::HerdrApi;
 use crate::signal_engine::{self, ObservedFacts, StalledThresholds, WaitingReason};
+use crate::team_hook;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -127,6 +129,20 @@ pub enum Record {
         old_owner: Option<String>,
         new_owner: Option<String>,
     },
+    /// One hook-spool line folded in verbatim (issue #100 stage 5) — the
+    /// event-driven push path, layered on top of the polling records
+    /// above, never replacing them. `teammate_name`/`task_id` are
+    /// best-effort extractions from the raw payload (`None` when the
+    /// event type doesn't carry one, e.g. `TeammateIdle` has no task_id
+    /// — see `team_hook`'s module doc for the verified field-set
+    /// asymmetry across the three event types).
+    HookSignal {
+        team: String,
+        timestamp: u64,
+        event: String,
+        teammate_name: Option<String>,
+        task_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +158,15 @@ struct AgentSnapshot {
 pub struct RecorderState {
     agents: HashMap<String, AgentSnapshot>,
     tasks: HashMap<String, (String, Option<String>)>,
+    /// Bytes of the hook spool already folded into a `Record` (issue
+    /// #100 M3). `None` until the first spool consumption — that first
+    /// call initializes it to the file's length *at that moment* (seek
+    /// to EOF), never 0: history predating this recorder run is already
+    /// covered by the polling snapshot above, so replaying the whole
+    /// spool on every restart would re-fold stale events for zero new
+    /// information (Caio decision, #100 M1 ACK). In-memory only, never
+    /// persisted across restarts.
+    spool_offset: Option<u64>,
 }
 
 impl RecorderState {
@@ -219,6 +244,90 @@ pub fn tick<H: HerdrApi>(
     }
 
     records
+}
+
+/// Wraps [`tick`] with hook-spool consumption (issue #100 stage 5): the
+/// event-driven push path layered on top of the existing poll, never
+/// replacing it — `tick` itself is untouched, so every existing polling
+/// test keeps asserting the exact same behavior. `spool_path` is `None`
+/// when unresolvable (missing `XDG_STATE_HOME`/`HOME`), degrading to
+/// polling-only silently — same honest-absence policy as the rest of
+/// this module.
+pub fn tick_with_spool<H: HerdrApi>(
+    state: &mut RecorderState,
+    paths: &GatherPaths,
+    team: &str,
+    herdr: &H,
+    thresholds: &StalledThresholds,
+    now: SystemTime,
+    spool_path: Option<&Path>,
+) -> Vec<Record> {
+    let mut records = tick(state, paths, team, herdr, thresholds, now);
+    if let Some(spool_path) = spool_path {
+        records.extend(consume_spool(state, spool_path, team));
+    }
+    records
+}
+
+/// Reads only the spool bytes appended since the last call (or since
+/// process start, per [`RecorderState::spool_offset`]'s doc comment),
+/// folding each complete JSONL line into a [`Record::HookSignal`]. A
+/// missing spool file is zero new lines, not an error (no hook has
+/// fired yet for this team). A trailing line with no newline yet (the
+/// hook process is mid-write) is left unconsumed for the next call, not
+/// dropped. A line that fails to parse as a [`team_hook::HookEnvelope`]
+/// is skipped — malformed spool content must never fail a whole tick.
+fn consume_spool(state: &mut RecorderState, spool_path: &Path, team: &str) -> Vec<Record> {
+    let Ok(contents) = std::fs::read(spool_path) else {
+        // No hook has fired yet for this team. Baseline at 0 (not a
+        // no-op skip) so that whenever the file first appears, its
+        // entire contents are treated as new rather than as
+        // pre-existing history — a missing file has no history to skip.
+        state.spool_offset.get_or_insert(0);
+        return Vec::new();
+    };
+    let offset = *state.spool_offset.get_or_insert(contents.len() as u64);
+    let offset = offset as usize;
+    if offset > contents.len() {
+        // Spool was rotated/truncated externally (not a v1 code path,
+        // but never trust external file state): resync to current EOF
+        // and skip this tick's read rather than panicking on the
+        // out-of-bounds slice below.
+        state.spool_offset = Some(contents.len() as u64);
+        return Vec::new();
+    }
+
+    let mut consumed = 0usize;
+    let mut records = Vec::new();
+    for line in contents[offset..].split_inclusive(|&byte| byte == b'\n') {
+        if !line.ends_with(b"\n") {
+            break; // partial trailing write — retry next call
+        }
+        consumed += line.len();
+        let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if let Ok(envelope) = serde_json::from_str::<team_hook::HookEnvelope>(text) {
+            records.push(Record::HookSignal {
+                team: team.to_owned(),
+                timestamp: envelope.captured_unix,
+                event: envelope.event,
+                teammate_name: field_str(&envelope.payload, "teammate_name"),
+                task_id: field_str(&envelope.payload, "task_id"),
+            });
+        }
+    }
+    state.spool_offset = Some((offset + consumed) as u64);
+    records
+}
+
+fn field_str(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 struct TeammateClassification {
@@ -356,15 +465,17 @@ pub fn record_command(args: &[String]) -> Result<(), RecordCommandError> {
     let thresholds = StalledThresholds::default();
     let interval = Duration::from_secs(parsed.interval_secs.max(1));
     let mut state = RecorderState::new();
+    let spool_path = team_hook::default_spool_path(&parsed.team);
 
     loop {
-        let records = tick(
+        let records = tick_with_spool(
             &mut state,
             &paths,
             &parsed.team,
             &herdr,
             &thresholds,
             SystemTime::now(),
+            spool_path.as_deref(),
         );
         append_records(&log_path, &records)?;
         std::thread::sleep(interval);
@@ -750,5 +861,165 @@ mod tests {
         assert_eq!(contents.lines().count(), 2);
         assert!(contents.lines().next().unwrap().contains("\"baseline\""));
         assert!(contents.lines().nth(1).unwrap().contains("\"transition\""));
+    }
+
+    // ── consume_spool: hook-spool consumption (issue #100 M3) ──────────────
+
+    fn spool_line(event: &str, extra: &str) -> String {
+        format!(r#"{{"spool_v":1,"event":"{event}","captured_unix":1,"payload":{{{extra}}}}}"#)
+    }
+
+    #[test]
+    fn missing_spool_file_yields_no_hook_signals() {
+        let dir = TempDir::new();
+        let mut state = RecorderState::new();
+        let records = consume_spool(&mut state, &dir.path().join("absent.jsonl"), "team-x");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn first_call_skips_pre_existing_lines_and_starts_at_eof() {
+        let dir = TempDir::new();
+        let spool_path = dir.path().join("team-x.jsonl");
+        write(
+            &spool_path,
+            &format!(
+                "{}\n",
+                spool_line("TaskCreated", r#""task_id":"pre-existing""#)
+            ),
+        );
+        let mut state = RecorderState::new();
+
+        let first = consume_spool(&mut state, &spool_path, "team-x");
+        assert!(
+            first.is_empty(),
+            "history predating this recorder run must not replay"
+        );
+    }
+
+    #[test]
+    fn a_line_appended_after_the_initial_call_is_folded_into_the_next_one() {
+        let dir = TempDir::new();
+        let spool_path = dir.path().join("team-x.jsonl");
+        write(
+            &spool_path,
+            &format!(
+                "{}\n",
+                spool_line("TaskCreated", r#""task_id":"pre-existing""#)
+            ),
+        );
+        let mut state = RecorderState::new();
+        consume_spool(&mut state, &spool_path, "team-x"); // establishes EOF baseline
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&spool_path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(
+            file,
+            "{}",
+            spool_line(
+                "TaskCompleted",
+                r#""task_id":"new-1","teammate_name":"builder-98""#
+            )
+        )
+        .unwrap();
+
+        let second = consume_spool(&mut state, &spool_path, "team-x");
+        assert_eq!(second.len(), 1);
+        match &second[0] {
+            Record::HookSignal {
+                team,
+                event,
+                teammate_name,
+                task_id,
+                ..
+            } => {
+                assert_eq!(team, "team-x");
+                assert_eq!(event, "TaskCompleted");
+                assert_eq!(teammate_name.as_deref(), Some("builder-98"));
+                assert_eq!(task_id.as_deref(), Some("new-1"));
+            }
+            other => panic!("expected HookSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_partial_trailing_line_is_deferred_to_the_next_call_not_dropped() {
+        let dir = TempDir::new();
+        let spool_path = dir.path().join("team-x.jsonl");
+        let mut state = RecorderState::new();
+        consume_spool(&mut state, &spool_path, "team-x"); // baseline: file doesn't exist yet
+
+        // Simulate a hook mid-write: no trailing newline yet.
+        let partial = spool_line("TeammateIdle", r#""teammate_name":"builder-98""#);
+        write(&spool_path, &partial);
+        let mid_write = consume_spool(&mut state, &spool_path, "team-x");
+        assert!(
+            mid_write.is_empty(),
+            "an incomplete line must not be folded in yet"
+        );
+
+        // The write completes.
+        write(&spool_path, &format!("{partial}\n"));
+        let completed = consume_spool(&mut state, &spool_path, "team-x");
+        assert_eq!(
+            completed.len(),
+            1,
+            "the completed line must now be folded in"
+        );
+    }
+
+    #[test]
+    fn a_malformed_line_is_skipped_without_failing_the_tick() {
+        let dir = TempDir::new();
+        let spool_path = dir.path().join("team-x.jsonl");
+        let mut state = RecorderState::new();
+        consume_spool(&mut state, &spool_path, "team-x"); // baseline
+
+        write(
+            &spool_path,
+            &format!(
+                "not valid json\n{}\n",
+                spool_line("TaskCreated", r#""task_id":"ok""#)
+            ),
+        );
+        let records = consume_spool(&mut state, &spool_path, "team-x");
+        assert_eq!(
+            records.len(),
+            1,
+            "the malformed line is skipped, the valid one still lands"
+        );
+    }
+
+    #[test]
+    fn tick_with_spool_folds_both_polling_and_hook_records_together() {
+        let dir = TempDir::new();
+        let paths = gather_paths(dir.path());
+        write(
+            &paths.teams_root.join("team-x/config.json"),
+            lead_only_config(),
+        );
+        let spool_path = dir.path().join("hook-spool.jsonl");
+        write(
+            &spool_path,
+            &format!("{}\n", spool_line("TaskCreated", r#""task_id":"1""#)),
+        );
+        let herdr = FakeHerdr::default();
+        let mut state = RecorderState::new();
+
+        // First call baselines both the agent snapshot and the spool offset.
+        let first = tick_with_spool(
+            &mut state,
+            &paths,
+            "team-x",
+            &herdr,
+            &StalledThresholds::default(),
+            SystemTime::now(),
+            Some(&spool_path),
+        );
+        assert!(first.iter().any(|r| matches!(r, Record::Baseline { .. })));
+        assert!(!first.iter().any(|r| matches!(r, Record::HookSignal { .. })));
     }
 }

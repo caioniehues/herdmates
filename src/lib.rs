@@ -36,6 +36,7 @@ pub mod socket_backend;
 pub mod spawn;
 pub mod spec;
 pub mod status_kill;
+pub mod team_hook;
 pub mod teamfiles;
 pub mod teammux;
 pub mod teammux_launch;

@@ -218,7 +218,11 @@ pub fn resolve_team(
 /// Team directory names under `teams_root` that actually look like a team
 /// (contain `config.json`) — filters out stray/incomplete directories
 /// rather than counting them as ambiguity candidates.
-fn list_team_dirs(teams_root: &Path) -> Vec<String> {
+///
+/// `pub(crate)` so `team_hook.rs` (#100 M5) can enumerate teams to
+/// session-derive a bucket for lead-session hook payloads, without
+/// re-deriving this directory-listing logic a second time.
+pub(crate) fn list_team_dirs(teams_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(teams_root) else {
         return Vec::new();
     };
