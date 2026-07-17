@@ -142,18 +142,15 @@ pub fn pump_once<H: HerdrApi>(teams_root: &Path, herdr: &H) {
 }
 
 /// Team directories directly under `teams_root` that contain a `config.json`,
-/// sorted by directory name for a deterministic pass order.
+/// sorted by directory name for a deterministic pass order. Thin path-mapping
+/// wrapper over `gather::list_team_dirs`, the canonical enumeration
+/// (2026-07-17 review, finding 4: the previous inline copy had already
+/// diverged from it).
 pub fn discover_team_dirs(teams_root: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(teams_root) else {
-        return Vec::new();
-    };
-    let mut dirs = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path.join("config.json").is_file())
-        .collect::<Vec<_>>();
-    dirs.sort();
-    dirs
+    crate::gather::list_team_dirs(teams_root)
+        .into_iter()
+        .map(|name| teams_root.join(name))
+        .collect()
 }
 
 pub(crate) fn read_inboxes(inboxes_dir: &Path) -> BTreeMap<String, Vec<InboxMessage>> {

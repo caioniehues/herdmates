@@ -209,9 +209,8 @@ mod tests {
 
     fn message(from: &str, content: &str) -> InboxMessage {
         InboxMessage {
-            from_agent_id: Some(from.to_owned()),
-            to_agent_id: None,
-            content: Some(content.to_owned()),
+            from: Some(from.to_owned()),
+            text: Some(content.to_owned()),
         }
     }
 

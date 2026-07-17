@@ -151,32 +151,49 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 // ─── I/O: lock + read-modify-atomic-rename ──────────────────────────────────
 
-const LOCK_RETRY_ATTEMPTS: u32 = 20;
+// ponytail: 4×50ms = 200ms worst-case wait. The only caller today is the
+// pane-board nudge, which runs this on the TUI's draw thread (2026-07-17
+// review, finding 9) — raise the budget only alongside moving the write
+// off that thread.
+const LOCK_RETRY_ATTEMPTS: u32 = 4;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-struct LockGuard(PathBuf);
+/// Holds an OS advisory lock (fs4/flock) on the sidecar `.lock` file. The
+/// kernel releases the lock when the descriptor closes — including on
+/// SIGKILL/OOM/panic-abort — so a dead holder can never orphan the lock
+/// (2026-07-17 review, finding 2; the previous `create_new`-sentinel
+/// protocol required a human to delete the stray file after a crash).
+/// The `.lock` file itself is left in place; an unlocked empty sidecar is
+/// inert, and removing it would race concurrent lockers.
+struct LockGuard(std::fs::File);
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = fs4::FileExt::unlock(&self.0);
     }
 }
 
 fn acquire_lock(lock_path: &Path) -> Result<LockGuard, InboxWriteError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|source| InboxWriteError::Io {
+            path: lock_path.to_owned(),
+            source,
+        })?;
     for attempt in 0..LOCK_RETRY_ATTEMPTS {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
-            Ok(_) => return Ok(LockGuard(lock_path.to_owned())),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => return Ok(LockGuard(file)),
+            Err(fs4::TryLockError::WouldBlock) => {
                 if attempt + 1 == LOCK_RETRY_ATTEMPTS {
                     return Err(InboxWriteError::LockContention(lock_path.to_owned()));
                 }
                 std::thread::sleep(LOCK_RETRY_DELAY);
             }
-            Err(source) => {
+            Err(fs4::TryLockError::Error(source)) => {
                 return Err(InboxWriteError::Io {
                     path: lock_path.to_owned(),
                     source,
@@ -424,9 +441,12 @@ mod tests {
         assert_eq!(entries[1]["msg_id"], "new-id");
         assert_eq!(entries[1]["text"], "status?");
 
-        // no leftover lock or tmp file
-        assert!(!PathBuf::from(format!("{}.lock", inbox_path.display())).exists());
+        // no leftover tmp file; the .lock sidecar deliberately remains on
+        // disk (fs4 advisory lock — removal would race concurrent lockers)
+        // but must be RELEASED, i.e. immediately re-acquirable.
         assert!(!PathBuf::from(format!("{}.tmp", inbox_path.display())).exists());
+        let lock_path = PathBuf::from(format!("{}.lock", inbox_path.display()));
+        assert!(acquire_lock(&lock_path).is_ok());
     }
 
     #[test]
@@ -445,16 +465,36 @@ mod tests {
     }
 
     #[test]
-    fn acquire_lock_times_out_when_the_lock_file_is_already_held() {
+    fn acquire_lock_times_out_when_the_lock_is_already_held() {
         let dir = TempDir::new();
         let lock_path = dir.0.join("held.lock");
-        std::fs::write(&lock_path, "").unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&holder).unwrap();
 
-        // shrink the retry budget indirectly by pre-holding the lock —
-        // acquire_lock will exhaust LOCK_RETRY_ATTEMPTS and error rather
-        // than hang; this test intentionally accepts the ~1s retry cost.
+        // acquire_lock exhausts LOCK_RETRY_ATTEMPTS and errors rather than
+        // hang; this test intentionally accepts the ~200ms retry cost.
         let result = acquire_lock(&lock_path);
         assert!(matches!(result, Err(InboxWriteError::LockContention(_))));
-        std::fs::remove_file(&lock_path).unwrap();
+        fs4::FileExt::unlock(&holder).unwrap();
+    }
+
+    #[test]
+    fn acquire_lock_succeeds_over_a_dead_holders_leftover_lock_file() {
+        // A crashed/SIGKILLed holder leaves the sidecar FILE behind but the
+        // kernel has already released its advisory lock — the file's mere
+        // existence must never block future writers (2026-07-17 review,
+        // finding 2: the old create_new protocol failed exactly here).
+        let dir = TempDir::new();
+        let lock_path = dir.0.join("orphaned.lock");
+        std::fs::write(&lock_path, "").unwrap();
+
+        let result = acquire_lock(&lock_path);
+        assert!(result.is_ok());
     }
 }

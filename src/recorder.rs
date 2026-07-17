@@ -278,7 +278,9 @@ pub fn tick_with_spool<H: HerdrApi>(
 /// dropped. A line that fails to parse as a [`team_hook::HookEnvelope`]
 /// is skipped — malformed spool content must never fail a whole tick.
 fn consume_spool(state: &mut RecorderState, spool_path: &Path, team: &str) -> Vec<Record> {
-    let Ok(contents) = std::fs::read(spool_path) else {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(spool_path) else {
         // No hook has fired yet for this team. Baseline at 0 (not a
         // no-op skip) so that whenever the file first appears, its
         // entire contents are treated as new rather than as
@@ -286,20 +288,30 @@ fn consume_spool(state: &mut RecorderState, spool_path: &Path, team: &str) -> Ve
         state.spool_offset.get_or_insert(0);
         return Vec::new();
     };
-    let offset = *state.spool_offset.get_or_insert(contents.len() as u64);
-    let offset = offset as usize;
-    if offset > contents.len() {
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let offset = *state.spool_offset.get_or_insert(len);
+    if offset > len {
         // Spool was rotated/truncated externally (not a v1 code path,
         // but never trust external file state): resync to current EOF
-        // and skip this tick's read rather than panicking on the
-        // out-of-bounds slice below.
-        state.spool_offset = Some(contents.len() as u64);
+        // and skip this tick's read rather than reading from a stale
+        // offset.
+        state.spool_offset = Some(len);
         return Vec::new();
     }
 
+    // Seek + tail read, never a whole-file read: the spool is append-only
+    // with no rotation yet, so re-reading from byte 0 every ~2s tick grows
+    // without bound over a long dogfood run (2026-07-17 review, finding 3;
+    // rotation policy still carried as future work).
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(offset)).is_err() || file.read_to_end(&mut tail).is_err() {
+        return Vec::new();
+    }
+    let offset = offset as usize;
+
     let mut consumed = 0usize;
     let mut records = Vec::new();
-    for line in contents[offset..].split_inclusive(|&byte| byte == b'\n') {
+    for line in tail.split_inclusive(|&byte| byte == b'\n') {
         if !line.ends_with(b"\n") {
             break; // partial trailing write — retry next call
         }
@@ -477,7 +489,17 @@ pub fn record_command(args: &[String]) -> Result<(), RecordCommandError> {
             SystemTime::now(),
             spool_path.as_deref(),
         );
-        append_records(&log_path, &records)?;
+        // A transient append failure (disk momentarily full, log dir
+        // briefly unavailable) must not kill the live tap — log and retry
+        // next tick (2026-07-17 review, finding 6). The records this tick
+        // observed are dropped, not re-queued: the recorder is a delta
+        // log, and the next tick's baseline re-derives current truth.
+        if let Err(error) = append_records(&log_path, &records) {
+            eprintln!(
+                "herdmates record: append to {} failed ({error}); retrying next tick",
+                log_path.display()
+            );
+        }
         std::thread::sleep(interval);
     }
 }
@@ -943,6 +965,31 @@ mod tests {
             }
             other => panic!("expected HookSignal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_externally_truncated_spool_resyncs_to_eof_instead_of_panicking() {
+        // 2026-07-17 review, finding 10: this defensive branch had no test.
+        let dir = TempDir::new();
+        let spool_path = dir.path().join("team-x.jsonl");
+        write(
+            &spool_path,
+            &format!("{}\n", spool_line("TaskCreated", r#""task_id":"t-1""#)),
+        );
+        let mut state = RecorderState::new();
+        consume_spool(&mut state, &spool_path, "team-x"); // baseline at EOF
+
+        // External rotation: file replaced with something shorter than the
+        // stored offset.
+        write(&spool_path, "x\n");
+
+        let records = consume_spool(&mut state, &spool_path, "team-x");
+        assert!(records.is_empty(), "resync tick must consume nothing");
+        assert_eq!(
+            state.spool_offset,
+            Some(2),
+            "offset must resync to the new, shorter EOF"
+        );
     }
 
     #[test]

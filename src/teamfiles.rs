@@ -83,16 +83,19 @@ pub struct Member {
     pub prompt: Option<String>,
 }
 
-/// One message from an `inboxes/{name}.json` array.
-/// All fields optional; unknown fields silently ignored.
+/// One message from an `inboxes/{name}.json` array, using the LIVE entry
+/// schema (`from`/`text`/..., live-captured in
+/// docs/research/teammux-e2e-2026-07-16 and written by `inbox_write`).
+/// The pre-capture `fromAgentId`/`toAgentId`/`content` shape this struct
+/// originally guessed at never existed on disk — against real entries it
+/// deserialized every field to `None` silently (2026-07-17 review,
+/// finding 1). All fields optional; unknown fields silently ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct InboxMessage {
-    #[serde(rename = "fromAgentId", default)]
-    pub from_agent_id: Option<String>,
-    #[serde(rename = "toAgentId", default)]
-    pub to_agent_id: Option<String>,
     #[serde(default)]
-    pub content: Option<String>,
+    pub from: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// Aggregated view of one team member: config fields + inbox messages.
@@ -307,15 +310,8 @@ mod tests {
     fn populated_inbox_parses_known_fields_and_ignores_unknown() {
         let msgs = read_inbox(&fixture("two-member/inboxes/alpha.json")).expect("populated inbox");
         assert_eq!(msgs.len(), 1);
-        assert_eq!(
-            msgs[0].from_agent_id.as_deref(),
-            Some("alpha@session-fixture")
-        );
-        assert_eq!(
-            msgs[0].to_agent_id.as_deref(),
-            Some("team-lead@session-fixture")
-        );
-        assert_eq!(msgs[0].content.as_deref(), Some("Task complete"));
+        assert_eq!(msgs[0].from.as_deref(), Some("alpha"));
+        assert_eq!(msgs[0].text.as_deref(), Some("Task complete"));
     }
 
     // ── build_teammates ───────────────────────────────────────────────────────
@@ -374,9 +370,8 @@ mod tests {
     fn build_teammates_joins_inbox_by_name() {
         let config = fixture_config();
         let msg = InboxMessage {
-            from_agent_id: Some("alpha@test".to_owned()),
-            to_agent_id: Some("team-lead@test".to_owned()),
-            content: Some("done".to_owned()),
+            from: Some("alpha".to_owned()),
+            text: Some("done".to_owned()),
         };
         let inboxes = BTreeMap::from([("alpha".to_owned(), vec![msg.clone()])]);
 

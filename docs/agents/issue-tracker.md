@@ -1,8 +1,9 @@
 # Issue tracker: GitHub Issues
 
-Published 2026-07-15: `caioniehues/herdr-agent-team` (public, marketplace
-topic `herdr-plugin`). Issues and specs now live on GitHub Issues via the
-`gh` CLI.
+Published 2026-07-15, renamed since: `caioniehues/herdmates` (public,
+marketplace topic `herdr-plugin`; the original `herdr-agent-team` slug
+survives only as a GitHub redirect — never rely on it). Issues and specs
+live on GitHub Issues via the `gh` CLI.
 
 ## Conventions
 

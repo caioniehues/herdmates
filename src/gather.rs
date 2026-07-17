@@ -238,9 +238,13 @@ const LIVE_TRANSCRIPT_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// session), is it fresh enough. No filesystem access — testable without
 /// tempdir fixtures, matching the `pane_board.rs` M4 `spool_grew` split.
 fn is_transcript_live(transcript_mtime: Option<SystemTime>, now: SystemTime) -> bool {
-    transcript_mtime
-        .and_then(|mtime| now.duration_since(mtime).ok())
-        .is_some_and(|elapsed| elapsed <= LIVE_TRANSCRIPT_WINDOW)
+    transcript_mtime.is_some_and(|mtime| {
+        // A transcript mtime in the future (NTP step-back, clock desync)
+        // counts as elapsed-zero — i.e. live. `duration_since` errors on
+        // future mtimes; mapping that error to "dead" would silently drop
+        // a genuinely live team (2026-07-17 review, finding 8).
+        now.duration_since(mtime).unwrap_or(Duration::ZERO) <= LIVE_TRANSCRIPT_WINDOW
+    })
 }
 
 /// Impure glue: reads `team`'s config to find its lead session, stats
@@ -260,21 +264,25 @@ fn team_is_live(paths: &GatherPaths, team: &str, now: SystemTime) -> bool {
 }
 
 /// Team directory names under `teams_root` that actually look like a team
-/// (contain `config.json`) — filters out stray/incomplete directories
-/// rather than counting them as ambiguity candidates.
+/// (a directory containing `config.json`) — filters out stray/incomplete
+/// entries rather than counting them as ambiguity candidates. Sorted for
+/// a deterministic order.
 ///
-/// `pub(crate)` so `team_hook.rs` (#100 M5) can enumerate teams to
-/// session-derive a bucket for lead-session hook payloads, without
-/// re-deriving this directory-listing logic a second time.
+/// This is the CANONICAL team-dir enumeration: `team_hook.rs` (#100 M5),
+/// `resolve_team`, and `pump::discover_team_dirs` (and through it
+/// `jump.rs`) all route here. The 2026-07-17 review (finding 4) caught a
+/// second, already-diverged copy in `pump.rs` — never reintroduce one.
 pub(crate) fn list_team_dirs(teams_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(teams_root) else {
         return Vec::new();
     };
-    entries
+    let mut names: Vec<String> = entries
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("config.json").is_file())
+        .filter(|entry| entry.path().is_dir() && entry.path().join("config.json").is_file())
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .collect()
+        .collect();
+    names.sort();
+    names
 }
 
 // ─── Task files (~/.claude/tasks/{team}/{n}.json) ─────────────────────────────
@@ -1223,6 +1231,15 @@ mod tests {
     #[test]
     fn is_transcript_live_false_when_transcript_missing() {
         assert!(!is_transcript_live(None, SystemTime::now()));
+    }
+
+    #[test]
+    fn is_transcript_live_true_for_future_mtime_clock_skew() {
+        // 2026-07-17 review, finding 8: a future mtime (NTP step-back)
+        // must count as live, never silently drop the team.
+        let now = SystemTime::now();
+        let mtime = now + Duration::from_secs(120);
+        assert!(is_transcript_live(Some(mtime), now));
     }
 
     fn gather_paths_for(dir: &Path) -> GatherPaths {

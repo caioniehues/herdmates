@@ -94,8 +94,8 @@ pub fn build_attention_queue(
 
     if let Some(lead) = lead {
         for message in &lead.inbox {
-            let content = message.content.as_deref().unwrap_or_default();
-            let from = message.from_agent_id.as_deref().unwrap_or("unknown");
+            let content = message.text.as_deref().unwrap_or_default();
+            let from = message.from.as_deref().unwrap_or("unknown");
             let id = stable_id(&format!("{from}|{content}"));
             items.push(AttentionItem {
                 id: format!("inbox:{id}"),
@@ -194,9 +194,8 @@ mod tests {
     #[test]
     fn lead_inbox_messages_become_attention_items_with_jump_target() {
         let lead = lead_with_inbox(vec![InboxMessage {
-            from_agent_id: Some("alpha@t".to_owned()),
-            to_agent_id: Some("team-lead@t".to_owned()),
-            content: Some("STEP 3 READY".to_owned()),
+            from: Some("alpha@t".to_owned()),
+            text: Some("STEP 3 READY".to_owned()),
         }]);
         let queue = build_attention_queue(&[], &FocusFile::default(), Some(&lead), Some("w1A:p1"));
         assert_eq!(queue.len(), 1);
@@ -212,9 +211,8 @@ mod tests {
         let peer = Teammate {
             is_lead: false,
             ..lead_with_inbox(vec![InboxMessage {
-                from_agent_id: Some("beta@t".to_owned()),
-                to_agent_id: Some("alpha@t".to_owned()),
-                content: Some("peer chatter".to_owned()),
+                from: Some("beta@t".to_owned()),
+                text: Some("peer chatter".to_owned()),
             }])
         };
         let queue = build_attention_queue(&[], &FocusFile::default(), Some(&peer), None);
@@ -239,9 +237,8 @@ mod tests {
             }],
         };
         let lead = lead_with_inbox(vec![InboxMessage {
-            from_agent_id: Some("alpha@t".to_owned()),
-            to_agent_id: None,
-            content: Some("report".to_owned()),
+            from: Some("alpha@t".to_owned()),
+            text: Some("report".to_owned()),
         }]);
         let queue = build_attention_queue(&agents, &focus, Some(&lead), None);
         assert_eq!(queue.len(), 3);
@@ -253,9 +250,8 @@ mod tests {
     #[test]
     fn ids_are_stable_across_separate_builds() {
         let lead = lead_with_inbox(vec![InboxMessage {
-            from_agent_id: Some("alpha@t".to_owned()),
-            to_agent_id: None,
-            content: Some("same message".to_owned()),
+            from: Some("alpha@t".to_owned()),
+            text: Some("same message".to_owned()),
         }]);
         let first = build_attention_queue(&[], &FocusFile::default(), Some(&lead), None);
         let second = build_attention_queue(&[], &FocusFile::default(), Some(&lead), None);

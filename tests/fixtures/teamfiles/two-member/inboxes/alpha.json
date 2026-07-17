@@ -1,9 +1,12 @@
 [
   {
-    "fromAgentId": "alpha@session-fixture",
-    "toAgentId": "team-lead@session-fixture",
-    "content": "Task complete",
-    "timestamp": 1784197200000,
+    "from": "alpha",
+    "text": "Task complete",
+    "timestamp": "2026-07-16T09:00:00.000Z",
+    "msgV": 1,
+    "msg_id": "5cadd986-0000-4000-8000-000000000000",
+    "type": "message",
+    "read": false,
     "unknownFutureField": "ignored"
   }
 ]

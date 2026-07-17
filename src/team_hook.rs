@@ -51,7 +51,7 @@ use serde_json::Value;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One appended spool line: envelope + raw payload verbatim. See module
 /// doc comment for why the payload is untyped.
@@ -258,17 +258,40 @@ fn load_gate_config() -> Option<GateConfig> {
 /// because the gating capability needs to reach `ExitCode::from(2)` on
 /// a future `GateDecision::Block` — a plain `Result<(), Error>` can only
 /// reach the crate's existing 0/1 exit codes.
+/// Hard ceilings on the stdin read, enforcing the module's "must never
+/// block" invariant against a parent that holds the pipe open or floods it
+/// (2026-07-17 review, finding 7). Team-event payloads are sub-KB; 1 MiB /
+/// 5 s are generous.
+const STDIN_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const STDIN_READ_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Reads stdin (size-capped) on a helper thread and gives up after
+/// `timeout`. `None` on read error or timeout — the caller exits 0 either
+/// way per the module's all-failures-are-silent contract. On timeout the
+/// helper thread is abandoned; the process exits immediately after, which
+/// reaps it.
+fn read_stdin_bounded(timeout: Duration) -> Option<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut input = String::new();
+        let result = std::io::Read::take(std::io::stdin(), STDIN_READ_MAX_BYTES)
+            .read_to_string(&mut input)
+            .map(|_| input);
+        let _ = sender.send(result);
+    });
+    receiver.recv_timeout(timeout).ok()?.ok()
+}
+
 pub fn hook_command(args: &[String]) -> ExitCode {
     let event_name = args
         .first()
         .cloned()
         .unwrap_or_else(|| "unknown".to_owned());
 
-    let mut input = String::new();
-    if let Err(error) = std::io::stdin().read_to_string(&mut input) {
-        eprintln!("herdmates hook: failed to read stdin for {event_name}: {error}");
+    let Some(input) = read_stdin_bounded(STDIN_READ_TIMEOUT) else {
+        eprintln!("herdmates hook: failed to read stdin for {event_name} (error or timeout)");
         return ExitCode::SUCCESS;
-    }
+    };
 
     let payload: Value = match serde_json::from_str(&input) {
         Ok(value) => value,
