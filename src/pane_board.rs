@@ -375,7 +375,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(300);
 pub fn pane_board_command(args: &[String]) -> Result<(), PaneBoardError> {
     let parsed = parse_pane_board_args(args)?;
     let paths = GatherPaths::from_env().ok_or(PaneBoardError::UnresolvedGatherPaths)?;
-    let team = gather::resolve_team(&paths, parsed.team.as_deref())?;
+    let team = gather::resolve_team(&paths, parsed.team.as_deref(), SystemTime::now())?;
     let herdr = HerdrClient::from_env();
     let thresholds = StalledThresholds::default();
     let interval = Duration::from_secs(parsed.interval_secs.max(1));

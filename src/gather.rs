@@ -199,20 +199,64 @@ pub enum ResolveTeamError {
 /// more than one is a hard error listing the candidates — same
 /// never-guess doctrine as the reason-badge engine (ADR-0013 honesty
 /// doctrine): an ambiguous or absent team is never silently picked.
+///
+/// Candidates are pre-filtered to LIVE teams (#102) before the 0/1/many
+/// count decides the outcome — `~/.claude/teams/*/` accumulates one dir
+/// per team ever created (dismissal prunes members, not the directory,
+/// #102 M1 finding) and never getting filtered would make every stale
+/// husk count as ambiguity forever. The filter can only ever narrow the
+/// candidate set, so it can only ever turn a would-be wrong/ambiguous
+/// pick into a stricter honest error — never produce a wrong pick itself.
 pub fn resolve_team(
     paths: &GatherPaths,
     explicit: Option<&str>,
+    now: SystemTime,
 ) -> Result<String, ResolveTeamError> {
     if let Some(team) = explicit {
         return Ok(team.to_owned());
     }
-    let mut candidates = list_team_dirs(&paths.teams_root);
+    let mut candidates: Vec<String> = list_team_dirs(&paths.teams_root)
+        .into_iter()
+        .filter(|team| team_is_live(paths, team, now))
+        .collect();
     candidates.sort();
     match candidates.len() {
         1 => Ok(candidates.into_iter().next().expect("len checked as 1")),
         0 => Err(ResolveTeamError::NoTeams(paths.teams_root.clone())),
         _ => Err(ResolveTeamError::Ambiguous(candidates.join(", "))),
     }
+}
+
+/// #102: a team dir counts as live only while its lead session has a
+/// transcript touched within [`LIVE_TRANSCRIPT_WINDOW`] — `member_count`
+/// deliberately isn't a signal (a legit solo-lead team, seconds after
+/// `herdr team create` before any teammate joins, would false-negative).
+const LIVE_TRANSCRIPT_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// Pure half of the liveness check: given an already-resolved transcript
+/// mtime (or `None`, meaning no transcript was ever found for the lead
+/// session), is it fresh enough. No filesystem access — testable without
+/// tempdir fixtures, matching the `pane_board.rs` M4 `spool_grew` split.
+fn is_transcript_live(transcript_mtime: Option<SystemTime>, now: SystemTime) -> bool {
+    transcript_mtime
+        .and_then(|mtime| now.duration_since(mtime).ok())
+        .is_some_and(|elapsed| elapsed <= LIVE_TRANSCRIPT_WINDOW)
+}
+
+/// Impure glue: reads `team`'s config to find its lead session, stats
+/// that session's transcript, and runs the pure freshness check above.
+/// Degrades to `false` (never live) on any missing/malformed input —
+/// same never-panic policy as every other pass in this module.
+fn team_is_live(paths: &GatherPaths, team: &str, now: SystemTime) -> bool {
+    let config_path = paths.teams_root.join(team).join("config.json");
+    let Ok(config) = teamfiles::read_team_config(&config_path) else {
+        return false;
+    };
+    let Some(session_id) = config.lead_session_id.filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    let mtime = resolve_transcript_mtime(&paths.projects_root, &session_id);
+    is_transcript_live(mtime, now)
 }
 
 /// Team directory names under `teams_root` that actually look like a team
@@ -1030,15 +1074,33 @@ mod tests {
 
     // ── resolve_team (#98 board) ────────────────────────────────────────────
 
+    /// #102: `resolve_team`'s auto-pick path now requires a live team
+    /// (config with a `leadSessionId` whose transcript exists and is
+    /// fresh) — write both fixture pieces together so every candidate
+    /// test stays live unless the test is deliberately checking staleness.
+    fn write_live_team(paths: &GatherPaths, team: &str, session_id: &str) {
+        write(
+            &paths.teams_root.join(team).join("config.json"),
+            &two_member_config(session_id),
+        );
+        write(
+            &paths
+                .projects_root
+                .join("proj1")
+                .join(format!("{session_id}.jsonl")),
+            "{}",
+        );
+    }
+
     #[test]
     fn resolve_team_explicit_always_wins_even_with_other_teams_present() {
         let dir = TempDir::new();
         let paths = gather_paths_for(dir.path());
-        write(&paths.teams_root.join("team-x/config.json"), "{}");
-        write(&paths.teams_root.join("team-y/config.json"), "{}");
+        write_live_team(&paths, "team-x", "session-x");
+        write_live_team(&paths, "team-y", "session-y");
 
         assert_eq!(
-            resolve_team(&paths, Some("team-z")).unwrap(),
+            resolve_team(&paths, Some("team-z"), SystemTime::now()).unwrap(),
             "team-z",
             "explicit team name is trusted verbatim, not validated against disk"
         );
@@ -1048,9 +1110,12 @@ mod tests {
     fn resolve_team_auto_picks_the_sole_team_dir() {
         let dir = TempDir::new();
         let paths = gather_paths_for(dir.path());
-        write(&paths.teams_root.join("team-x/config.json"), "{}");
+        write_live_team(&paths, "team-x", "session-x");
 
-        assert_eq!(resolve_team(&paths, None).unwrap(), "team-x");
+        assert_eq!(
+            resolve_team(&paths, None, SystemTime::now()).unwrap(),
+            "team-x"
+        );
     }
 
     #[test]
@@ -1059,7 +1124,7 @@ mod tests {
         let paths = gather_paths_for(dir.path());
 
         assert!(matches!(
-            resolve_team(&paths, None),
+            resolve_team(&paths, None, SystemTime::now()),
             Err(ResolveTeamError::NoTeams(_))
         ));
     }
@@ -1068,10 +1133,10 @@ mod tests {
     fn resolve_team_errors_on_multiple_teams_and_lists_candidates() {
         let dir = TempDir::new();
         let paths = gather_paths_for(dir.path());
-        write(&paths.teams_root.join("team-x/config.json"), "{}");
-        write(&paths.teams_root.join("team-y/config.json"), "{}");
+        write_live_team(&paths, "team-x", "session-x");
+        write_live_team(&paths, "team-y", "session-y");
 
-        match resolve_team(&paths, None) {
+        match resolve_team(&paths, None, SystemTime::now()) {
             Err(ResolveTeamError::Ambiguous(candidates)) => {
                 assert!(candidates.contains("team-x"));
                 assert!(candidates.contains("team-y"));
@@ -1084,12 +1149,80 @@ mod tests {
     fn resolve_team_ignores_stray_dirs_without_a_config_json() {
         let dir = TempDir::new();
         let paths = gather_paths_for(dir.path());
-        write(&paths.teams_root.join("team-x/config.json"), "{}");
+        write_live_team(&paths, "team-x", "session-x");
         // A leftover/incomplete directory with no config.json must not
         // count as a second candidate.
         fs::create_dir_all(paths.teams_root.join("not-a-team")).unwrap();
 
-        assert_eq!(resolve_team(&paths, None).unwrap(), "team-x");
+        assert_eq!(
+            resolve_team(&paths, None, SystemTime::now()).unwrap(),
+            "team-x"
+        );
+    }
+
+    #[test]
+    fn resolve_team_ignores_stale_teams_and_degrades_to_no_teams() {
+        let dir = TempDir::new();
+        let paths = gather_paths_for(dir.path());
+        write(
+            &paths.teams_root.join("team-x/config.json"),
+            &two_member_config("session-x"),
+        );
+        write(&paths.projects_root.join("proj1/session-x.jsonl"), "{}");
+        let long_ago = SystemTime::now() + LIVE_TRANSCRIPT_WINDOW + Duration::from_secs(1);
+
+        assert!(
+            matches!(
+                resolve_team(&paths, None, long_ago),
+                Err(ResolveTeamError::NoTeams(_))
+            ),
+            "a config whose transcript predates the window must not count as a candidate"
+        );
+    }
+
+    #[test]
+    fn resolve_team_ignores_a_team_with_no_transcript_at_all() {
+        let dir = TempDir::new();
+        let paths = gather_paths_for(dir.path());
+        write(
+            &paths.teams_root.join("team-x/config.json"),
+            &two_member_config("session-x"),
+        );
+        // No transcript file written for session-x — the #102 M1
+        // `session-b7cc9f6d` case (fresh config, no transcript ever).
+
+        assert!(matches!(
+            resolve_team(&paths, None, SystemTime::now()),
+            Err(ResolveTeamError::NoTeams(_))
+        ));
+    }
+
+    // ── is_transcript_live (#102, pure) ─────────────────────────────────────
+
+    #[test]
+    fn is_transcript_live_true_within_window() {
+        let now = SystemTime::now();
+        let mtime = now - Duration::from_secs(60);
+        assert!(is_transcript_live(Some(mtime), now));
+    }
+
+    #[test]
+    fn is_transcript_live_false_past_window() {
+        let now = SystemTime::now();
+        let mtime = now - LIVE_TRANSCRIPT_WINDOW - Duration::from_secs(1);
+        assert!(!is_transcript_live(Some(mtime), now));
+    }
+
+    #[test]
+    fn is_transcript_live_true_exactly_at_window_boundary() {
+        let now = SystemTime::now();
+        let mtime = now - LIVE_TRANSCRIPT_WINDOW;
+        assert!(is_transcript_live(Some(mtime), now));
+    }
+
+    #[test]
+    fn is_transcript_live_false_when_transcript_missing() {
+        assert!(!is_transcript_live(None, SystemTime::now()));
     }
 
     fn gather_paths_for(dir: &Path) -> GatherPaths {
