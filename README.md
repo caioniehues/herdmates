@@ -29,9 +29,15 @@ herdr plugin install caioniehues/herdmates
 Local development:
 
 ```bash
-cargo build --release
+cargo install --path . --root "$HOME/.local"
 herdr plugin link .
 ```
+
+The manifest's `command`s use a bare `herdmates` argv[0] (issue #101: herdr
+spawns argv directly, with no shell, so a relative path like
+`target/release/herdmates` never resolves) — `cargo install` is what puts a
+resolvable `herdmates` on `PATH` (`~/.local/bin`, same place `herdr` itself
+lives). A plain `cargo build --release` is not enough on its own.
 
 ### Upgrade or relink after manifest changes
 

@@ -6,25 +6,32 @@ description = "Claude Code teammates, native in herdr — teammux shim, agent bo
 platforms = ["linux", "macos"]
 
 [[build]]
-command = ["cargo", "build", "--release"]
+# Issue #101: `cargo install` builds release itself, so this one hook
+# both builds and puts a bare-argv0-resolvable `herdmates` on PATH at
+# `~/.local/bin` (confirmed on PATH, matches where `herdr` itself
+# lives). herdr spawns argv directly (no shell) — a literal "~" in
+# argv would never expand and would create a literal ./~ directory, so
+# this goes through the manifest's existing `sh -c` convention
+# (`open-board` action already does), not a bare argv array.
+command = ["sh", "-c", "cargo install --path . --root \"$HOME/.local\""]
 
 [[actions]]
 id = "spawn"
 title = "Spawn agent team"
 contexts = ["workspace"]
-command = ["target/release/herdmates", "spawn"]
+command = ["herdmates", "spawn"]
 
 [[actions]]
 id = "status"
 title = "Team status"
 contexts = ["workspace"]
-command = ["target/release/herdmates", "status"]
+command = ["herdmates", "status"]
 
 [[actions]]
 id = "kill"
 title = "Kill team"
 contexts = ["workspace"]
-command = ["target/release/herdmates", "kill"]
+command = ["herdmates", "kill"]
 
 [[actions]]
 id = "open-board"
@@ -36,27 +43,27 @@ command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin caioniehue
 id = "open-report"
 title = "Open team report"
 contexts = ["pane"]
-command = ["target/release/herdmates", "open-report"]
+command = ["herdmates", "open-report"]
 
 [[actions]]
 id = "jump"
 title = "Jump to next attention item"
 contexts = ["workspace"]
-command = ["target/release/herdmates", "jump"]
+command = ["herdmates", "jump"]
 
 [[panes]]
 id = "board"
 title = "Agent Team control deck"
 description = "Keyboard-driven worker controls; open as a tab or override placement for a quick popup."
 placement = "tab"
-command = ["target/release/herdmates", "board"]
+command = ["herdmates", "board"]
 
 [[panes]]
 id = "focus"
 title = "Focus"
 description = "One-next-action focus file + decision queue. A real split/overlay pane — never a popup."
 placement = "split"
-command = ["target/release/herdmates", "focus"]
+command = ["herdmates", "focus"]
 
 [[actions]]
 id = "open-focus"
@@ -72,7 +79,7 @@ id = "pane-board"
 title = "Mission control board"
 description = "Read-only team overview: agent status/reason badges, task list, mailbox tail. All reads, no writes."
 placement = "split"
-command = ["target/release/herdmates", "pane-board"]
+command = ["herdmates", "pane-board"]
 
 [[actions]]
 id = "open-pane-board"
@@ -91,28 +98,28 @@ action = "open-report"
 # HERDR_PLUGIN_EVENT_JSON uses the underscore form (spec section 9).
 [[events]]
 on = "pane.agent_status_changed"
-command = ["target/release/herdmates", "on-agent-status"]
+command = ["herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.moved"
-command = ["target/release/herdmates", "on-agent-status"]
+command = ["herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.exited"
-command = ["target/release/herdmates", "on-agent-status"]
+command = ["herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.closed"
-command = ["target/release/herdmates", "on-agent-status"]
+command = ["herdmates", "on-agent-status"]
 
 [[events]]
 on = "workspace.closed"
-command = ["target/release/herdmates", "on-agent-status"]
+command = ["herdmates", "on-agent-status"]
 
 [[events]]
 on = "worktree.removed"
-command = ["target/release/herdmates", "on-agent-status"]
+command = ["herdmates", "on-agent-status"]
 
 [[events]]
 on = "pane.agent_detected"
-command = ["target/release/herdmates", "on-agent-status"]
+command = ["herdmates", "on-agent-status"]
