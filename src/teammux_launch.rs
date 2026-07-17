@@ -1,14 +1,19 @@
-//! `herdmates teammux-launch` (issue #85 commit 8): stand up a lead
-//! `claude` session whose native tmux teammate mode is translated to
-//! herdr panes by the `teammux` shim.
+//! `herdmates teammux-launch` (issue #85 commit 8; takeover default
+//! #103): stand up a lead `claude` session whose native tmux teammate
+//! mode is translated to herdr panes by the `teammux` shim.
 //!
-//! Flow: split a new herdr pane off the calling pane, install a `tmux`
-//! symlink to the `teammux` binary in a shim bin dir, seed the idmap
-//! (`%0`/`@0` → the lead pane/tab), then launch the lead `claude` in the
-//! new pane with `PATH` prepended, a fake `TMUX`/`TMUX_PANE` environment
+//! DEFAULT flow (#103, takeover): the CALLING pane becomes the lead —
+//! install a `tmux` symlink to the `teammux` binary in a shim bin dir,
+//! seed the idmap (`%0` → the calling pane, `@0` → its tab, tab mapping
+//! skipped if `pane get` can't resolve it), then **exec** `claude` in
+//! place with `PATH` prepended, a fake `TMUX`/`TMUX_PANE` environment
 //! (cmux correction: no real tmux anywhere), scoped settings
 //! (`teammateMode: tmux`), and `TEAMMUX_STATE_PATH` pointing at the
-//! per-lead idmap file.
+//! per-lead idmap file. All trailing args pass through to claude.
+//!
+//! `--split` (recognized as the FIRST arg only, so claude's own flags
+//! are never swallowed) keeps the original behavior: split a new herdr
+//! pane off the caller and launch the lead there via `pane run`.
 //!
 //! Command construction is pure and unit-tested; `launch` takes the
 //! state root as a parameter (never reads env internally — same
@@ -112,7 +117,22 @@ pub fn sibling_teammux(current_exe: &Path) -> Result<PathBuf, TeammuxLaunchError
     }
 }
 
-/// `herdmates teammux-launch [claude args...]`
+/// Pure: split `--split` (first arg only) off the passthrough claude args.
+pub(crate) fn parse_launch_args(args: &[String]) -> (bool, &[String]) {
+    match args.first().map(String::as_str) {
+        Some("--split") => (true, &args[1..]),
+        _ => (false, args),
+    }
+}
+
+/// Pure: the argv tail claude is exec'd with in takeover mode.
+pub(crate) fn lead_exec_args(claude_args: &[String]) -> Vec<String> {
+    let mut argv = vec!["--settings".to_owned(), LEAD_SETTINGS.to_owned()];
+    argv.extend(claude_args.iter().cloned());
+    argv
+}
+
+/// `herdmates teammux-launch [--split] [claude args...]`
 pub fn teammux_launch_command(args: &[String]) -> Result<(), TeammuxLaunchError> {
     let caller_pane =
         std::env::var("HERDR_PANE_ID").map_err(|_| TeammuxLaunchError::NoCallerPane)?;
@@ -121,15 +141,76 @@ pub fn teammux_launch_command(args: &[String]) -> Result<(), TeammuxLaunchError>
     let current_exe = std::env::current_exe()?;
     let teammux_binary = sibling_teammux(&current_exe)?;
     let current_path = std::env::var("PATH").unwrap_or_default();
-    launch(
-        &herdr,
-        &caller_pane,
-        &state_root,
-        &teammux_binary,
-        &current_path,
-        args,
-        &mut std::io::stdout(),
-    )
+    let (split, claude_args) = parse_launch_args(args);
+    if split {
+        launch(
+            &herdr,
+            &caller_pane,
+            &state_root,
+            &teammux_binary,
+            &current_path,
+            claude_args,
+            &mut std::io::stdout(),
+        )
+    } else {
+        // Takeover (#103 default): this pane becomes the lead. The tab
+        // mapping degrades to pane-only when unresolvable — window-level
+        // shim verbs then miss `@0`, pane-level ones still work.
+        let lead_tab_id = herdr
+            .pane_get(&caller_pane)
+            .ok()
+            .and_then(|pane| pane.tab_id);
+        let env_pairs = seed_lead_state(
+            &state_root,
+            &teammux_binary,
+            &current_path,
+            &caller_pane,
+            lead_tab_id.as_deref(),
+        )?;
+        // exec only returns on failure.
+        Err(exec_lead(&env_pairs, claude_args))
+    }
+}
+
+/// Shared lead-state seeding for both modes: idmap (`%0`/`@0`), shim
+/// symlink, and the composed lead environment.
+fn seed_lead_state(
+    state_root: &Path,
+    teammux_binary: &Path,
+    current_path: &str,
+    lead_pane_id: &str,
+    lead_tab_id: Option<&str>,
+) -> Result<Vec<(String, String)>, TeammuxLaunchError> {
+    std::fs::create_dir_all(state_root)?;
+    let state_path = state_root.join(format!("{}.json", lead_pane_id.replace(':', "_")));
+    IdMap::insert(&state_path, LEAD_TMUX_PANE, lead_pane_id)?;
+    if let Some(tab_id) = lead_tab_id {
+        IdMap::insert(&state_path, LEAD_TMUX_WINDOW, tab_id)?;
+    }
+    let shim_bin_dir = state_root.join("bin");
+    #[cfg(unix)]
+    install_shim(&shim_bin_dir, teammux_binary)?;
+    Ok(lead_env(&shim_bin_dir, &state_path, current_path))
+}
+
+/// Replace this process with the lead `claude` (takeover mode). Returns
+/// only when exec itself fails.
+#[cfg(unix)]
+fn exec_lead(env_pairs: &[(String, String)], claude_args: &[String]) -> TeammuxLaunchError {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new("claude");
+    command.args(lead_exec_args(claude_args));
+    for (key, value) in env_pairs {
+        command.env(key, value);
+    }
+    TeammuxLaunchError::Io(command.exec())
+}
+
+#[cfg(not(unix))]
+fn exec_lead(_env_pairs: &[(String, String)], _claude_args: &[String]) -> TeammuxLaunchError {
+    TeammuxLaunchError::Io(io::Error::other(
+        "takeover mode requires unix exec; use --split",
+    ))
 }
 
 fn launch(
@@ -143,18 +224,13 @@ fn launch(
 ) -> Result<(), TeammuxLaunchError> {
     let lead = herdr.pane_split_pane(caller_pane, "right", None)?;
 
-    std::fs::create_dir_all(state_root)?;
-    let state_path = state_root.join(format!("{}.json", lead.pane_id.replace(':', "_")));
-    IdMap::insert(&state_path, LEAD_TMUX_PANE, lead.pane_id.as_str())?;
-    if let Some(tab_id) = lead.tab_id.as_deref() {
-        IdMap::insert(&state_path, LEAD_TMUX_WINDOW, tab_id)?;
-    }
-
-    let shim_bin_dir = state_root.join("bin");
-    #[cfg(unix)]
-    install_shim(&shim_bin_dir, teammux_binary)?;
-
-    let env_pairs = lead_env(&shim_bin_dir, &state_path, current_path);
+    let env_pairs = seed_lead_state(
+        state_root,
+        teammux_binary,
+        current_path,
+        &lead.pane_id,
+        lead.tab_id.as_deref(),
+    )?;
     let command_line = lead_command_line(&env_pairs, claude_args);
     herdr.pane_run(&lead.pane_id, &command_line)?;
 
@@ -162,7 +238,9 @@ fn launch(
         out,
         "lead pane {} launched (state {})",
         lead.pane_id,
-        state_path.display()
+        state_root
+            .join(format!("{}.json", lead.pane_id.replace(':', "_")))
+            .display()
     )?;
     Ok(())
 }
@@ -204,6 +282,38 @@ mod tests {
         assert!(pairs.contains(&("TMUX".to_owned(), FAKE_TMUX.to_owned())));
         assert!(pairs.contains(&("TMUX_PANE".to_owned(), "%0".to_owned())));
         assert!(pairs.contains(&(STATE_PATH_ENV.to_owned(), "/state/lead.json".to_owned())));
+    }
+
+    #[test]
+    fn parse_launch_args_strips_leading_split_flag_only() {
+        let args = vec!["--split".to_owned(), "--resume".to_owned()];
+        let (split, rest) = parse_launch_args(&args);
+        assert!(split);
+        assert_eq!(rest, ["--resume".to_owned()]);
+
+        // `--split` NOT in first position belongs to claude, never to us.
+        let args = vec!["--resume".to_owned(), "--split".to_owned()];
+        let (split, rest) = parse_launch_args(&args);
+        assert!(!split);
+        assert_eq!(rest, args.as_slice());
+
+        let (split, rest) = parse_launch_args(&[]);
+        assert!(!split);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn lead_exec_args_prepend_settings_then_pass_through() {
+        let argv = lead_exec_args(&["--resume".to_owned(), "abc".to_owned()]);
+        assert_eq!(
+            argv,
+            [
+                "--settings".to_owned(),
+                LEAD_SETTINGS.to_owned(),
+                "--resume".to_owned(),
+                "abc".to_owned(),
+            ]
+        );
     }
 
     #[test]
