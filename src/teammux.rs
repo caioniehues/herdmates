@@ -481,6 +481,9 @@ fn window_geometry<H: HerdrApi>(
 
 /// `list-panes -t @N -F #{pane_id}`: enumerate the panes herdr reports for
 /// the tab `window` maps to, translating each back to its tmux `%N` id.
+/// Panes with no idmap entry (foreign panes sharing the tab) are lazily
+/// assigned a fresh `%N` and persisted — tmux semantics: every pane in a
+/// window always has a valid id.
 fn list_pane_ids<H: HerdrApi>(herdr: &H, idmap: &IdMap, window: &TmuxId) -> DispatchOutcome {
     let herdr_tab_id = match idmap.lookup(window.as_str()) {
         Some(id) => id.to_owned(),
@@ -503,11 +506,21 @@ fn list_pane_ids<H: HerdrApi>(herdr: &H, idmap: &IdMap, window: &TmuxId) -> Disp
         match idmap.reverse_lookup(&pane.pane_id) {
             Some(tmux_id) => tmux_ids.push(tmux_id.to_owned()),
             None => {
-                return DispatchOutcome::Error {
-                    message: format!(
-                        "teammux: list-panes: herdr pane `{}` in tab `{herdr_tab_id}` has no tmux id registered in idmap",
-                        pane.pane_id
-                    ),
+                // A pane this teammux session never created — a human's own
+                // pane or another session sharing the tab. Real tmux reports
+                // every pane in the window with a valid id, so mint one
+                // lazily instead of failing the whole enumeration (live E2E
+                // blocker, docs/research/teammux-e2e-2026-07-16/).
+                match IdMap::allocate(idmap.path(), '%', pane.pane_id.clone()) {
+                    Ok(tmux_id) => tmux_ids.push(tmux_id),
+                    Err(error) => {
+                        return DispatchOutcome::Error {
+                            message: format!(
+                                "teammux: list-panes: failed to lazily register herdr pane `{}` in tab `{herdr_tab_id}`: {error}",
+                                pane.pane_id
+                            ),
+                        }
+                    }
                 }
             }
         }
@@ -979,10 +992,16 @@ mod tests {
     }
 
     #[test]
-    fn list_pane_ids_fails_loudly_on_an_orphan_pane_missing_from_idmap() {
-        let idmap = temp_idmap(&[("@0", "w1A:t1")]);
+    fn list_pane_ids_lazily_registers_a_foreign_pane_missing_from_idmap() {
+        // Live E2E blocker regression (docs/research/teammux-e2e-2026-07-16/):
+        // a tab holding one self-registered pane and one foreign pane must
+        // enumerate BOTH, minting a persistent %N for the foreign one.
+        let idmap = temp_idmap(&[("@0", "w1A:t1"), ("%0", "w1A:p15")]);
         let fake = FakeHerdr::default();
-        *fake.panes.borrow_mut() = vec![pane("w1A:pOrphan", Some("w1A:t1"))];
+        *fake.panes.borrow_mut() = vec![
+            pane("w1A:p15", Some("w1A:t1")),
+            pane("w1A:pForeign", Some("w1A:t1")),
+        ];
 
         let outcome = dispatch(
             &fake,
@@ -991,12 +1010,15 @@ mod tests {
                 window: TmuxId::parse("@0").unwrap(),
             }),
         );
-        match outcome {
-            DispatchOutcome::Error { message } => {
-                assert!(message.contains("no tmux id registered"));
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: "%0\n%1\n".to_owned()
             }
-            other => panic!("expected an Error outcome, got {other:?}"),
-        }
+        );
+
+        let reloaded = IdMap::load(idmap.path()).expect("reload idmap after lazy registration");
+        assert_eq!(reloaded.lookup("%1"), Some("w1A:pForeign"));
     }
 
     #[test]
