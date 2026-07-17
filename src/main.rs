@@ -37,9 +37,13 @@ fn main() -> ExitCode {
         "teammux-launch" => exit(teammux_launch::teammux_launch_command(&args)),
         "jump" => exit(jump::jump_command(&args)),
         "focus" => exit(focus_pane::focus_pane_command(&args)),
+        // Issue #97 stage 2 (ADR-0013 §93 stage 2, docs/spec.md §4): minimal
+        // recorder — polls the gather + signal-engine pipeline and appends
+        // classified-observation deltas to an append-only JSONL log.
+        "record" => exit(recorder::record_command(&args)),
         "" | "help" | "--help" | "-h" => {
             eprintln!(
-                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|teammux-launch|jump|focus>"
+                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|teammux-launch|jump|focus|record>"
             );
             ExitCode::SUCCESS
         }

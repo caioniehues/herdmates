@@ -24,7 +24,7 @@
 /// `Option`s are `None` when the source has no answer, not when it wasn't
 /// consulted — the caller is expected to always consult every source it can
 /// reach; a `None` here is what drives the degradation rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct ObservedFacts {
     /// Herdr `agent_status`, verbatim. Pane-backed ground truth for the
     /// permission-prompt class — never inferred from any other signal.
@@ -43,7 +43,7 @@ pub struct ObservedFacts {
 
 /// Coarse activity read off `herdr::AgentInfo::status`. `Unknown` covers a
 /// missing field and any status string this engine doesn't model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum AgentActivity {
     Working,
     Idle,
@@ -93,7 +93,7 @@ impl Default for StalledThresholds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum StalledTier {
     Quiet,
     Stalled,
@@ -101,7 +101,7 @@ pub enum StalledTier {
 
 /// One reason class, precedence order top-to-bottom matches variant order
 /// (`PermissionPrompt` outranks everything below it).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum WaitingReason {
     PermissionPrompt,
     BlockedOnDependency,
