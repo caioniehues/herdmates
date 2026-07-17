@@ -55,6 +55,11 @@ pub struct WorktreeRef {
 pub struct PaneInfo {
     pub pane_id: String,
     pub workspace_id: String,
+    /// Live-verified present on every `pane get`/`pane rename` response
+    /// (herdr 0.7.4). Needed to jump to a specific pane by id (#86 commit
+    /// 5): there is no `pane focus <pane_id>` verb, only directional
+    /// `pane focus --direction` and `pane zoom <pane_id>`, so the jump path
+    /// is `workspace focus` + `tab focus` resolved from here.
     pub tab_id: Option<String>,
     pub agent: Option<String>,
     pub agent_id: Option<String>,
@@ -257,6 +262,18 @@ pub trait HerdrApi {
     /// window_width,window_height}` (issue #85 commit 8): the target pane's
     /// tab layout, geometry's only herdr source.
     fn pane_layout(&self, _pane_id: &str) -> Result<PaneLayoutSnapshot, HerdrError> {
+        Err(unsupported_api())
+    }
+    /// Bring a workspace's tab into view (`herdr workspace focus`). There is
+    /// no `pane focus <pane_id>` verb (live-verified via `herdr pane --help`,
+    /// #86 commit 5) — jumping to a specific pane is `workspace focus` +
+    /// [`Self::tab_focus`] resolved from [`Self::pane_get`]'s `tab_id`.
+    fn workspace_focus(&self, _: &str) -> Result<(), HerdrError> {
+        Err(unsupported_api())
+    }
+    /// Bring a specific tab into view (`herdr tab focus`). See
+    /// [`Self::workspace_focus`].
+    fn tab_focus(&self, _: &str) -> Result<(), HerdrError> {
         Err(unsupported_api())
     }
     fn api_schema(&self) -> Result<String, HerdrError> {
@@ -490,6 +507,18 @@ impl HerdrClient {
         parse_pane_layout(&stdout).map_err(|message| self.invalid_response(&args, message))
     }
 
+    pub fn workspace_focus(&self, workspace_id: &str) -> Result<(), HerdrError> {
+        let args = args(["workspace", "focus"]).with(workspace_id).finish();
+        self.invoke(&args)?;
+        Ok(())
+    }
+
+    pub fn tab_focus(&self, tab_id: &str) -> Result<(), HerdrError> {
+        let args = args(["tab", "focus"]).with(tab_id).finish();
+        self.invoke(&args)?;
+        Ok(())
+    }
+
     pub fn api_schema(&self) -> Result<String, HerdrError> {
         self.invoke(&args(["api", "schema", "--json"]).finish())
     }
@@ -656,6 +685,12 @@ impl HerdrApi for HerdrClient {
     }
     fn pane_layout(&self, pane_id: &str) -> Result<PaneLayoutSnapshot, HerdrError> {
         Self::pane_layout(self, pane_id)
+    }
+    fn workspace_focus(&self, workspace_id: &str) -> Result<(), HerdrError> {
+        Self::workspace_focus(self, workspace_id)
+    }
+    fn tab_focus(&self, tab_id: &str) -> Result<(), HerdrError> {
+        Self::tab_focus(self, tab_id)
     }
     fn api_schema(&self) -> Result<String, HerdrError> {
         Self::api_schema(self)
@@ -927,6 +962,16 @@ pub(crate) mod test_support {
         fn agent_list(&self) -> Result<Vec<AgentInfo>, HerdrError> {
             self.calls.borrow_mut().push("agent_list".to_owned());
             Ok(self.agents.borrow().clone())
+        }
+        fn workspace_focus(&self, workspace_id: &str) -> Result<(), HerdrError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("workspace_focus:{workspace_id}"));
+            Ok(())
+        }
+        fn tab_focus(&self, tab_id: &str) -> Result<(), HerdrError> {
+            self.calls.borrow_mut().push(format!("tab_focus:{tab_id}"));
+            Ok(())
         }
         fn pane_get(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
             self.calls.borrow_mut().push(format!("pane_get:{pane_id}"));

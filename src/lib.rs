@@ -8,11 +8,16 @@
 
 pub mod adopt;
 pub mod agents_md;
+pub mod attention;
+pub mod audit;
 pub mod board;
+pub mod focus_pane;
+pub mod focusfile;
 pub mod god_cli;
 pub mod herdr;
 pub mod hook;
 pub mod idmap;
+pub mod jump;
 pub mod launcher;
 pub mod metadata;
 pub mod msg;

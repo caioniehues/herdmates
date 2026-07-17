@@ -35,9 +35,11 @@ fn main() -> ExitCode {
         "on-agent-status" => exit(hook::hook_command()),
         "pump-board" => exit(pump::pump_board_command(&args)),
         "teammux-launch" => exit(teammux_launch::teammux_launch_command(&args)),
+        "jump" => exit(jump::jump_command(&args)),
+        "focus" => exit(focus_pane::focus_pane_command(&args)),
         "" | "help" | "--help" | "-h" => {
             eprintln!(
-                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|teammux-launch>"
+                "herdmates <adopt|board|spawn|status|kill|inbox|report|wait|msg|open-report|on-agent-status|pump-board|teammux-launch|jump|focus>"
             );
             ExitCode::SUCCESS
         }

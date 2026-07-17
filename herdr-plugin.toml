@@ -38,12 +38,31 @@ title = "Open team report"
 contexts = ["pane"]
 command = ["target/release/herdmates", "open-report"]
 
+[[actions]]
+id = "jump"
+title = "Jump to next attention item"
+contexts = ["workspace"]
+command = ["target/release/herdmates", "jump"]
+
 [[panes]]
 id = "board"
 title = "Agent Team control deck"
 description = "Keyboard-driven worker controls; open as a tab or override placement for a quick popup."
 placement = "tab"
 command = ["target/release/herdmates", "board"]
+
+[[panes]]
+id = "focus"
+title = "Focus"
+description = "One-next-action focus file + decision queue. A real split/overlay pane — never a popup."
+placement = "split"
+command = ["target/release/herdmates", "focus"]
+
+[[actions]]
+id = "open-focus"
+title = "Open focus pane"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin caioniehues.herdmates --entrypoint focus --placement split"]
 
 [[link_handlers]]
 id = "report"
