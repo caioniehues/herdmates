@@ -25,6 +25,7 @@ pub mod paths;
 pub mod pump;
 pub mod reconcile;
 pub mod run;
+pub mod signal_engine;
 pub mod socket;
 #[cfg(unix)]
 pub mod socket_backend;

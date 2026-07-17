@@ -28,6 +28,7 @@
 
 use crate::focusfile::{stable_id, FocusFile};
 use crate::herdr::AgentInfo;
+use crate::signal_engine::{self, AgentActivity, ObservedFacts, StalledThresholds, WaitingReason};
 use crate::teamfiles::Teammate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -64,7 +65,13 @@ pub fn build_attention_queue(
     let mut items = Vec::new();
 
     for agent in agents {
-        if agent.status.as_deref() == Some("blocked") {
+        let facts = ObservedFacts {
+            agent_status: AgentActivity::from_status_str(agent.status.as_deref()),
+            ..Default::default()
+        };
+        if signal_engine::classify(&facts, &StalledThresholds::default())
+            == WaitingReason::PermissionPrompt
+        {
             items.push(AttentionItem {
                 id: format!("blocked:{}", agent.pane_id),
                 kind: AttentionKind::Blocked,
