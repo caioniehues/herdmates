@@ -187,7 +187,12 @@ pub fn pump_once<H: HerdrApi>(paths: &GatherPaths, herdr: &H) {
         let reason = signal_engine::classify(&lead_facts.facts, &thresholds);
         let state = brain::five_state(lead_facts.facts.agent_status, reason);
 
-        let token_set = tokens::teammate_tokens(lead, state);
+        // The reap count is the team's, not the lead's own state: how many
+        // of its teammates finished and are still running (brain::
+        // reapable_count over the same `facts` the state above came from,
+        // so the sidebar and `roster` cannot disagree — rule #90).
+        let token_set =
+            tokens::teammate_tokens(lead, state, brain::reapable_count(&facts, &thresholds));
         let pairs = token_set
             .into_iter()
             .map(|token| (token.name, token.value))
@@ -246,7 +251,7 @@ pub fn resolve_lead_pane(config: &TeamConfig, agents: &[AgentInfo]) -> Option<St
 mod tests {
     use super::*;
     use crate::brain::FiveState;
-    use crate::herdr::{test_support::FakeHerdr, AgentSession};
+    use crate::herdr::{test_support::FakeHerdr, AgentSession, PaneInfo};
     use crate::teamfiles::{Member, Teammate};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -285,6 +290,28 @@ mod tests {
             teams_root: teams_root.to_path_buf(),
             tasks_root: teams_root.join("__tasks_unused"),
             projects_root: teams_root.join("__projects_unused"),
+        }
+    }
+
+    /// A teammate's herdr pane as `pane list` reports one: no detected
+    /// agent (Defect D), a `display_agent` herdmates published, and the
+    /// teammate's own session id under herdr's official claude source.
+    fn teammate_pane(pane_id: &str, display_agent: &str, session_value: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_owned(),
+            workspace_id: "w4".to_owned(),
+            tab_id: None,
+            agent: None,
+            agent_id: None,
+            agent_session: Some(AgentSession {
+                source: "herdr:claude".to_owned(),
+                agent: "claude".to_owned(),
+                kind: "id".to_owned(),
+                value: session_value.to_owned(),
+            }),
+            agent_status: Some("unknown".to_owned()),
+            display_agent: Some(display_agent.to_owned()),
+            cwd: None,
         }
     }
 
@@ -432,6 +459,57 @@ mod tests {
     // ── pump_once (integration smoke) ───────────────────────────────────────
 
     #[test]
+    fn pump_once_publishes_a_reap_token_when_a_teammate_finished_and_was_never_stopped() {
+        // End-to-end over the real pipeline: a team config naming a
+        // split-pane teammate, that teammate's herdr pane carrying the
+        // display_agent herdmates publishes plus its own session id, and
+        // that session's transcript declaring the matching agentName /
+        // teamName with an mtime well past the hard stalled threshold.
+        let temp = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: temp.path().join("teams"),
+            tasks_root: temp.path().join("tasks"),
+            projects_root: temp.path().join("projects"),
+        };
+        write_team(
+            &paths.teams_root,
+            "session-t",
+            "lead-session",
+            r#", {"agentId":"beta@session-t","name":"beta","agentType":"general-purpose","tmuxPaneId":"%1","backendType":"tmux"}"#,
+        );
+        let transcript_dir = paths.projects_root.join("proj1");
+        fs::create_dir_all(&transcript_dir).expect("create transcript dir");
+        fs::write(
+            transcript_dir.join("mate-session.jsonl"),
+            "{\"type\":\"user\",\"agentName\":\"beta\",\"teamName\":\"session-t\"}\n",
+        )
+        .expect("write transcript");
+        let stale = SystemTime::now() - std::time::Duration::from_secs(3 * 3_600);
+        fs::File::options()
+            .write(true)
+            .open(transcript_dir.join("mate-session.jsonl"))
+            .expect("reopen transcript")
+            .set_modified(stale)
+            .expect("age the transcript");
+
+        let fake = FakeHerdr::default();
+        *fake.agents.borrow_mut() = vec![agent_with_session("w1:pLead", "lead-session")];
+        *fake.panes.borrow_mut() = vec![teammate_pane("w4:p14", "beta", "mate-session")];
+
+        pump_once(&paths, &fake);
+
+        let published = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("pane_report_tokens"))
+            .expect("the lead's tokens were published");
+        assert!(
+            published.contains("reap=1 to stop"),
+            "published tokens were: {published}"
+        );
+    }
+
+    #[test]
     fn pump_once_publishes_tokens_for_resolvable_lead_and_skips_unresolvable_team() {
         let temp = TempDir::new();
         write_team(temp.path(), "session-resolvable", "resolvable-session", "");
@@ -555,7 +633,7 @@ mod tests {
         let teammates = teamfiles::build_teammates(&config, &BTreeMap::new());
         let lead: &Teammate = teammates.iter().find(|t| t.is_lead).unwrap();
 
-        let token_set = tokens::teammate_tokens(lead, FiveState::Online);
+        let token_set = tokens::teammate_tokens(lead, FiveState::Online, 0);
 
         assert_eq!(
             token_set

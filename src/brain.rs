@@ -305,13 +305,67 @@ pub(crate) fn render_deadlocks(team: &str, suspects: &[DeadlockSuspect]) -> Stri
     out
 }
 
+// ─── reaping ────────────────────────────────────────────────────────────────
+
+/// Pure: is `member` a finished-but-unreaped teammate — one the lead
+/// should either give more work or stop?
+///
+/// A Claude Code teammate is a persistent interactive session: finishing
+/// its task does not end it. Two were measured alive at 3h58m and 3h14m
+/// after reporting back (findings §2), and `TaskStop` is the only thing
+/// that reaps one — pane closed, idmap entry dropped, registry row deleted,
+/// all verified live. Nothing invoked it because nothing told the lead a
+/// teammate was done. This predicate is that signal.
+///
+/// Three conditions, and each one is doing work:
+///
+/// - **Not the lead.** Stopping the lead is not what a reap hint means.
+/// - **`FiveState::Stale`**, i.e. `signal_engine`'s HARD stalled tier: the
+///   teammate's own transcript has not moved for `stalled_secs`. The
+///   classification is not re-derived here — single-source rule #90, the
+///   engine owns it and the sidebar sees the same verdict.
+/// - **A resolved pane.** Without one nothing has confirmed this member is
+///   still running: the row may be a leftover whose pane was closed by
+///   hand, or herdr may just not have answered. Claiming a live session
+///   either way would be a guess.
+///
+/// Deliberately NOT part of this: rewriting or purging the member's
+/// registry row. The teammate is genuinely alive and the lead can still
+/// message it — the record is honest and falsifying it would be worse than
+/// the symptom (findings §3). This only surfaces; a human or the lead acts.
+pub(crate) fn reapable(member: &TeammateFacts, state: FiveState) -> bool {
+    !member.is_lead && member.pane_id.is_some() && matches!(state, FiveState::Stale)
+}
+
+/// Pure: how many of `members` are finished-but-unreaped teammates.
+pub(crate) fn reapable_count(members: &[TeammateFacts], thresholds: &StalledThresholds) -> usize {
+    members
+        .iter()
+        .filter(|member| {
+            let reason = signal_engine::classify(&member.facts, thresholds);
+            reapable(member, five_state(member.facts.agent_status, reason))
+        })
+        .count()
+}
+
 // ─── roster ─────────────────────────────────────────────────────────────────
 
 /// Pure: dense plain-text roster — one line per member, state + engine
-/// reason + pane. Non-lead members always classify from `Unknown`
-/// `agent_status` (documented gap: `gather::gather_team`'s doc comment —
-/// only the lead resolves to a herdr session pre-shim) so their line is
-/// footnoted rather than silently presented as equally grounded.
+/// reason + pane, plus a reap hint for every teammate that has finished
+/// and not been stopped.
+///
+/// Two notes can follow the list and each is conditional on what the
+/// roster actually contains, so neither is boilerplate:
+///
+/// - a member with no resolved pane really is degraded — nothing grounded
+///   its state (see `gather::gather_team`'s ownership rules); and
+/// - a non-lead member that DID resolve still carries `Unknown`
+///   `agent_status`, because herdr cannot hold a teammate's agent state at
+///   all (`gather::resolve_teammate_pane`'s doc comment has the measured
+///   reason). Its liveness is a real read off its own transcript, but the
+///   pane-backed classes — `needs-you` (permission prompt), `blocked` —
+///   can never fire for it. Saying so is what keeps the difference between
+///   "quiet" and "not waiting on a human" visible.
 pub(crate) fn render_roster(
     team: &str,
     members: &[TeammateFacts],
@@ -321,15 +375,25 @@ pub(crate) fn render_roster(
         return format!("team {team} has no members");
     }
     let mut out = format!("team {team} — {} member(s):\n", members.len());
-    let mut any_non_lead = false;
+    let mut any_unresolved_pane = false;
+    let mut any_resolved_non_lead = false;
+    let mut reap_count = 0usize;
     for member in members {
         let reason = signal_engine::classify(&member.facts, thresholds);
         let state = five_state(member.facts.agent_status, reason);
-        if !member.is_lead {
-            any_non_lead = true;
+        match (member.is_lead, member.pane_id.is_some()) {
+            (_, false) => any_unresolved_pane = true,
+            (false, true) => any_resolved_non_lead = true,
+            (true, true) => {}
         }
+        let reap_hint = if reapable(member, state) {
+            reap_count += 1;
+            format!(" — finished? reap it: TaskStop {}", member.name)
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "  {} [{}] {} — {}, pane {}\n",
+            "  {} [{}] {} — {}, pane {}{reap_hint}\n",
             member.name,
             if member.is_lead { "lead" } else { "member" },
             state.label(),
@@ -337,10 +401,18 @@ pub(crate) fn render_roster(
             member.pane_id.as_deref().unwrap_or("unresolved"),
         ));
     }
-    if any_non_lead {
-        out.push_str("  note: non-lead members show no live agent_status (no herdr-resolvable session pre-shim, documented gather.rs gap) — their state/reason above is honestly degraded, not a real read.");
+    if reap_count > 0 {
+        out.push_str(&format!(
+            "  {reap_count} teammate(s) finished and still running — a teammate is a persistent session, so nothing ends it but TaskStop. Give it more work or stop it; do not just close the pane, which kills a live session the lead can still message.\n"
+        ));
     }
-    out
+    if any_resolved_non_lead {
+        out.push_str("  note: a non-lead member's liveness is read off its own transcript, but herdr holds no agent_status for a teammate pane (gather.rs: resolve_teammate_pane) — so needs-you/blocked can never show for one, however true they might be.\n");
+    }
+    if any_unresolved_pane {
+        out.push_str("  note: a member shown as pane `unresolved` grounded nothing — no pane means no confirmed live session, so its state/reason is an honest degrade rather than a real read.\n");
+    }
+    out.trim_end().to_owned()
 }
 
 // ─── command wiring (impure shell) ─────────────────────────────────────────
@@ -691,8 +763,128 @@ mod tests {
         assert!(rendered.contains("suspicion only"));
     }
 
+    // ── reapability (issue: nothing reaps a finished teammate) ──────────────
+
+    /// A member with a resolved pane and a transcript quiet past the hard
+    /// stalled threshold — the shape a finished-but-unstopped split-pane
+    /// teammate has.
+    fn quiet_teammate(
+        name: &str,
+        is_lead: bool,
+        pane: Option<&str>,
+        quiet_secs: u64,
+    ) -> TeammateFacts {
+        TeammateFacts {
+            name: name.to_owned(),
+            agent_id: format!("{name}@t"),
+            is_lead,
+            facts: ObservedFacts {
+                seconds_since_transcript_activity: Some(quiet_secs),
+                ..ObservedFacts::default()
+            },
+            pane_id: pane.map(str::to_owned),
+        }
+    }
+
     #[test]
-    fn render_roster_footnotes_the_non_lead_status_gap() {
+    fn a_stale_non_lead_member_with_a_live_pane_is_reapable() {
+        let member = quiet_teammate("fix3-imp3093", false, Some("w3:p22"), 3 * 3_600);
+        let state = five_state(
+            member.facts.agent_status,
+            signal_engine::classify(&member.facts, &StalledThresholds::default()),
+        );
+
+        assert_eq!(state, FiveState::Stale);
+        assert!(reapable(&member, state));
+    }
+
+    #[test]
+    fn a_lead_is_never_reapable_however_quiet_it_is() {
+        let lead = quiet_teammate("team-lead", true, Some("w3:p21"), 3 * 3_600);
+        let state = five_state(
+            lead.facts.agent_status,
+            signal_engine::classify(&lead.facts, &StalledThresholds::default()),
+        );
+
+        assert_eq!(state, FiveState::Stale);
+        assert!(
+            !reapable(&lead, state),
+            "stopping the lead is not what a reap hint means"
+        );
+    }
+
+    #[test]
+    fn a_member_whose_pane_never_resolved_is_not_called_reapable() {
+        // No pane means nothing confirmed this member is still running —
+        // the row may be a leftover, or herdr may simply not have answered.
+        // Either way there is no live session to claim, so no hint.
+        let member = quiet_teammate("ghost", false, None, 3 * 3_600);
+        let state = five_state(
+            member.facts.agent_status,
+            signal_engine::classify(&member.facts, &StalledThresholds::default()),
+        );
+
+        assert!(!reapable(&member, state));
+    }
+
+    #[test]
+    fn a_member_still_inside_the_stalled_threshold_is_not_reapable() {
+        let member = quiet_teammate("busy", false, Some("w3:p22"), 60);
+        let state = five_state(
+            member.facts.agent_status,
+            signal_engine::classify(&member.facts, &StalledThresholds::default()),
+        );
+
+        assert_ne!(state, FiveState::Stale);
+        assert!(!reapable(&member, state));
+    }
+
+    #[test]
+    fn render_roster_prints_the_reap_hint_only_for_reapable_members() {
+        let members = [
+            quiet_teammate("team-lead", true, Some("w3:p21"), 3 * 3_600),
+            quiet_teammate("fix3-imp3093", false, Some("w3:p22"), 3 * 3_600),
+            quiet_teammate("busy", false, Some("w3:p23"), 30),
+        ];
+
+        let rendered = render_roster("team-x", &members, &StalledThresholds::default());
+
+        assert!(
+            rendered.contains("TaskStop fix3-imp3093"),
+            "the finished teammate gets the reap hint; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("TaskStop busy"),
+            "a teammate that is still producing output does not; rendered:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("TaskStop team-lead"),
+            "the lead is never a reap target; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_roster_says_how_many_teammates_are_waiting_to_be_reaped() {
+        let members = [
+            quiet_teammate("team-lead", true, Some("w3:p21"), 10),
+            quiet_teammate("a", false, Some("w3:p22"), 3 * 3_600),
+            quiet_teammate("b", false, Some("w3:p23"), 3 * 3_600),
+        ];
+
+        let rendered = render_roster("team-x", &members, &StalledThresholds::default());
+
+        assert!(
+            rendered.contains("2 teammate(s) finished"),
+            "rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_roster_footnotes_members_whose_pane_never_resolved() {
+        // Both members here have `pane_id: None`, which after the ownership
+        // rules in gather.rs means nothing grounded their state — the note
+        // has to say that rather than the old blanket claim that non-lead
+        // members can never resolve, which they now can.
         let members = [
             member("team-lead", "lead@t", true),
             member("alpha", "alpha@t", false),
@@ -700,7 +892,23 @@ mod tests {
         let rendered = render_roster("team-x", &members, &StalledThresholds::default());
         assert!(rendered.contains("team-lead"));
         assert!(rendered.contains("alpha"));
-        assert!(rendered.contains("documented gather.rs gap"));
+        assert!(rendered.contains("no confirmed live session"));
+    }
+
+    #[test]
+    fn render_roster_footnotes_the_teammate_agent_status_gap_only_when_one_resolved() {
+        let unresolved = [member("alpha", "alpha@t", false)];
+        assert!(
+            !render_roster("team-x", &unresolved, &StalledThresholds::default())
+                .contains("herdr holds no agent_status"),
+            "the note is about resolved teammates; an unresolved one is a different degrade"
+        );
+
+        let resolved = [quiet_teammate("alpha", false, Some("w1:p2"), 30)];
+        assert!(
+            render_roster("team-x", &resolved, &StalledThresholds::default())
+                .contains("herdr holds no agent_status")
+        );
     }
 
     #[test]

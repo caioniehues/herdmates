@@ -154,10 +154,35 @@ pub fn dispatch<H: HerdrApi>(
             "set-option -w -t {} pane-border-status top",
             window.as_str()
         )),
-        Verb::SetRemainOnExit { pane, mode } => styling_noop(format!(
-            "set-option -p -t {} remain-on-exit {mode}",
-            pane.as_str()
-        )),
+        // NOT a styling verb, however much it looks like the ones above it.
+        // `remain-on-exit` is the PANE-LIFETIME verb, and Claude Code sets it
+        // immediately before `respawn-pane -k` (bundle offset 195804110):
+        // together they say "replace this pane's process with the agent, and
+        // when the agent exits cleanly destroy the pane; keep it only if it
+        // failed". Both halves are gone here — this is a no-op, and
+        // `respawn_pane` maps onto `pane run`, which submits into the pane's
+        // existing shell rather than replacing its process, so pane lifetime
+        // is decoupled from teammate lifetime either way.
+        //
+        // It costs nothing today only because a Claude Code teammate never
+        // exits on its own (findings §2: measured alive 3h58m after
+        // finishing) — the reap path is `TaskStop`, which `kill_pane` already
+        // implements correctly. It has its own arm so the next reader does
+        // not re-file a lifetime verb under `pane-border-style`, which is how
+        // the layout bug below stayed hidden.
+        Verb::SetRemainOnExit { pane, mode } => {
+            if std::env::var_os("TEAMMUX_LOG").is_some() {
+                eprintln!(
+                    "teammux: set-option -p -t {} remain-on-exit {mode}: no-op — herdr has no \
+                     pane-lifetime option, and pane lifetime is already decoupled from the \
+                     teammate process (respawn-pane maps to `pane run`)",
+                    pane.as_str()
+                );
+            }
+            DispatchOutcome::Ok {
+                stdout: String::new(),
+            }
+        }
         // A no-op because the layout it asks for is already maintained, not
         // because layout is unsupported — a different thing from the styling
         // verbs this used to be grouped with. Claude Code sends

@@ -74,10 +74,23 @@ pub(crate) fn state_value(state: FiveState) -> String {
 /// caller via `signal_engine::classify` + `brain::five_state` — this
 /// module only renders, it never re-derives the classification.
 ///
+/// `reap_count` is `brain::reapable_count` for the team this teammate
+/// leads: how many of its teammates have finished and are still running.
+/// It gets a token because a teammate is a persistent session that only
+/// `TaskStop` ends, so an accumulating count is exactly the ambient signal
+/// nothing carried before — a lead that spawned eleven agents kept eleven
+/// live sessions and had no indication of it. Zero produces no token, like
+/// every other absent source here.
+///
 /// Priority order (survives the budget cap first): `task`, `status`,
-/// `model`. A source field that is absent or empty produces no token for
+/// `reap`, `model` — `reap` above `model` because it names something to
+/// act on. A source field that is absent or empty produces no token for
 /// that name rather than an empty placeholder.
-pub(crate) fn teammate_tokens(teammate: &Teammate, state: FiveState) -> TokenSet {
+pub(crate) fn teammate_tokens(
+    teammate: &Teammate,
+    state: FiveState,
+    reap_count: usize,
+) -> TokenSet {
     let mut candidates = Vec::new();
     if let Some(task) = non_empty(teammate.task.as_deref()) {
         candidates.push(Token {
@@ -89,6 +102,12 @@ pub(crate) fn teammate_tokens(teammate: &Teammate, state: FiveState) -> TokenSet
         name: "status".to_owned(),
         value: state_value(state),
     });
+    if reap_count > 0 {
+        candidates.push(Token {
+            name: "reap".to_owned(),
+            value: format!("{reap_count} to stop"),
+        });
+    }
     if let Some(model) = non_empty(teammate.model.as_deref()) {
         candidates.push(Token {
             name: "model".to_owned(),
@@ -142,10 +161,44 @@ mod tests {
     }
 
     #[test]
+    fn a_reap_count_becomes_its_own_token_ahead_of_the_model() {
+        let set = teammate_tokens(
+            &teammate(Some("review the diff"), true, Some("claude-opus-4-8")),
+            FiveState::Online,
+            2,
+        );
+
+        let names = set
+            .tokens()
+            .iter()
+            .map(|token| token.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["task", "status", "reap", "model"]);
+        assert_eq!(
+            set.tokens()
+                .iter()
+                .find(|token| token.name == "reap")
+                .map(|token| token.value.as_str()),
+            Some("2 to stop")
+        );
+    }
+
+    #[test]
+    fn no_reap_token_when_nothing_is_waiting_to_be_reaped() {
+        let set = teammate_tokens(&teammate(None, true, None), FiveState::Online, 0);
+
+        assert!(
+            !set.tokens().iter().any(|token| token.name == "reap"),
+            "an absent count produces no token rather than a `0` placeholder"
+        );
+    }
+
+    #[test]
     fn full_teammate_produces_task_status_model_in_priority_order() {
         let set = teammate_tokens(
             &teammate(Some("write the haiku"), true, Some("claude-opus-4-8")),
             FiveState::Online,
+            0,
         );
 
         assert_eq!(
@@ -169,7 +222,7 @@ mod tests {
 
     #[test]
     fn absent_task_and_model_are_skipped_not_emitted_empty() {
-        let set = teammate_tokens(&teammate(None, false, None), FiveState::Waiting);
+        let set = teammate_tokens(&teammate(None, false, None), FiveState::Waiting, 0);
 
         assert_eq!(
             set.tokens(),
@@ -182,7 +235,7 @@ mod tests {
 
     #[test]
     fn empty_string_task_is_treated_as_absent() {
-        let set = teammate_tokens(&teammate(Some(""), true, None), FiveState::Online);
+        let set = teammate_tokens(&teammate(Some(""), true, None), FiveState::Online, 0);
 
         assert!(set.tokens().iter().all(|token| token.name != "task"));
     }
@@ -190,11 +243,11 @@ mod tests {
     #[test]
     fn status_token_reflects_passed_in_five_state() {
         assert_eq!(
-            teammate_tokens(&teammate(None, true, None), FiveState::Online).tokens()[0].value,
+            teammate_tokens(&teammate(None, true, None), FiveState::Online, 0).tokens()[0].value,
             "online"
         );
         assert_eq!(
-            teammate_tokens(&teammate(None, true, None), FiveState::NeedsYou).tokens()[0].value,
+            teammate_tokens(&teammate(None, true, None), FiveState::NeedsYou, 0).tokens()[0].value,
             "!! needs-you"
         );
     }
