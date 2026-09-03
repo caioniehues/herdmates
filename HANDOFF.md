@@ -1,7 +1,46 @@
 # Handoff — current state
 
-Updated 2026-08-21 (v3.0.0 SHIPPED; v3.1 built, unpushed; brain-layer wave
-done).
+Updated 2026-09-03. Sections below dated 2026-08-21 and earlier are still
+accurate for what they cover; the teammate-lifecycle wave on top of them is
+summarised first.
+
+## Teammate lifecycle wave (2026-09-02 / 09-03) — branch `fix/teammate-idle-self-wake`, UNPUSHED
+
+Five commits on that branch, gate clean at 365 tests. **The full record lives
+outside the repo** — `~/.claude/plans/herdmates-panes-and-stale-agents-findings.md`
+(read §10 first: what is actually true of the primitives; then the retracted
+Fix 3 and the shipped Fix 3′/Fix 4 in §6; then §8's thirteen reversals).
+
+- **Self-wake fixed** (`88df226`). A split-pane teammate's `TeammateIdle` hook
+  inherits its OWN inbox socket, so the enrichment post woke the teammate that
+  generated it — 208 injections into teammates, none into any lead. In-process
+  teammates were never affected and still deliver. Filed upstream as #133,
+  which offers a PR from a fork; **not opened.**
+- **Lead-tab arrangement fixed** (`4d87f31`, `8188a33`). Claude Code
+  binary-subdivides the lead's window then repairs it with `select-layout
+  main-vertical`, which the shim was dropping as a styling no-op while
+  honouring the `resize-pane` that accompanies it. Now arranged at split time;
+  lead at 30%, teammates in one column.
+- **Finished teammates are now visible** (`9251b49`, `f0fdcc7`, `9e63c3d`).
+  A teammate is a persistent session — one measured alive 14 h 09 m after
+  finishing — and only `TaskStop` reaps one. `roster` and `pump-board` now name
+  the teammates waiting for it. Registry rows are deliberately untouched.
+
+**Next steps, in the order they are worth doing:**
+
+1. **Nothing is installed from the last three commits.** `~/.local/bin/{herdmates,teammux}`
+   are built from this branch as of `8188a33`. A `herdr plugin update` rebuilds
+   from upstream and silently reverts everything on this branch.
+2. **File the herdr issue** for `lookup_agent` not recognising Claude Code's
+   version-path argv0 (`detect/mod.rs:193`; it already handles the same shape
+   for Muse via `is_muse_versioned_binary`). This is the root of Defect D and
+   it affects every tmux teammate, herdmates or not.
+3. **Defect E** — a lead's session id rotates and the team config keeps the
+   original, so `resolve_lead_pane` and `brain::resolve_own_team` both fail for
+   such a team (measured: 3 of 9 live teams). A live teammate's argv carries
+   `--parent-session-id <current lead session>`, which recovers it.
+4. Release when Caio says: bump the manifest + Cargo version (**owed** — these
+   commits change behaviour) and tag.
 
 ## Where things stand (2026-08-21)
 
