@@ -158,8 +158,24 @@ pub fn dispatch<H: HerdrApi>(
             "set-option -p -t {} remain-on-exit {mode}",
             pane.as_str()
         )),
+        // A no-op because the layout it asks for is already maintained, not
+        // because layout is unsupported — a different thing from the styling
+        // verbs this used to be grouped with. Claude Code sends
+        // `main-vertical` after every spawn to repair its own recursive
+        // subdivision; herdr has no layout-setting verb to replay that with,
+        // and `pane.move` is a hard no-op within one tab, so `split_window`
+        // arranges at creation time instead. Nothing is dropped here that has
+        // not already been honoured.
         Verb::SelectLayout { window, layout } => {
-            styling_noop(format!("select-layout -t {} {layout}", window.as_str()))
+            if std::env::var_os("TEAMMUX_LOG").is_some() {
+                eprintln!(
+                    "teammux: select-layout -t {} {layout}: already arranged at split time",
+                    window.as_str()
+                );
+            }
+            DispatchOutcome::Ok {
+                stdout: String::new(),
+            }
         }
         other => DispatchOutcome::Error {
             message: format!("teammux: {other:?} not yet implemented"),
@@ -325,6 +341,42 @@ fn resize_pane<H: HerdrApi>(
 /// herdr's own default pane process serves the same "keep the pane alive
 /// and idle" role tmux's `cat` placeholder does; the real teammate process
 /// is launched later, by `respawn-pane -k` (commit 6).
+/// Pure: which pane a new teammate should be split off, to keep the tab in
+/// tmux's `main-vertical` shape — the lead in a full-height column, every
+/// teammate stacked in the column beside it.
+///
+/// The bottom-most non-lead pane, by `rect.y`; splitting it downward extends
+/// the teammate column by one and leaves the lead's column untouched, so the
+/// invariant holds inductively from the first teammate onward. Ties break on
+/// `x` then `pane_id`, only so the choice is deterministic — a tie means two
+/// panes share a top edge, and either extends the column equally well.
+///
+/// `None` when there is nothing to arrange around (only the lead, or an empty
+/// snapshot); the caller then honours Claude Code's request verbatim, which
+/// for a lead-only tab is already main-vertical.
+///
+/// An unknown `lead_pane_id` excludes nothing rather than everything: the tab
+/// mapping degrades to pane-only when `pane get` cannot resolve it (see
+/// `teammux_launch`), and reading that as "no candidates" would silently stop
+/// arranging instead of arranging slightly differently.
+pub(crate) fn main_vertical_split_target<'a>(
+    layout: &'a crate::herdr::PaneLayoutSnapshot,
+    lead_pane_id: Option<&str>,
+) -> Option<&'a str> {
+    layout
+        .panes
+        .iter()
+        .filter(|pane| Some(pane.pane_id.as_str()) != lead_pane_id)
+        .max_by(|a, b| {
+            a.rect
+                .y
+                .cmp(&b.rect.y)
+                .then(a.rect.x.cmp(&b.rect.x))
+                .then_with(|| a.pane_id.cmp(&b.pane_id))
+        })
+        .map(|pane| pane.pane_id.as_str())
+}
+
 fn split_window<H: HerdrApi>(
     herdr: &H,
     idmap: &IdMap,
@@ -352,6 +404,28 @@ fn split_window<H: HerdrApi>(
                 };
             }
         },
+    };
+    // Arrange rather than obey. Claude Code splits the MIDDLE teammate with an
+    // alternating -h/-v and then repairs the recursive subdivision by sending
+    // `select-layout main-vertical` — a repair herdr cannot perform (no
+    // layout-setting verb exists, and `pane.move` is a hard no-op within one
+    // tab). Honouring the request and dropping the repair is what produces the
+    //15-column slivers, so the arrangement is applied here instead, where it
+    // is still expressible. Best effort throughout: an unreadable layout falls
+    // back to the request, because a cosmetic arrangement must never fail a
+    // teammate spawn.
+    let (herdr_target, herdr_direction, ratio) = match herdr.pane_layout(&herdr_target) {
+        Ok(layout) => match main_vertical_split_target(
+            &layout,
+            idmap.lookup(crate::teammux_launch::LEAD_TMUX_PANE),
+        ) {
+            // Extend the teammate column downward; the lead's column is
+            // untouched, and its width is Claude Code's `resize-pane -x` to set.
+            Some(bottom) => (bottom.to_owned(), "down", None),
+            // Lead-only tab: the request IS main-vertical (`-t <lead> -h -l 70%`).
+            None => (herdr_target, herdr_direction, ratio),
+        },
+        Err(_) => (herdr_target, herdr_direction, ratio),
     };
     let info = match herdr.pane_split_pane(&herdr_target, herdr_direction, ratio) {
         Ok(info) => info,
@@ -1534,6 +1608,156 @@ mod tests {
             DispatchOutcome::Error { message } => assert!(message.contains("unsupported amount")),
             other => panic!("expected an Error outcome, got {other:?}"),
         }
+    }
+
+    // ── main-vertical arrangement, honoured at split time ────────────────────
+    //
+    // Claude Code targets the MIDDLE teammate and alternates `-h`/`-v`
+    // (`createTeammatePaneWithLeader`), then repairs the resulting recursive
+    // subdivision by sending `select-layout main-vertical`. herdr has no
+    // layout-setting verb at all and `pane.move` is a hard no-op within one
+    // tab, so that repair cannot be implemented — the arrangement has to be
+    // correct at the moment the pane is created instead.
+
+    #[test]
+    fn main_vertical_split_target_picks_the_bottom_most_non_lead_pane() {
+        let snapshot = layout(
+            (0, 0, 100, 60),
+            &[
+                ("lead", (0, 0, 30, 60)),
+                ("t0", (30, 0, 70, 30)),
+                ("t1", (30, 30, 70, 30)),
+            ],
+        );
+        assert_eq!(
+            main_vertical_split_target(&snapshot, Some("lead")),
+            Some("t1")
+        );
+    }
+
+    #[test]
+    fn main_vertical_split_target_is_none_when_the_lead_is_the_only_pane() {
+        let snapshot = layout((0, 0, 100, 60), &[("lead", (0, 0, 100, 60))]);
+        assert_eq!(main_vertical_split_target(&snapshot, Some("lead")), None);
+    }
+
+    /// With no registered lead (the tab mapping degrades to pane-only when
+    /// `pane get` cannot resolve it — see `teammux_launch`), every pane is a
+    /// candidate. Never read an unknown lead as "no panes" and stop arranging.
+    #[test]
+    fn main_vertical_split_target_falls_back_to_the_bottom_pane_when_the_lead_is_unknown() {
+        let snapshot = layout(
+            (0, 0, 100, 60),
+            &[
+                ("a", (0, 0, 50, 60)),
+                ("b", (50, 0, 50, 30)),
+                ("c", (50, 30, 50, 30)),
+            ],
+        );
+        assert_eq!(main_vertical_split_target(&snapshot, None), Some("c"));
+    }
+
+    #[test]
+    fn split_window_stacks_a_new_teammate_under_the_others_not_where_claude_asked() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead"), ("%1", "w1A:t0"), ("%2", "w1A:t1")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(layout(
+            (0, 0, 100, 60),
+            &[
+                ("w1A:lead", (0, 0, 30, 60)),
+                ("w1A:t0", (30, 0, 70, 30)),
+                ("w1A:t1", (30, 30, 70, 30)),
+            ],
+        ));
+        *fake.split_result.borrow_mut() = Some(pane("w1A:t2", Some("w1A:t1")));
+
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%1").unwrap(), // the middle teammate
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: "%3\n".to_owned()
+            }
+        );
+        // Bottom of the teammate column, split downward — not %1, not `right`.
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call == "pane_split_pane:w1A:t1:down:None"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// The FIRST teammate is the one case Claude Code already gets right:
+    /// `-t <lead> -h -l 70%` IS main-vertical for a two-pane tab. Honour it,
+    /// ratio included, so the lead keeps its column.
+    #[test]
+    fn split_window_honours_the_request_when_the_lead_is_alone() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() =
+            Some(layout((0, 0, 100, 60), &[("w1A:lead", (0, 0, 100, 60))]));
+        *fake.split_result.borrow_mut() = Some(pane("w1A:t0", Some("w1A:t1")));
+
+        dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%0").unwrap(),
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: Some("70%".to_owned()),
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call == "pane_split_pane:w1A:lead:right:Some(0.7)"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// Arrangement is cosmetic; spawning a teammate is not. An unreadable
+    /// layout degrades to Claude Code's own request rather than failing the
+    /// split — same rule `select_pane_title` applies to its metadata publish.
+    #[test]
+    fn split_window_falls_back_to_the_requested_target_when_the_layout_is_unreadable() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead"), ("%1", "w1A:t0")]);
+        let fake = FakeHerdr::default();
+        fake.fail_layout.set(true);
+        *fake.split_result.borrow_mut() = Some(pane("w1A:t1", Some("w1A:t1")));
+
+        // Horizontal, deliberately: it maps to `right`, which the arranged
+        // path never produces. A `Vertical` request would map to `down` and
+        // make this assertion pass either way.
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%1").unwrap(),
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert!(matches!(outcome, DispatchOutcome::Ok { .. }), "{outcome:?}");
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call == "pane_split_pane:w1A:t0:right:None"),
+            "{:?}",
+            fake.calls()
+        );
     }
 
     #[test]
