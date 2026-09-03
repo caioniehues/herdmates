@@ -184,7 +184,7 @@ pub(crate) fn render_why(
         "  transcript activity: {}\n",
         match member.facts.seconds_since_transcript_activity {
             Some(secs) => format!("{secs}s ago"),
-            None => "unknown (no transcript resolved — non-lead members have no herdr-resolvable session pre-shim, documented gap)".to_owned(),
+            None => "unknown (no transcript whose ownership this member could be proved for: an in-process teammate has no pane, a split-pane teammate's pane failed the transcript identity check, or the lead's recorded session no longer resolves to its pane — gather.rs module doc)".to_owned(),
         }
     ));
     out.push_str(&format!(

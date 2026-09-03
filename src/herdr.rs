@@ -65,6 +65,13 @@ pub struct PaneInfo {
     pub agent_id: Option<String>,
     pub agent_session: Option<AgentSession>,
     pub agent_status: Option<String>,
+    /// Display-only pane metadata (`pane report-metadata --display-agent`),
+    /// which for a teammate pane is the teammate's NAME — herdmates
+    /// publishes it itself at spawn (`teammux::publish_display_agent`).
+    /// It is the only field on a pane snapshot that names a teammate, so
+    /// `gather::match_teammate_pane` joins non-lead members through it.
+    /// `None` on every pane nobody has reported metadata for.
+    pub display_agent: Option<String>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -97,6 +104,8 @@ struct PaneInfoWire {
     agent: Option<String>,
     agent_session: Option<AgentSession>,
     agent_status: Option<String>,
+    #[serde(default)]
+    display_agent: Option<String>,
     cwd: Option<PathBuf>,
 }
 
@@ -118,6 +127,7 @@ impl<'de> Deserialize<'de> for PaneInfo {
             agent_id,
             agent_session: wire.agent_session,
             agent_status: wire.agent_status,
+            display_agent: wire.display_agent,
             cwd: wire.cwd,
         })
     }
@@ -1013,6 +1023,7 @@ pub(crate) mod test_support {
                     },
                 ),
                 agent_status: Some("idle".to_owned()),
+                display_agent: None,
                 cwd: None,
             })
         }
@@ -1046,6 +1057,7 @@ pub(crate) mod test_support {
                     agent_id: None,
                     agent_session: None,
                     agent_status: None,
+                    display_agent: None,
                     cwd: None,
                 }),
             }
@@ -1587,6 +1599,47 @@ mod tests {
                 .as_ref()
                 .map(|session| session.kind.as_str()),
             Some("id")
+        );
+    }
+
+    /// Verbatim `herdr pane list` response for a live SPLIT-PANE TEAMMATE
+    /// pane, captured 2026-09-03. Two fields matter and neither is on the
+    /// codex sample above:
+    ///
+    /// - `display_agent` carries the teammate's NAME (herdmates publishes it
+    ///   itself, `teammux::publish_display_agent`) — the only pane field
+    ///   that names a teammate, and so the join key
+    ///   `gather::gather_team` resolves non-lead members through.
+    /// - `agent` is absent and `agent_status` is `"unknown"` while
+    ///   `agent_session` IS present, carrying the teammate's OWN Claude Code
+    ///   session id under herdr's official `herdr:claude` source. That is
+    ///   Defect D (herdr's `lookup_agent` cannot name the version-path
+    ///   argv0 a teammate runs as) sitting next to the session id the
+    ///   findings doc recorded as nonexistent.
+    const LIVE_TEAMMATE_PANE_LIST: &str = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"1991368b-f1dd-408c-9b54-b30c0270fef3"},"agent_status":"unknown","cwd":"/home/zvi/Projects/nanoclaw","display_agent":"fix3-imp3093","focused":false,"foreground_cwd":"/home/zvi/Projects/nanoclaw","label":"fix3-imp3093","pane_id":"w3:p22","revision":1388,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":41},"tab_id":"w3:tJ","terminal_id":"term_65a830cdb763a4d","terminal_title":"\u2733 general-purpose","terminal_title_stripped":"general-purpose","tokens":{"clauth":"unknown","ctx_ok":"\u2584 48%","eff_xhigh":"xhigh","idle_crit":"idle 36m","mdl":"\u273b Opus 5 1M"},"workspace_id":"w3"}],"type":"pane_list"}}"#;
+
+    #[test]
+    fn parses_a_live_teammate_panes_display_agent_and_own_session_id() {
+        let panes = parse_pane_list(LIVE_TEAMMATE_PANE_LIST).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "w3:p22");
+        assert_eq!(
+            panes[0].display_agent.as_deref(),
+            Some("fix3-imp3093"),
+            "display_agent is the only pane field naming a teammate"
+        );
+        assert_eq!(
+            panes[0].agent, None,
+            "Defect D: herdr never detects a teammate pane's agent"
+        );
+        assert_eq!(panes[0].agent_status.as_deref(), Some("unknown"));
+        assert_eq!(
+            panes[0]
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            Some("1991368b-f1dd-408c-9b54-b30c0270fef3"),
+            "the teammate's OWN session id, under herdr's official source"
         );
     }
 

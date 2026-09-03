@@ -452,10 +452,13 @@ mod tests {
             [
                 "agent_list",
                 "agent_list",
+                "pane_list",
                 "pane_report_tokens:w1:pLead:herdmates-board:task=Coordinate the team,status=online"
             ],
             "two agent_list calls: pump_once's own lead-pane resolution, then \
-             gather::gather_team's inside the state-classification path"
+             gather::gather_team's inside the state-classification path; the \
+             pane_list is gather_team's non-lead teammate resolution, one \
+             snapshot per pass rather than one per member"
         );
     }
 
