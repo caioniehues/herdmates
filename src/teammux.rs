@@ -295,6 +295,44 @@ fn publish_display_agent<H: HerdrApi>(herdr: &H, herdr_pane_id: &str, name: &str
     let _ = herdr.pane_report_metadata(herdr_pane_id, &update);
 }
 
+/// Pure: the directional border move that takes `pane_id` from its CURRENT
+/// width to `target_fraction` of the tab.
+///
+/// tmux's `-x` names an absolute width; herdr's `amount` is a fraction to
+/// move the border BY (`handle_pane_resize` defaults it to 0.05 and clamps it
+/// to 0.5). Passing the target straight through therefore asks for the wrong
+/// thing in the wrong units — and, being relative, compounds on every repeat:
+/// measured live, a lead asked for 30% three times ended up at 90%.
+///
+/// `None` when the pane is already within half a column of the target (no
+/// call worth making), when it is absent from the snapshot, or when the tab
+/// has no width to divide by.
+pub(crate) fn absolute_width_resize(
+    layout: &crate::herdr::PaneLayoutSnapshot,
+    pane_id: &str,
+    target_fraction: f64,
+) -> Option<(&'static str, f64)> {
+    let area_width = f64::from(layout.area.width);
+    if area_width <= 0.0 {
+        return None;
+    }
+    let current = layout
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .map(|pane| f64::from(pane.rect.width))?;
+    let delta = target_fraction - current / area_width;
+    // Half a column: below this the move rounds to nothing anyway.
+    if delta.abs() * area_width < 0.5 {
+        return None;
+    }
+    Some(if delta > 0.0 {
+        ("right", delta)
+    } else {
+        ("left", -delta)
+    })
+}
+
 /// `resize-pane -t %N -x AMOUNT`: herdr models resize as a directional
 /// border move (`--direction left|right|up|down [--amount FLOAT]`), not
 /// tmux's absolute-size-target `-x`. Documented assumption (findings.md,
@@ -323,7 +361,21 @@ fn resize_pane<H: HerdrApi>(
             };
         }
     };
-    match herdr.pane_resize(&herdr_pane_id, "right", Some(ratio)) {
+    // Convert the absolute target into the delta from the pane's current
+    // width; see `absolute_width_resize`. An unreadable layout degrades to
+    // doing nothing rather than to the old pass-through, because the
+    // pass-through is what compounded the lead to 90%.
+    let Ok(layout) = herdr.pane_layout(&herdr_pane_id) else {
+        return DispatchOutcome::Ok {
+            stdout: String::new(),
+        };
+    };
+    let Some((direction, amount)) = absolute_width_resize(&layout, &herdr_pane_id, ratio) else {
+        return DispatchOutcome::Ok {
+            stdout: String::new(),
+        };
+    };
+    match herdr.pane_resize(&herdr_pane_id, direction, Some(amount)) {
         Ok(()) => DispatchOutcome::Ok {
             stdout: String::new(),
         },
@@ -1552,9 +1604,15 @@ mod tests {
     }
 
     #[test]
-    fn resize_pane_converts_percentage_and_maps_x_to_a_fixed_direction() {
+    fn resize_pane_does_nothing_when_the_layout_cannot_be_read() {
+        // Supersedes `resize_pane_converts_percentage_and_maps_x_to_a_fixed_direction`,
+        // which pinned the pass-through (`right`, the target as the amount)
+        // that compounded the lead to 90%. Without a layout there is no
+        // current width to compute a delta from, and guessing is exactly what
+        // the old mapping did — so do nothing rather than move it wrongly.
         let idmap = temp_idmap(&[("%0", "w1A:p1")]);
         let fake = FakeHerdr::default();
+        fake.fail_layout.set(true);
 
         let outcome = dispatch(
             &fake,
@@ -1570,10 +1628,14 @@ mod tests {
                 stdout: String::new()
             }
         );
-        assert!(fake
-            .calls()
-            .iter()
-            .any(|call| call == "pane_resize:w1A:p1:right:Some(0.3)"));
+        assert!(
+            !fake
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("pane_resize:")),
+            "{:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -1618,6 +1680,69 @@ mod tests {
     // layout-setting verb at all and `pane.move` is a hard no-op within one
     // tab, so that repair cannot be implemented — the arrangement has to be
     // correct at the moment the pane is created instead.
+
+    // ── resize-pane -x is an ABSOLUTE target; herdr's `amount` is a RELATIVE
+    //    border nudge. Converting needs the pane's current width.
+
+    #[test]
+    fn absolute_width_resize_shrinks_a_pane_that_is_too_wide() {
+        // 90 of 100 wide, asked for 30% -> move the border 60% leftward.
+        let snapshot = layout((0, 0, 100, 50), &[("lead", (0, 0, 90, 50))]);
+        let (direction, amount) = absolute_width_resize(&snapshot, "lead", 0.30).unwrap();
+        assert_eq!(direction, "left");
+        assert!((amount - 0.60).abs() < 1e-9, "{amount}");
+    }
+
+    #[test]
+    fn absolute_width_resize_grows_a_pane_that_is_too_narrow() {
+        let snapshot = layout((0, 0, 100, 50), &[("lead", (0, 0, 10, 50))]);
+        let (direction, amount) = absolute_width_resize(&snapshot, "lead", 0.30).unwrap();
+        assert_eq!(direction, "right");
+        assert!((amount - 0.20).abs() < 1e-9, "{amount}");
+    }
+
+    #[test]
+    fn absolute_width_resize_is_none_when_the_pane_is_already_at_the_target() {
+        let snapshot = layout((0, 0, 100, 50), &[("lead", (0, 0, 30, 50))]);
+        assert_eq!(absolute_width_resize(&snapshot, "lead", 0.30), None);
+    }
+
+    /// The defect this replaces, measured live 2026-09-03: `resize-pane -t %0
+    /// -x 30%` mapped to `pane_resize(lead, "right", 0.3)`, which herdr reads
+    /// as "move the border 30% RIGHTWARD" — so over three spawns the lead grew
+    /// 30% -> 60% -> 90% instead of settling at 30%.
+    #[test]
+    fn resize_pane_moves_the_border_by_the_delta_not_by_the_target() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() =
+            Some(layout((0, 0, 100, 50), &[("w1A:lead", (0, 0, 90, 50))]));
+
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::ResizePane {
+                pane: TmuxId::parse("%0").unwrap(),
+                amount: "30%".to_owned(),
+            }),
+        );
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: String::new()
+            }
+        );
+        // Direction here; the exact delta is pinned by the pure tests above,
+        // where it can be compared with a tolerance instead of through a
+        // formatted float.
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.starts_with("pane_resize:w1A:lead:left:")),
+            "{:?}",
+            fake.calls()
+        );
+    }
 
     #[test]
     fn main_vertical_split_target_picks_the_bottom_most_non_lead_pane() {
