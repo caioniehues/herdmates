@@ -98,9 +98,14 @@ not a bug.
   waiting-reason detail (permission-prompt / blocked-on-dependency /
   stalled tier / turn-complete / reason-less waiting), plus every raw
   fact behind it (transcript staleness, unread inbox, owned-task
-  blocking). Non-lead teammates always show `agent_status: Unknown` and
-  "no transcript resolved" — a documented upstream gap (only the lead
-  resolves to a herdr session pre-shim), not this command failing.
+  blocking). Non-lead teammates always show `agent_status: Unknown`:
+  herdr holds no agent state for a teammate pane (its process runs as a
+  version-numbered binary herdr's detector cannot name, and the pane's
+  agent-session identity already belongs to herdr's own claude
+  integration, which refuses a substitute) — so `needs-you`/`blocked`
+  can never show for one. Their liveness comes from their own transcript
+  instead. "no transcript resolved" means ownership could not be proved,
+  not that the command failed.
 - **`herdmates deadlocks`** — reach for this when the team feels wedged
   but every teammate looks idle: finds tasks stuck `in_progress` for
   ≥10 minutes with unfinished work still blocked behind them —
@@ -112,6 +117,17 @@ not a bug.
   team and what state are they in" before deciding who to check on;
   each line carries a coarse 5-state label (`online` / `needs-you` /
   `blocked` / `waiting` / `stale`) plus the underlying engine reason.
+
+  **It also tells you which teammates to reap, and that is the reason to
+  run it habitually.** A teammate is a persistent Claude Code session:
+  finishing its task does not end it. One measured on this machine sat
+  alive 14 hours after reporting back, holding a pane and a roster row.
+  A teammate whose own transcript has been silent past the stalled
+  threshold gets `finished? reap it: TaskStop <name>`, and a summary
+  line counts them. Either give it more work or `TaskStop` it —
+  **do not close its pane**, which kills a live session you can still
+  message. Nothing reaps a teammate automatically and nothing should;
+  the roster row stays truthful either way.
 
 All three print dense plain text meant for a model to read (no
 tables/color) and degrade honestly on missing data — never a wrong

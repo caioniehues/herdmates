@@ -24,3 +24,9 @@ jobs:
       # Issue #127: boundary-crossing seams (docs/agents/boundary-pairs.md) —
       # currently just the ADR-0004 cd-in-prompt-text anti-pattern grep.
       - run: bash scripts/check-boundary-seams.sh
+      # Same seam class, sidebar tokens: src/tokens.rs publishes names,
+      # docs/sidebar-rows.toml renders them, and BOTH failure directions are
+      # silent (a token with no row renders nowhere; a row with no producer
+      # makes reload-config return "partial" and keep the old layout). Caught
+      # `$model` published with no row on its first run.
+      - run: bash scripts/check-token-seams.sh
