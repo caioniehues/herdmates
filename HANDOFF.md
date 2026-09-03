@@ -28,18 +28,32 @@ Fix 3 and the shipped Fix 3′/Fix 4 in §6; then §8's thirteen reversals).
 
 **Next steps, in the order they are worth doing:**
 
-1. **Nothing is installed from the last three commits.** `~/.local/bin/{herdmates,teammux}`
-   are built from this branch as of `8188a33`. A `herdr plugin update` rebuilds
-   from upstream and silently reverts everything on this branch.
-2. **File the herdr issue** for `lookup_agent` not recognising Claude Code's
+1. **Installed 2026-09-03 17:04** from this worktree via the plugin's own build hook
+   (`cargo install --path . --root "$HOME/.local"`), which also re-registered the install source
+   from the predecessor's worktree to this one. Backups: `~/.local/bin/*.pre-reaping-fix.bak`
+   (this install) and `*.pre-selfwake-fix.bak` (pre-2026-09-02). Verified on real traffic — a
+   genuine `TeammateIdle` hook 105 s after install spooled correctly. A `herdr plugin update`
+   still rebuilds from upstream and silently reverts everything on this branch.
+   `docs/sidebar-rows.toml`'s `$reap` row was also added to the live herdr config
+   (`~/.dotfiles/config/herdr/config.toml`, `rows_by_agent.claude`, uncommitted there);
+   `reload-config` returned `applied`, not `partial`.
+2. **Correction to `f0fdcc7`'s commit message, worth knowing before you read it:** it says
+   "nothing told the lead a teammate was done". Claude Code *does* — a native
+   `idle_notification` carrying the teammate's summary and result reaches the lead's session
+   (measured 2026-09-03, 7 minutes after a teammate finished). The lead was told and still had
+   not reaped 5 h 36 m later, which is the real justification for the reap surface: a standing
+   count, not another notification. Consequence: **Fix 5 in the findings doc is downgraded** from
+   "restore missing delivery" to "add engine reasons to a notification that already arrives", and
+   Probe 1 no longer blocks anything. Full record in that doc's §11.
+3. **File the herdr issue** for `lookup_agent` not recognising Claude Code's
    version-path argv0 (`detect/mod.rs:193`; it already handles the same shape
    for Muse via `is_muse_versioned_binary`). This is the root of Defect D and
    it affects every tmux teammate, herdmates or not.
-3. **Defect E** — a lead's session id rotates and the team config keeps the
+4. **Defect E** — a lead's session id rotates and the team config keeps the
    original, so `resolve_lead_pane` and `brain::resolve_own_team` both fail for
    such a team (measured: 3 of 9 live teams). A live teammate's argv carries
    `--parent-session-id <current lead session>`, which recovers it.
-4. Release when Caio says: bump the manifest + Cargo version (**owed** — these
+5. Release when Caio says: bump the manifest + Cargo version (**owed** — these
    commits change behaviour) and tag.
 
 ## Where things stand (2026-08-21)
