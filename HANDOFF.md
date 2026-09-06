@@ -26,6 +26,16 @@ Fix 3 and the shipped Fix 3′/Fix 4 in §6; then §8's thirteen reversals).
   finishing — and only `TaskStop` reaps one. `roster` and `pump-board` now name
   the teammates waiting for it. Registry rows are deliberately untouched.
 
+**Fixed 2026-09-06 (`387145d`): the reap badge never cleared.** `pane report-metadata --token`
+only sets, so a token that stops being published keeps its last value. `reap` skipped publishing
+at count zero, which meant the badge asking you to reap survived the reaping — found live on a
+lead frozen at `reap: 10 to stop` with no teammates left. The pump now clears the names it does
+not publish, in the same call. Two things worth carrying forward: **clearing is not scoped to
+`--source`** (it will remove another producer's token of the same name — measured), and the
+deleted-`--clear-token` mutant initially survived the whole suite because the only coverage was
+`FakeHerdr`, which reimplements the call instead of running it; `FakeBinary::recording_argv`
+now asserts on the real argv.
+
 **Next steps, in the order they are worth doing:**
 
 1. **Installed 2026-09-03 17:04** from this worktree via the plugin's own build hook
