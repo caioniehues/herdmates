@@ -76,9 +76,32 @@ fn own_session_id() -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-fn resolve_own_team(paths: &GatherPaths) -> Result<String, TeamResolveError> {
+/// Which team the CALLING session leads.
+///
+/// The recorded `leadSessionId` is tried first and answers for a lead that
+/// has not resumed. When it does not (Defect E: a Claude Code session id
+/// rotates on resume or `/clear` while the team config keeps the original),
+/// the lead's own teammates are asked — they carry `--parent-session-id`,
+/// which still names this session. Without that fallback a resumed lead is
+/// told it leads nothing and loses `why`/`roster` outright, with its
+/// teammates visibly running.
+///
+/// The fallback is attempted only for the `NotATeamLead` case: a missing
+/// `CLAUDE_CODE_SESSION_ID` is a different error and there is nothing to
+/// match on. It costs one `pane process-info` per teammate-looking pane, and
+/// only on the path that was previously a hard error.
+fn resolve_own_team<H: crate::herdr::HerdrApi>(
+    paths: &GatherPaths,
+    herdr: &H,
+) -> Result<String, TeamResolveError> {
     let teams = team_hook::discover_teams_at(Some(&paths.teams_root));
-    resolve_team_by_session(own_session_id().as_deref(), &teams)
+    let session_id = own_session_id();
+    match resolve_team_by_session(session_id.as_deref(), &teams) {
+        Ok(team) => Ok(team),
+        Err(TeamResolveError::NotATeamLead(id)) => gather::recover_team_by_lead_session(herdr, &id)
+            .ok_or(TeamResolveError::NotATeamLead(id)),
+        Err(other) => Err(other),
+    }
 }
 
 // ─── 5-state vocabulary ─────────────────────────────────────────────────────
@@ -437,8 +460,8 @@ fn gather_paths() -> Result<GatherPaths, BrainError> {
 pub fn why_command(args: &[String]) -> Result<(), BrainError> {
     let agent = args.first().ok_or(BrainError::MissingAgentArg)?;
     let paths = gather_paths()?;
-    let team = resolve_own_team(&paths)?;
     let herdr = crate::herdr::HerdrClient::from_env();
+    let team = resolve_own_team(&paths, &herdr)?;
     let thresholds = StalledThresholds::default();
     let members = gather::gather_team(&paths, &team, &herdr, SystemTime::now());
     match find_teammate(&members, agent) {
@@ -455,7 +478,8 @@ pub fn why_command(args: &[String]) -> Result<(), BrainError> {
 /// `herdmates deadlocks` (issue #122, ADR-0015 §Decision point 6).
 pub fn deadlocks_command(_args: &[String]) -> Result<(), BrainError> {
     let paths = gather_paths()?;
-    let team = resolve_own_team(&paths)?;
+    let herdr = crate::herdr::HerdrClient::from_env();
+    let team = resolve_own_team(&paths, &herdr)?;
     let tasks = gather::team_task_displays(&paths, &team, SystemTime::now());
     let suspects = detect_status_lag(&tasks, StalledThresholds::default().stalled_secs);
     println!("{}", render_deadlocks(&team, &suspects));
@@ -465,8 +489,8 @@ pub fn deadlocks_command(_args: &[String]) -> Result<(), BrainError> {
 /// `herdmates roster` (issue #122, ADR-0015 brain layer pull path).
 pub fn roster_command(_args: &[String]) -> Result<(), BrainError> {
     let paths = gather_paths()?;
-    let team = resolve_own_team(&paths)?;
     let herdr = crate::herdr::HerdrClient::from_env();
+    let team = resolve_own_team(&paths, &herdr)?;
     let thresholds = StalledThresholds::default();
     let members = gather::gather_team(&paths, &team, &herdr, SystemTime::now());
     println!("{}", render_roster(&team, &members, &thresholds));

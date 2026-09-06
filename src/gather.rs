@@ -738,28 +738,65 @@ pub(crate) fn recover_lead_pane_via_teammates<H: HerdrApi>(
     team: &str,
     agents: &[crate::herdr::AgentInfo],
 ) -> Option<String> {
-    let panes = herdr.pane_list(None).ok()?;
-    for pane in panes.iter().filter(|pane| pane.display_agent.is_some()) {
-        let Ok(info) = herdr.pane_process_info(&pane.pane_id) else {
-            continue;
-        };
-        let launch = info
-            .foreground_processes
-            .iter()
-            .find_map(|process| parse_teammate_launch(&process.argv));
-        let Some(launch) = launch.filter(|launch| launch.team_name == team) else {
-            continue;
-        };
-        if let Some(lead) = agents.iter().find(|agent| {
-            agent
-                .agent_session
-                .as_ref()
-                .is_some_and(|session| session.value == launch.lead_session_id)
-        }) {
-            return Some(lead.pane_id.clone());
-        }
-    }
-    None
+    teammate_launches(herdr)
+        .into_iter()
+        .filter(|launch| launch.team_name == team)
+        .find_map(|launch| {
+            agents
+                .iter()
+                .find(|agent| {
+                    agent
+                        .agent_session
+                        .as_ref()
+                        .is_some_and(|session| session.value == launch.lead_session_id)
+                })
+                .map(|lead| lead.pane_id.clone())
+        })
+}
+
+/// Impure: the team `session_id` leads, discovered from the teammates it
+/// spawned rather than from any team config (Defect E, second half).
+///
+/// `brain::resolve_own_team` matches the calling session against each team's
+/// recorded `leadSessionId`, so a lead whose session has rotated is told it
+/// leads nothing and loses `roster`/`why` entirely — while its teammates are
+/// running in front of it. Those teammates carry `--parent-session-id`, which
+/// still names the session asking the question.
+///
+/// `None` whenever no live teammate names `session_id` as its parent, which
+/// keeps the honest "not a team lead" error for a session that genuinely
+/// leads nothing. Same cost profile and the same degrade rules as
+/// [`recover_lead_pane_via_teammates`]; both share [`teammate_launches`].
+pub(crate) fn recover_team_by_lead_session<H: HerdrApi>(
+    herdr: &H,
+    session_id: &str,
+) -> Option<String> {
+    teammate_launches(herdr)
+        .into_iter()
+        .find(|launch| launch.lead_session_id == session_id)
+        .map(|launch| launch.team_name)
+}
+
+/// Impure: every live teammate's self-declared `(team, lead session)`.
+///
+/// Only panes carrying a `display_agent` are probed — a pane herdmates never
+/// labelled is not a teammate it spawned — because `pane process-info` has no
+/// bulk form and costs one subprocess per pane. A herdr failure at either
+/// step drops that pane rather than the whole scan.
+fn teammate_launches<H: HerdrApi>(herdr: &H) -> Vec<TeammateLaunch> {
+    let Ok(panes) = herdr.pane_list(None) else {
+        return Vec::new();
+    };
+    panes
+        .iter()
+        .filter(|pane| pane.display_agent.is_some())
+        .filter_map(|pane| herdr.pane_process_info(&pane.pane_id).ok())
+        .filter_map(|info| {
+            info.foreground_processes
+                .iter()
+                .find_map(|process| parse_teammate_launch(&process.argv))
+        })
+        .collect()
 }
 
 /// Pure: the one pane in `panes` whose `display_agent` is exactly `name`.
@@ -1065,6 +1102,47 @@ mod tests {
         let argv = teammate_argv("session-x", "beta", Some(""));
 
         assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn a_resumed_lead_finds_its_own_team_through_its_live_teammates() {
+        // The other half of Defect E: `brain::resolve_own_team` matches the
+        // CALLING session against each team's recorded `leadSessionId`, so a
+        // lead that has resumed cannot invoke its own verbs at all — it is
+        // told it is "not registered as any team's lead" while its teammates
+        // are running in front of it.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("my-live-session"))),
+        );
+
+        assert_eq!(
+            recover_team_by_lead_session(&herdr, "my-live-session").as_deref(),
+            Some("team-x")
+        );
+    }
+
+    #[test]
+    fn a_session_no_teammate_claims_as_parent_recovers_no_team() {
+        // A plain session that leads nothing must still get the honest
+        // "not a team lead" error, never someone else's team.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv(
+                "team-x",
+                "beta",
+                Some("someone-elses-session"),
+            )),
+        );
+
+        assert_eq!(
+            recover_team_by_lead_session(&herdr, "my-live-session"),
+            None
+        );
     }
 
     #[test]
