@@ -69,10 +69,14 @@ now asserts on the real argv.
    silently:** Claude Code's teammate command is compound (`cd … && env … <binary>`), so
    prefixing the whole string applies the variable to `cd` and changes nothing. Use
    `export HERDR_AGENT=claude; ` prepended, or inject into the existing `env`.
-   **Still unproven, and it carries the whole value:** whether a real teammate then reports
-   meaningful `working`/`blocked` rather than the probe's default `idle` — i.e. whether
-   `needs-you` can finally fire for a teammate sitting on a permission prompt. Today `roster`
-   states outright that it cannot.
+   **GATE ANSWERED 2026-09-06 — it passes** (findings doc §12.1). A real `claude` launched from
+   the versioned path with the hint reports `agent: "claude"` and cycles `blocked` (verified
+   against a real on-screen prompt) → `working` → `idle`; without the hint the same process is
+   `agent: null`. So the status is a real read and `needs-you` becomes reachable for a teammate,
+   which `roster` currently says is impossible. **Implement.** Two carry-forwards: poll faster
+   than 1 s or be event-driven (a 4 s poll produced a false negative — the `working` window on a
+   short turn is ~1–2 s), and confirm the same holds for an actual teammate before building on
+   it, since the probe used a normal session.
 4. **Do NOT file a new herdr issue** for Defect D: **herdr#2779 already reports it** (open since
    2026-08-13, `bug` + `maintainer-needed`), and herdr's `bug.yml` template explicitly forbids
    the shape the draft used (no root cause, no proposed fix; bots close such issues same-day).
