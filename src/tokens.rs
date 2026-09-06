@@ -12,6 +12,34 @@ use crate::teamfiles::Teammate;
 /// the legacy `crate::metadata::SOURCE`).
 pub const SOURCE: &str = "herdmates-board";
 
+/// Every token name [`teammate_tokens`] can publish, in publish order.
+///
+/// This is the **clear vocabulary**: a name here is one the pump is entitled
+/// to remove from a pane when it stops publishing it. It exists because
+/// `pane report-metadata --token` only ever SETS — omitting a token leaves
+/// whatever value the pane already had, forever. A live lead sat frozen at
+/// `reap: 10 to stop` for three days with zero teammates left, because the
+/// N -> 0 transition publishes nothing and nothing cleared the old value.
+///
+/// ⚠ **Clearing is NOT scoped to the reporting source** (measured
+/// 2026-09-06: `--source herdmates-board --clear-token idle_ok` removed a
+/// token published by an entirely different source). So every name here must
+/// be one herdmates genuinely owns. Adding a name that another producer also
+/// publishes — a statusline, another plugin — would silently wipe their
+/// value on every pass. Check what else writes to the target panes before
+/// extending this list.
+pub const PUBLISHABLE_TOKEN_NAMES: [&str; 4] = ["task", "status", "reap", "model"];
+
+/// Pure: the [`PUBLISHABLE_TOKEN_NAMES`] entries `set` does not carry — the
+/// names a caller must explicitly clear so a stale value cannot survive.
+/// Order follows the vocabulary, so the emitted argv is deterministic.
+pub(crate) fn absent_names(set: &TokenSet) -> Vec<&'static str> {
+    PUBLISHABLE_TOKEN_NAMES
+        .into_iter()
+        .filter(|name| !set.tokens().iter().any(|token| token.name == *name))
+        .collect()
+}
+
 /// Herdr 0.7.4 hard limit on one token's rendered value.
 pub const MAX_TOKEN_VALUE_CHARS: usize = 80;
 
@@ -157,6 +185,43 @@ mod tests {
             model: model.map(str::to_owned),
             task: task.map(str::to_owned),
             inbox: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_set_reports_every_vocabulary_name_it_does_not_carry() {
+        // Only `status` is unconditional, so a bare teammate with no task,
+        // no model and nothing to reap leaves the other three absent.
+        let set = teammate_tokens(&teammate(None, true, None), FiveState::Online, 0);
+
+        assert_eq!(absent_names(&set), ["task", "reap", "model"]);
+    }
+
+    #[test]
+    fn a_full_set_has_no_absent_names_to_clear() {
+        let set = teammate_tokens(
+            &teammate(Some("review the diff"), true, Some("claude-opus-4-8")),
+            FiveState::Online,
+            2,
+        );
+
+        assert!(absent_names(&set).is_empty());
+    }
+
+    #[test]
+    fn every_name_the_builder_can_publish_is_in_the_clearable_vocabulary() {
+        // The guard that keeps the clear path honest as tokens are added: a
+        // name published but missing from the vocabulary can never be
+        // cleared, which is exactly the `reap` bug this vocabulary exists to
+        // prevent (it froze at "10 to stop" on a live pane for three days).
+        let maximal = teammate_tokens(&teammate(Some("t"), true, Some("m")), FiveState::Online, 3);
+
+        for token in maximal.tokens() {
+            assert!(
+                PUBLISHABLE_TOKEN_NAMES.contains(&token.name.as_str()),
+                "`{}` is published but absent from PUBLISHABLE_TOKEN_NAMES, so nothing can ever clear it",
+                token.name
+            );
         }
     }
 

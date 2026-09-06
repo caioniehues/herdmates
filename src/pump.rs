@@ -193,14 +193,22 @@ pub fn pump_once<H: HerdrApi>(paths: &GatherPaths, herdr: &H) {
         // so the sidebar and `roster` cannot disagree — rule #90).
         let token_set =
             tokens::teammate_tokens(lead, state, brain::reapable_count(&facts, &thresholds));
+        // Clear whatever this pass did NOT publish. `--token` only sets, so
+        // a name that stops being published keeps its last value on the pane
+        // indefinitely — and for `reap` the N -> 0 transition is the success
+        // path, so the badge asking you to reap would survive the reaping.
+        // Cleared unconditionally rather than tracked: herdr treats clearing
+        // an absent token as a no-op, and the pump holds no memory of the
+        // previous pass to diff against.
+        let clear = tokens::absent_names(&token_set);
         let pairs = token_set
             .into_iter()
             .map(|token| (token.name, token.value))
             .collect::<Vec<_>>();
-        if pairs.is_empty() {
+        if pairs.is_empty() && clear.is_empty() {
             continue;
         }
-        let _ = herdr.pane_report_tokens(&pane_id, tokens::SOURCE, &pairs);
+        let _ = herdr.pane_report_tokens(&pane_id, tokens::SOURCE, &pairs, &clear);
     }
 }
 
@@ -459,6 +467,35 @@ mod tests {
     // ── pump_once (integration smoke) ───────────────────────────────────────
 
     #[test]
+    fn pump_once_clears_the_reap_token_when_nothing_is_left_to_reap() {
+        // The live defect this fixes, reproduced: `pane report-metadata
+        // --token` only SETS. A lead whose teammates have all been reaped
+        // publishes no `reap` token, and the pane keeps the last value it
+        // was given — measured on a real lead frozen at "10 to stop" for
+        // three days with zero teammates left. The N -> 0 transition is the
+        // SUCCESS path, so the badge telling you to reap must go quiet
+        // exactly when you have done it.
+        let temp = TempDir::new();
+        let paths = paths_for(temp.path());
+        write_team(&paths.teams_root, "session-t", "lead-session", "");
+
+        let fake = FakeHerdr::default();
+        *fake.agents.borrow_mut() = vec![agent_with_session("w1:pLead", "lead-session")];
+
+        pump_once(&paths, &fake);
+
+        let published = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("pane_report_tokens"))
+            .expect("the lead's tokens were published");
+        assert!(
+            published.contains("-reap"),
+            "a zero count must CLEAR reap, not merely omit it; call was: {published}"
+        );
+    }
+
+    #[test]
     fn pump_once_publishes_a_reap_token_when_a_teammate_finished_and_was_never_stopped() {
         // End-to-end over the real pipeline: a team config naming a
         // split-pane teammate, that teammate's herdr pane carrying the
@@ -531,7 +568,7 @@ mod tests {
                 "agent_list",
                 "agent_list",
                 "pane_list",
-                "pane_report_tokens:w1:pLead:herdmates-board:task=Coordinate the team,status=online"
+                "pane_report_tokens:w1:pLead:herdmates-board:task=Coordinate the team,status=online,-reap,-model"
             ],
             "two agent_list calls: pump_once's own lead-pane resolution, then \
              gather::gather_team's inside the state-classification path; the \
@@ -561,7 +598,10 @@ mod tests {
             .into_iter()
             .find(|call| call.starts_with("pane_report_tokens"))
             .expect("a report call");
-        assert!(report.ends_with("status=!! needs-you"), "{report}");
+        assert!(
+            report.ends_with("status=!! needs-you,-reap,-model"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -580,7 +620,7 @@ mod tests {
             .into_iter()
             .find(|call| call.starts_with("pane_report_tokens"))
             .expect("a report call");
-        assert!(report.ends_with("status=waiting"), "{report}");
+        assert!(report.ends_with("status=waiting,-reap,-model"), "{report}");
     }
 
     #[test]
