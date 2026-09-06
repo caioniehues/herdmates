@@ -59,12 +59,20 @@ now asserts on the real argv.
    version-path argv0 (`detect/mod.rs:193`; it already handles the same shape
    for Muse via `is_muse_versioned_binary`). This is the root of Defect D and
    it affects every tmux teammate, herdmates or not.
-4. **Defect E** — a lead's session id rotates and the team config keeps the
-   original, so `resolve_lead_pane` and `brain::resolve_own_team` both fail for
-   such a team (measured: 3 of 9 live teams). A live teammate's argv carries
-   `--parent-session-id <current lead session>`, which recovers it.
+4. **Defect E — FIXED 2026-09-06 (`8c75713`)** for the pane-resolution half:
+   `gather::recover_lead_pane_via_teammates` reads a live teammate's
+   `--parent-session-id`, so `pump_once` and `gather_team` both stop skipping a
+   rotated-lead team. **Still open:** `brain::resolve_own_team` matches
+   `CLAUDE_CODE_SESSION_ID` against `leadSessionId` directly, so a lead that has
+   resumed still cannot invoke its own `roster`/`why` — it gets "not registered
+   as any team's lead". Same recovery applies, but `resolve_own_team` has no
+   `HerdrApi` threaded through it yet.
 5. Release when Caio says: bump the manifest + Cargo version (**owed** — these
    commits change behaviour) and tag.
+6. **Verification note:** do NOT use `grep <string> ~/.local/bin/herdmates` to
+   confirm an install. Release builds inline short literal comparisons, so
+   `--parent-session-id` is absent from the binary that demonstrably uses it.
+   Run the binary against a fixture instead.
 
 ## Where things stand (2026-08-21)
 
