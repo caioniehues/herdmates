@@ -60,8 +60,16 @@ now asserts on the real argv.
    `pane.report_agent` (genuinely blocked) to all routes. `HERDR_AGENT=<agent>` is a documented
    env hint read from the process environ (`herdr/src/platform/mod.rs:322`) that drives herdr's
    OWN detection, and `teammux::respawn_pane` already owns the teammate's launch string, so
-   prefixing it is reachable. If it works, teammate panes get real `agent`/`agent_status` and
-   Fix 3 is revived. **Probe before designing** — untested for a teammate pane.
+   prefixing it is reachable. **PROBED 2026-09-06 and the detection half WORKS** — findings doc
+   §12 has the table. `HERDR_AGENT=claude` on the final binary of a `pane run` command turns
+   `agent: null / unknown` into `agent: "claude" / idle`. **The naive implementation fails
+   silently:** Claude Code's teammate command is compound (`cd … && env … <binary>`), so
+   prefixing the whole string applies the variable to `cd` and changes nothing. Use
+   `export HERDR_AGENT=claude; ` prepended, or inject into the existing `env`.
+   **Still unproven, and it carries the whole value:** whether a real teammate then reports
+   meaningful `working`/`blocked` rather than the probe's default `idle` — i.e. whether
+   `needs-you` can finally fire for a teammate sitting on a permission prompt. Today `roster`
+   states outright that it cannot.
 4. **Do NOT file a new herdr issue** for Defect D: **herdr#2779 already reports it** (open since
    2026-08-13, `bug` + `maintainer-needed`), and herdr's `bug.yml` template explicitly forbids
    the shape the draft used (no root cause, no proposed fix; bots close such issues same-day).
