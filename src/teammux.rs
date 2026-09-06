@@ -222,10 +222,28 @@ fn styling_noop(call: String) -> DispatchOutcome {
     }
 }
 
+/// Env hint herdr's own agent detector reads from a process' environ
+/// (`herdr/src/platform/mod.rs:322`, documented in `agents.mdx`) — the
+/// route that survives Defect D (herdr's `lookup_agent` matches argv0's
+/// basename and can never name a teammate's version-path binary; findings
+/// §4/§10.1/§12). Prepended as its own `export …; ` statement rather than a
+/// bare prefix on `command`: Claude Code's real teammate launch line is
+/// compound (`cd <dir> && env … <binary> …`), and a bare prefix binds the
+/// variable to `cd`, not the exec'd binary — measured to fail silently,
+/// reproducing the exact `agent: null` this exists to fix (findings §12's
+/// trap table). `export …;` is a separate statement in the same shell
+/// invocation, so it takes effect before anything after it runs regardless
+/// of the rest of the command's shape (verified live against all of `cd &&
+/// env foo`, `env foo`, and a bare command — findings §12).
+const HERDR_AGENT_HINT: &str = "export HERDR_AGENT=claude; ";
+
 /// `respawn-pane -k -t %N -- CMD`: launch the real teammate process in the
 /// already-split pane, via `herdr pane run` (closest herdr match — herdr has
 /// no separate "respawn the pane's process" primitive; `pane run` submits
-/// `CMD` to the pane the same way a human typing it would).
+/// `CMD` to the pane the same way a human typing it would). Always
+/// prefixed with [`HERDR_AGENT_HINT`] — this verb has exactly one caller in
+/// the whole system, Claude Code's teammate spawn, so there is no launch
+/// shape here that isn't a Claude Code teammate needing the hint.
 fn respawn_pane<H: HerdrApi>(
     herdr: &H,
     idmap: &IdMap,
@@ -236,7 +254,8 @@ fn respawn_pane<H: HerdrApi>(
         Some(id) => id.to_owned(),
         None => return unknown_tmux_id("respawn-pane", pane.as_str()),
     };
-    match herdr.pane_run(&herdr_pane_id, command) {
+    let hinted_command = format!("{HERDR_AGENT_HINT}{command}");
+    match herdr.pane_run(&herdr_pane_id, &hinted_command) {
         Ok(()) => DispatchOutcome::Ok {
             stdout: String::new(),
         },
@@ -1394,7 +1413,40 @@ mod tests {
         assert!(fake
             .calls()
             .iter()
-            .any(|call| call == "pane_run:w1A:p6:cd /tmp && claude"));
+            .any(|call| call == "pane_run:w1A:p6:export HERDR_AGENT=claude; cd /tmp && claude"));
+    }
+
+    #[test]
+    fn respawn_pane_prefixes_the_herdr_agent_hint_as_its_own_statement() {
+        // Defect D (findings §4/§12): a teammate's argv0 is a version-path
+        // binary herdr's detector can't name, so herdr never reports an
+        // agent for that pane. HERDR_AGENT is the documented env hint that
+        // fixes this from inside herdmates — but ONLY as a separate
+        // statement. Claude Code's real launch command is compound (`cd
+        // <dir> && env … <binary> …`), and a BARE prefix
+        // (`HERDR_AGENT=claude cd … && …`) binds the variable to `cd`, not
+        // the exec'd binary — measured to silently reproduce the exact
+        // `agent: null` this exists to fix (findings §12's trap). `export
+        // …; ` is its own statement in the same shell invocation, so it
+        // takes effect regardless of what shape the rest of the command
+        // takes; this test pins that exact shape against the real
+        // multi-command launch line herdr captured live.
+        let idmap = temp_idmap(&[("%1", "w1A:p6")]);
+        let fake = FakeHerdr::default();
+        let real_launch = "cd /home/zvi/Projects/nanoclaw && env CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 /home/zvi/.local/share/claude/versions/2.1.263 --agent-id probe1@team-x --agent-name probe1 --team-name team-x --parent-session-id 18b67557-0000-0000-0000-000000000000 --agent-type general-purpose --permission-mode auto";
+
+        dispatch(
+            &fake,
+            &idmap,
+            call(Verb::RespawnPane {
+                pane: TmuxId::parse("%1").unwrap(),
+                command: real_launch.to_owned(),
+            }),
+        );
+
+        assert!(fake.calls().iter().any(
+            |call| call == &format!("pane_run:w1A:p6:export HERDR_AGENT=claude; {real_launch}")
+        ));
     }
 
     #[test]
