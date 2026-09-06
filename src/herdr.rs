@@ -164,6 +164,35 @@ impl<'de> Deserialize<'de> for AgentInfo {
     }
 }
 
+/// One process in a pane's foreground job (`pane process-info`). Only the
+/// fields herdmates reads are modelled; herdr also reports `pid`, `cwd` and
+/// `cmdline`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ForegroundProcess {
+    pub name: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PaneProcessInfo {
+    #[serde(default)]
+    pub foreground_processes: Vec<ForegroundProcess>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneProcessInfoResult {
+    #[serde(rename = "type")]
+    kind: String,
+    process_info: PaneProcessInfo,
+}
+
+fn parse_pane_process_info(stdout: &str) -> Result<PaneProcessInfo, String> {
+    let result: PaneProcessInfoResult = parse_response(stdout)?;
+    expect_kind(&result.kind, "pane_process_info")?;
+    Ok(result.process_info)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
     Reached,
@@ -304,6 +333,16 @@ pub trait HerdrApi {
         _tokens: &[(String, String)],
         _clear: &[&str],
     ) -> Result<(), HerdrError> {
+        Err(unsupported_api())
+    }
+    /// `pane process-info <pane>`: the pane's foreground processes, with
+    /// their argv. herdmates uses it only to recover a rotated lead session
+    /// from a live teammate's `--parent-session-id` (Defect E).
+    ///
+    /// There is no bulk form — passing no `--pane` returns the FOCUSED pane
+    /// only (live-verified) — so this costs one subprocess per pane and
+    /// callers should scope it to panes they already have reason to inspect.
+    fn pane_process_info(&self, _pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
         Err(unsupported_api())
     }
     fn notification_show(&self, _: &str, _: &str, _: &str) -> Result<(), HerdrError> {
@@ -602,6 +641,15 @@ impl HerdrClient {
         Ok(())
     }
 
+    pub fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        let args = args(["pane", "process-info"])
+            .with("--pane")
+            .with(pane_id)
+            .finish();
+        let stdout = self.invoke(&args)?;
+        parse_pane_process_info(&stdout).map_err(|message| self.invalid_response(&args, message))
+    }
+
     pub fn notification_show(
         &self,
         title: &str,
@@ -740,6 +788,9 @@ impl HerdrApi for HerdrClient {
     ) -> Result<(), HerdrError> {
         Self::pane_report_tokens(self, pane_id, source, tokens, clear)
     }
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        Self::pane_process_info(self, pane_id)
+    }
     fn notification_show(&self, title: &str, body: &str, sound: &str) -> Result<(), HerdrError> {
         Self::notification_show(self, title, body, sound)
     }
@@ -842,6 +893,9 @@ pub(crate) mod test_support {
         pub layout_result: SyncRefCell<Option<PaneLayoutSnapshot>>,
         pub fail_layout: SyncCell<bool>,
         pub agents: SyncRefCell<Vec<AgentInfo>>,
+        /// Per-pane `pane process-info` responses (Defect E recovery).
+        pub process_info: SyncRefCell<BTreeMap<String, PaneProcessInfo>>,
+        pub fail_process_info: SyncCell<bool>,
         pub waits: SyncRefCell<VecDeque<WaitOutcome>>,
     }
 
@@ -1164,6 +1218,22 @@ pub(crate) mod test_support {
                 .borrow_mut()
                 .push(format!("pane_report_metadata:{pane_id}"));
             Ok(())
+        }
+        fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("pane_process_info:{pane_id}"));
+            if self.fail_process_info.get() {
+                return Err(Self::command_error());
+            }
+            Ok(self
+                .process_info
+                .borrow()
+                .get(pane_id)
+                .cloned()
+                .unwrap_or(PaneProcessInfo {
+                    foreground_processes: Vec::new(),
+                }))
         }
         fn pane_report_tokens(
             &self,
@@ -1719,6 +1789,36 @@ mod tests {
         let null = r#"{"id":"cli:agent:list","result":{"agents":[{"agent":"codex","agent_session":null,"agent_status":"working","pane_id":"opaque-pane","workspace_id":"opaque-workspace"}],"type":"agent_list"}}"#;
         let agents = parse_agent_list(null).unwrap();
         assert_eq!(agents[0].agent_id, None);
+    }
+
+    /// Verbatim `pane process-info` for a live split-pane teammate, captured
+    /// 2026-09-06. The argv is the only place a lead's CURRENT session id is
+    /// recoverable once `config.json`'s `leadSessionId` has gone stale.
+    const LIVE_TEAMMATE_PROCESS_INFO: &str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":665286,"foreground_processes":[{"argv":["/home/zvi/.local/share/claude/versions/2.1.263","--agent-id","review-pr436@session-c5ac985c","--agent-name","review-pr436","--team-name","session-c5ac985c","--agent-color","blue","--parent-session-id","c5ac985c-1bd3-407e-8438-1ba344d4eb13","--agent-type","general-purpose","--permission-mode","auto"],"cmdline":"irrelevant","cwd":"/home/zvi","name":"2.1.263","pid":665286}],"pane_id":"w3:p2T","shell_pid":665000},"type":"pane_process_info"}}"#;
+
+    #[test]
+    fn parses_a_live_teammate_process_info_argv() {
+        let info = parse_pane_process_info(LIVE_TEAMMATE_PROCESS_INFO).unwrap();
+
+        assert_eq!(info.foreground_processes.len(), 1);
+        let process = &info.foreground_processes[0];
+        assert_eq!(
+            process.name, "2.1.263",
+            "Defect D: the version-path binary herdr's detector cannot name"
+        );
+        assert!(process.argv.windows(2).any(
+            |w| w[0] == "--parent-session-id" && w[1] == "c5ac985c-1bd3-407e-8438-1ba344d4eb13"
+        ));
+    }
+
+    #[test]
+    fn process_info_tolerates_a_pane_with_no_foreground_processes() {
+        let empty = r#"{"id":"x","result":{"process_info":{"pane_id":"w1:p1","shell_pid":1},"type":"pane_process_info"}}"#;
+
+        assert!(parse_pane_process_info(empty)
+            .unwrap()
+            .foreground_processes
+            .is_empty());
     }
 
     #[test]

@@ -138,7 +138,18 @@ pub fn gather_team<H: HerdrApi>(
         return Vec::new();
     };
     let agents = herdr.agent_list().unwrap_or_default();
-    let lead_pane_id = pump::resolve_lead_pane(&config, &agents);
+    // Defect E: fall back to a live teammate's `--parent-session-id` when the
+    // config's recorded lead session no longer resolves. Guarded on the team
+    // actually having a split-pane teammate — the recovery reads one, and the
+    // probe costs a subprocess per candidate pane.
+    let lead_pane_id = pump::resolve_lead_pane(&config, &agents).or_else(|| {
+        config
+            .members
+            .iter()
+            .any(|member| !member.is_lead && member.backend_type.as_deref() == Some("tmux"))
+            .then(|| recover_lead_pane_via_teammates(herdr, team, &agents))
+            .flatten()
+    });
     let lead_status = lead_pane_id.as_ref().and_then(|pane_id| {
         agents
             .iter()
@@ -660,6 +671,97 @@ pub fn team_mailbox_tail(
 // Stat only — the ADR-0013 cut line forbids parsing JSONL transcript
 // content in v1; only the file's mtime is read.
 
+/// What a live teammate process's argv reveals about its team (Defect E).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TeammateLaunch {
+    pub team_name: String,
+    /// The lead session that actually SPAWNED this teammate — which is the
+    /// lead's session id *now*, not the one recorded when the team was
+    /// created. Those differ whenever the lead's session has rotated.
+    pub lead_session_id: String,
+}
+
+/// Pure: read a teammate's team and its lead's live session id out of the
+/// argv Claude Code launched it with.
+///
+/// Claude Code spawns a teammate as `<versions-dir>/2.1.x --agent-id
+/// <name>@<team> --agent-name <name> --team-name <team> --parent-session-id
+/// <lead session> …` (captured verbatim from `pane process-info`). The
+/// `--parent-session-id` is the authority for Defect E: a lead's Claude Code
+/// session id rotates on resume or `/clear`, and
+/// `~/.claude/teams/<team>/config.json` keeps the id the team was created
+/// with, so `leadSessionId` can name a session that no longer exists while
+/// the team is perfectly alive.
+///
+/// Returns `None` unless BOTH flags are present with non-empty values — a
+/// plain shell, a lead's own `claude`, or a truncated argv all yield nothing
+/// rather than a partial guess.
+pub(crate) fn parse_teammate_launch(argv: &[String]) -> Option<TeammateLaunch> {
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = argv.iter().position(|part| part == flag)?;
+        argv.get(index + 1)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty() && !value.starts_with("--"))
+    }
+
+    Some(TeammateLaunch {
+        team_name: flag_value(argv, "--team-name")?.to_owned(),
+        lead_session_id: flag_value(argv, "--parent-session-id")?.to_owned(),
+    })
+}
+
+/// Impure: recover `team`'s lead pane when its recorded `leadSessionId` no
+/// longer resolves (Defect E).
+///
+/// A lead's Claude Code session id rotates on resume or `/clear`, and
+/// `~/.claude/teams/<team>/config.json` keeps the id the team was created
+/// with. `pump::resolve_lead_pane` then finds nothing, which costs the team
+/// its sidebar tokens and costs the lead its own `roster`/`why` verbs —
+/// measured 2026-09-06 on 3 of 7 live teams that have teammates.
+///
+/// A LIVE teammate knows better: it was spawned by the lead's current
+/// session and carries `--parent-session-id` in its argv. So this asks each
+/// teammate-looking pane what its team and parent are, keeps the ones
+/// claiming `team`, and resolves that parent session against `agents`.
+///
+/// Cost is why this is a fallback and not the primary path: `pane
+/// process-info` has no bulk form, so it is one subprocess per candidate
+/// pane. Only panes carrying a `display_agent` are probed — a pane herdmates
+/// never labelled is not a teammate it spawned.
+///
+/// Every failure degrades to `None`: no live teammate, a teammate of another
+/// team, a parent session that is not running (the team really is dead), or
+/// a herdr call that errors. A `None` leaves the caller exactly where it was
+/// before, which is a skipped team, never a wrong pane.
+pub(crate) fn recover_lead_pane_via_teammates<H: HerdrApi>(
+    herdr: &H,
+    team: &str,
+    agents: &[crate::herdr::AgentInfo],
+) -> Option<String> {
+    let panes = herdr.pane_list(None).ok()?;
+    for pane in panes.iter().filter(|pane| pane.display_agent.is_some()) {
+        let Ok(info) = herdr.pane_process_info(&pane.pane_id) else {
+            continue;
+        };
+        let launch = info
+            .foreground_processes
+            .iter()
+            .find_map(|process| parse_teammate_launch(&process.argv));
+        let Some(launch) = launch.filter(|launch| launch.team_name == team) else {
+            continue;
+        };
+        if let Some(lead) = agents.iter().find(|agent| {
+            agent
+                .agent_session
+                .as_ref()
+                .is_some_and(|session| session.value == launch.lead_session_id)
+        }) {
+            return Some(lead.pane_id.clone());
+        }
+    }
+    None
+}
+
 /// Pure: the one pane in `panes` whose `display_agent` is exactly `name`.
 ///
 /// `display_agent` is herdmates' own publication (`teammux::
@@ -889,7 +991,182 @@ mod tests {
         }
     }
 
+    // ── teammate launch argv (Defect E: the lead's session id rotates) ──────
+
+    /// A live teammate's argv, in the order Claude Code emits it (captured
+    /// verbatim from `pane process-info` on this machine).
+    fn teammate_argv(team: &str, name: &str, parent: Option<&str>) -> Vec<String> {
+        let mut argv = vec![
+            "/home/zvi/.local/share/claude/versions/2.1.263".to_owned(),
+            "--agent-id".to_owned(),
+            format!("{name}@{team}"),
+            "--agent-name".to_owned(),
+            name.to_owned(),
+            "--team-name".to_owned(),
+            team.to_owned(),
+            "--agent-color".to_owned(),
+            "blue".to_owned(),
+        ];
+        if let Some(parent) = parent {
+            argv.push("--parent-session-id".to_owned());
+            argv.push(parent.to_owned());
+        }
+        argv.extend(
+            [
+                "--agent-type",
+                "general-purpose",
+                "--permission-mode",
+                "auto",
+            ]
+            .iter()
+            .map(|part| (*part).to_owned()),
+        );
+        argv
+    }
+
+    #[test]
+    fn teammate_argv_yields_its_team_and_the_leads_current_session() {
+        let argv = teammate_argv("session-95cbfad4", "mns-stale", Some("18b67557-live"));
+
+        let launch = parse_teammate_launch(&argv).expect("a teammate launch");
+
+        assert_eq!(launch.team_name, "session-95cbfad4");
+        assert_eq!(launch.lead_session_id, "18b67557-live");
+    }
+
+    #[test]
+    fn argv_without_a_parent_session_yields_nothing() {
+        let argv = teammate_argv("session-x", "beta", None);
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn a_non_teammate_process_argv_yields_nothing() {
+        let argv = vec!["/usr/bin/zsh".to_owned()];
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn a_trailing_flag_with_no_value_yields_nothing_rather_than_panicking() {
+        let argv = vec![
+            "claude".to_owned(),
+            "--team-name".to_owned(),
+            "session-x".to_owned(),
+            "--parent-session-id".to_owned(),
+        ];
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn an_empty_flag_value_is_refused_like_an_absent_one() {
+        let argv = teammate_argv("session-x", "beta", Some(""));
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn a_rotated_leads_pane_is_recovered_from_its_live_teammates_argv() {
+        // Defect E end to end: the config names a session that no longer
+        // exists, a live teammate names the one that does, and that one
+        // resolves to a pane.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("live-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        let recovered = recover_lead_pane_via_teammates(&herdr, "team-x", &agents);
+
+        assert_eq!(recovered.as_deref(), Some("w4:pT"));
+    }
+
+    #[test]
+    fn recovery_ignores_teammates_belonging_to_another_team() {
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("some-other-team", "beta", Some("live-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        assert_eq!(
+            recover_lead_pane_via_teammates(&herdr, "team-x", &agents),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_yields_nothing_when_the_named_lead_session_has_no_pane() {
+        // The team is genuinely dead: its teammates point at a lead session
+        // that is not running anywhere. Skipping is correct.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("ghost-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "someone-else", "idle")];
+
+        assert_eq!(
+            recover_lead_pane_via_teammates(&herdr, "team-x", &agents),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_only_inspects_panes_that_look_like_teammates() {
+        // process-info costs one subprocess per pane and there is no bulk
+        // form, so a pane with no display_agent is never probed.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![
+            teammate_pane("w4:pT", None, Some("live-lead")),
+            teammate_pane("w4:p14", Some("beta"), Some("mate-1")),
+        ];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("live-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        recover_lead_pane_via_teammates(&herdr, "team-x", &agents);
+
+        let probed = herdr
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("pane_process_info"))
+            .collect::<Vec<_>>();
+        assert_eq!(probed, ["pane_process_info:w4:p14"]);
+    }
+
+    #[test]
+    fn recovery_degrades_to_none_when_process_info_fails() {
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.fail_process_info.set(true);
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        assert_eq!(
+            recover_lead_pane_via_teammates(&herdr, "team-x", &agents),
+            None
+        );
+    }
+
     // ── teammate pane matching ──────────────────────────────────────────────
+
+    fn process_info(argv: Vec<String>) -> crate::herdr::PaneProcessInfo {
+        crate::herdr::PaneProcessInfo {
+            foreground_processes: vec![crate::herdr::ForegroundProcess {
+                name: "2.1.263".to_owned(),
+                argv,
+            }],
+        }
+    }
 
     fn teammate_pane(
         pane_id: &str,

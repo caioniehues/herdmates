@@ -164,7 +164,24 @@ pub fn pump_once<H: HerdrApi>(paths: &GatherPaths, herdr: &H) {
         let Ok(config) = teamfiles::read_team_config(&team_dir.join("config.json")) else {
             continue;
         };
-        let Some(pane_id) = resolve_lead_pane(&config, &agents) else {
+        // Defect E: a lead's session id rotates on resume/`/clear` while the
+        // team config keeps the original, so the recorded id can name a
+        // session that no longer exists for a team that is perfectly alive.
+        // Falling back to a live teammate's `--parent-session-id` costs one
+        // `pane process-info` per teammate-looking pane, and only on the
+        // teams that failed the cheap path.
+        // Only attempted when the team actually HAS a split-pane teammate:
+        // the recovery reads a live teammate's argv, so a team without one
+        // has nothing to recover from and should not pay a `pane_list`.
+        let has_split_pane_teammate = config
+            .members
+            .iter()
+            .any(|member| !member.is_lead && member.backend_type.as_deref() == Some("tmux"));
+        let Some(pane_id) = resolve_lead_pane(&config, &agents).or_else(|| {
+            has_split_pane_teammate
+                .then(|| gather::recover_lead_pane_via_teammates(herdr, team_name, &agents))
+                .flatten()
+        }) else {
             continue;
         };
         let inboxes = read_inboxes(&team_dir.join("inboxes"));
@@ -621,6 +638,54 @@ mod tests {
             .find(|call| call.starts_with("pane_report_tokens"))
             .expect("a report call");
         assert!(report.ends_with("status=waiting,-reap,-model"), "{report}");
+    }
+
+    #[test]
+    fn pump_once_publishes_for_a_team_whose_lead_session_rotated() {
+        // Defect E: config.json names the session the team was CREATED with;
+        // the lead has since resumed and runs under a new id. Before the
+        // teammate-argv fallback this team got no tokens at all — no status,
+        // no reap count — for as long as it lived.
+        let temp = TempDir::new();
+        let paths = paths_for(temp.path());
+        write_team(
+            &paths.teams_root,
+            "session-t",
+            "stale-lead-session",
+            r#", {"agentId":"beta@session-t","name":"beta","agentType":"general-purpose","tmuxPaneId":"%1","backendType":"tmux"}"#,
+        );
+
+        let fake = FakeHerdr::default();
+        // Only the ROTATED session is live; the recorded one resolves to nothing.
+        *fake.agents.borrow_mut() = vec![agent_with_session("w1:pLead", "rotated-lead-session")];
+        *fake.panes.borrow_mut() = vec![teammate_pane("w4:p14", "beta", "mate-session")];
+        fake.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            crate::herdr::PaneProcessInfo {
+                foreground_processes: vec![crate::herdr::ForegroundProcess {
+                    name: "2.1.263".to_owned(),
+                    argv: vec![
+                        "claude".to_owned(),
+                        "--team-name".to_owned(),
+                        "session-t".to_owned(),
+                        "--parent-session-id".to_owned(),
+                        "rotated-lead-session".to_owned(),
+                    ],
+                }],
+            },
+        );
+
+        pump_once(&paths, &fake);
+
+        let published = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("pane_report_tokens"));
+        assert!(
+            published.as_deref().is_some_and(|c| c.contains("w1:pLead")),
+            "the rotated lead's pane should still receive tokens; calls: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]
