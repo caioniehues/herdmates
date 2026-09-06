@@ -55,10 +55,21 @@ now asserts on the real argv.
    count, not another notification. Consequence: **Fix 5 in the findings doc is downgraded** from
    "restore missing delivery" to "add engine reasons to a notification that already arrives", and
    Probe 1 no longer blocks anything. Full record in that doc's §11.
-3. **File the herdr issue** for `lookup_agent` not recognising Claude Code's
-   version-path argv0 (`detect/mod.rs:193`; it already handles the same shape
-   for Muse via `is_muse_versioned_binary`). This is the root of Defect D and
-   it affects every tmux teammate, herdmates or not.
+3. **Defect D may be fixable after all — highest-value open lead.** The recorded conclusion
+   ("herdr cannot hold a teammate's agent state") was too broad: it generalised from
+   `pane.report_agent` (genuinely blocked) to all routes. `HERDR_AGENT=<agent>` is a documented
+   env hint read from the process environ (`herdr/src/platform/mod.rs:322`) that drives herdr's
+   OWN detection, and `teammux::respawn_pane` already owns the teammate's launch string, so
+   prefixing it is reachable. If it works, teammate panes get real `agent`/`agent_status` and
+   Fix 3 is revived. **Probe before designing** — untested for a teammate pane.
+4. **Do NOT file a new herdr issue** for Defect D: **herdr#2779 already reports it** (open since
+   2026-08-13, `bug` + `maintainer-needed`), and herdr's `bug.yml` template explicitly forbids
+   the shape the draft used (no root cause, no proposed fix; bots close such issues same-day).
+   A short comment on #2779 adding the Linux + teammate-spawn data point is drafted at
+   `~/.claude/plans/herdr-issue-REVISED.md` §7, unposted. The original draft for
+   `lookup_agent` not recognising Claude Code's
+   version-path argv0 is superseded; note it is NOT teammate-specific — ordinary `claude` panes
+   fail too on installs whose launcher is a script rather than a symlink.
 4. **Defect E — FIXED 2026-09-06, both halves** (`8c75713`, `8fc8e6a`).
    `gather::recover_lead_pane_via_teammates` recovers a rotated lead's PANE for
    `pump_once`/`gather_team`; `brain::resolve_own_team` recovers the lead's own
