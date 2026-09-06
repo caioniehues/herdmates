@@ -1,8 +1,46 @@
 # Handoff — current state
 
-Updated 2026-09-03. Sections below dated 2026-08-21 and earlier are still
+Updated 2026-09-06. Sections below dated 2026-08-21 and earlier are still
 accurate for what they cover; the teammate-lifecycle wave on top of them is
 summarised first.
+
+## Defect D SHIPPED 2026-09-06 (`370ed08`, `8c85b8d`) — a teammate can now be `needs-you`/`blocked`
+
+`~/.claude/plans/herdmates-agent-detection-brief.md`'s lead is done: herdr never detecting a
+split-pane teammate as an agent-backed pane (Defect D) is fixed from inside herdmates.
+`teammux::respawn_pane` now prepends `export HERDR_AGENT=claude; ` to every teammate launch — a
+documented env hint that drives herdr's own detector, applied as its own shell statement rather
+than a bare prefix (Claude Code's real launch line is compound, `cd <dir> && env … <binary> …`,
+and a bare prefix binds to `cd` — measured to fail silently). `gather::gather_team` now reads a
+resolved teammate's real `agent_status` off the same pane snapshot instead of hardcoding `Unknown`.
+
+**Live-confirmed 2026-09-06** in a headless `test-herdmates` session, using the real shipped
+`teammux` dispatch code against the real captured teammate argv shape (findings doc §13 has the
+full record): without the hint, `agent: null`; with it, the pane cycled real `blocked` (an actual
+trust-prompt) → `idle` → `working` (a real ~10s turn) → `idle`, and Claude Code's own TUI rendered
+the pane with teammate chrome (`@probe1` border title). Getting Claude Code to spawn a real
+tmux-backend teammate through natural delegation did not work in this session — no LLM-invocable
+team-creation tool or slash command was found — so the confirmation runs the actual fixed
+`teammux respawn-pane` CLI entry point directly against real captured teammate argv, which is the
+part of the system this fix touches; case closed as far as it can be without that trigger.
+
+`signal_engine::classify` needed no code change — it already handles a real status correctly, and
+gets a free correctness fix: a `Working` teammate with a stale transcript (mid a long tool call) no
+longer misclassifies as stalled, since the veto only `Working` gets was unreachable while every
+teammate was `Unknown`. `brain::render_roster`'s "needs-you/blocked can never show for a teammate"
+footnote is now conditional on `agent_status` still being `Unknown` after resolving, not on being a
+resolved non-lead per se.
+
+**Decisions on the two questions the brief left open:** no new `AgentActivity`/`FiveState` needed;
+transcript-mtime liveness stays PRIMARY, not demoted — `agent_status` is a current-state snapshot,
+not a duration, so it can't ground "stalled how long," and it survives a herdr that can't see the
+pane at all (in-process teammates already depend on it exclusively).
+
+Installed over `~/.local/bin/herdmates`/`teammux` (backups: `*.pre-agent-detection-fix.bak`),
+verified by running the installed binary, not grepping it. Not filed upstream — herdr#2779 checked
+2026-09-06, still open and `maintainer-needed`, no merge landed. Not pushed; no version bump (owed
+at release — every commit on this branch changes behaviour, per the standing rule below).
+14 commits on the branch now, 390 tests (389 passed, 1 ignored), fmt/clippy/3 seam checks clean.
 
 ## Teammate lifecycle wave (2026-09-02 / 09-03) — branch `fix/teammate-idle-self-wake`, UNPUSHED
 
@@ -36,8 +74,8 @@ deleted-`--clear-token` mutant initially survived the whole suite because the on
 `FakeHerdr`, which reimplements the call instead of running it; `FakeBinary::recording_argv`
 now asserts on the real argv.
 
-**Next session has a brief:** `~/.claude/plans/herdmates-agent-detection-brief.md` — the
-`HERDR_AGENT` lead (item 3 below), scoped so the first move is a gate question, not a design.
+**The brief this section pointed to is done:** `~/.claude/plans/herdmates-agent-detection-brief.md`
+(item 3 below) — see the top section of this doc and findings §13.
 
 **Next steps, in the order they are worth doing:**
 
@@ -73,10 +111,13 @@ now asserts on the real argv.
    the versioned path with the hint reports `agent: "claude"` and cycles `blocked` (verified
    against a real on-screen prompt) → `working` → `idle`; without the hint the same process is
    `agent: null`. So the status is a real read and `needs-you` becomes reachable for a teammate,
-   which `roster` currently says is impossible. **Implement.** Two carry-forwards: poll faster
+   which `roster` currently says is impossible. Two carry-forwards: poll faster
    than 1 s or be event-driven (a 4 s poll produced a false negative — the `working` window on a
    short turn is ~1–2 s), and confirm the same holds for an actual teammate before building on
    it, since the probe used a normal session.
+   **SHIPPED 2026-09-06 — see the top section of this doc.** Both carry-forwards were honoured:
+   the confirmation used real teammate argv (not a normal session), and the live probe polled at
+   ~0.75 s.
 4. **Do NOT file a new herdr issue** for Defect D: **herdr#2779 already reports it** (open since
    2026-08-13, `bug` + `maintainer-needed`), and herdr's `bug.yml` template explicitly forbids
    the shape the draft used (no root cause, no proposed fix; bots close such issues same-day).
