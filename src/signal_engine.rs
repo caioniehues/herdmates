@@ -78,12 +78,17 @@ impl AgentActivity {
     /// `Idle`/`Done` are pane-backed quiescence. `Unknown` is admitted too,
     /// and that is the load-bearing part: it means "no pane-backed status",
     /// not "busy", and transcript mtime is a liveness fact that owes
-    /// nothing to the status field. Every split-pane TEAMMATE is `Unknown`
-    /// here by construction (Defect D: herdr's `lookup_agent` cannot name
-    /// their version-path argv0), so excluding it discarded the only
-    /// liveness signal they have — the block below already carried a
-    /// `WaitingReason::Waiting` arm for `Unknown`, unreachable while
-    /// `is_quiescent` gated entry, which is the shape this restores.
+    /// nothing to the status field. Every split-pane TEAMMATE used to be
+    /// `Unknown` here unconditionally (Defect D: herdr's `lookup_agent`
+    /// could not name their version-path argv0), so excluding it discarded
+    /// the only liveness signal they had — the block below already carried
+    /// a `WaitingReason::Waiting` arm for `Unknown`, unreachable while
+    /// `is_quiescent` gated entry, which is the shape this restores. Defect
+    /// D is now fixed for teammates launched with the `HERDR_AGENT` hint
+    /// (`teammux::respawn_pane`, `gather::resolve_teammate_pane`), so a
+    /// resolved teammate can arrive as `Idle`/`Working`/`Blocked` too —
+    /// `Unknown` remains the honest degrade for one that didn't resolve, or
+    /// resolved before the hint took effect.
     ///
     /// `Working` is the veto: a positive pane-backed "working" outranks
     /// transcript quiet, so an agent herdr says is mid-turn is never called
@@ -374,13 +379,15 @@ mod tests {
 
     #[test]
     fn unknown_status_with_a_stale_transcript_is_stalled_not_a_reason_less_degrade() {
-        // The population this matters for is split-pane TEAMMATES: herdr
-        // cannot report their agent_status at all (Defect D — their argv0 is
-        // the version-path binary, so `lookup_agent` never names them), so
-        // every teammate arrives here as `Unknown`. Their transcript mtime
-        // is a real, pane-independent liveness fact, and discarding it
-        // because the status field is empty is what left a teammate that
-        // finished hours ago indistinguishable from one mid-turn.
+        // The population this matters for is split-pane TEAMMATES: before
+        // the HERDR_AGENT fix, herdr could not report their agent_status at
+        // all (Defect D — their argv0 was the version-path binary, so
+        // `lookup_agent` never named them), so every teammate arrived here
+        // as `Unknown`; a teammate whose pane never resolved, or whose
+        // launch predates the fix, still does. Their transcript mtime is a
+        // real, pane-independent liveness fact, and discarding it because
+        // the status field is empty is what left a teammate that finished
+        // hours ago indistinguishable from one mid-turn.
         let mut f = facts(AgentActivity::Unknown);
         f.seconds_since_transcript_activity = Some(3 * 3_600);
 

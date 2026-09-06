@@ -37,13 +37,22 @@
 //! doctrine is unchanged, it simply now has evidence to work with where it
 //! previously had none.
 //!
-//! What has NOT changed: `agent_status` stays `AgentActivity::Unknown` for
-//! every non-lead member, because herdr genuinely does not have one for a
-//! teammate pane and cannot be given one (see [`resolve_teammate_pane`]'s
-//! doc comment for the measured reason). Their liveness comes from the
-//! transcript instead, which `signal_engine::classify` grounds the stalled
-//! tiers on for exactly that reason. An IN-PROCESS teammate has no pane at
-//! all, so it still degrades to `None` on both counts.
+//! What changed 2026-09-06 (Defect D fix, findings §4/§12): `agent_status`
+//! no longer stays `AgentActivity::Unknown` by construction for every
+//! non-lead member. `teammux::respawn_pane` now tags a teammate's launch
+//! with the documented `HERDR_AGENT=claude` env hint, which drives herdr's
+//! OWN detector (unlike the guarded *report* path `resolve_teammate_pane`'s
+//! doc comment still describes as blocked), so a RESOLVED teammate's pane
+//! can carry a real status — read straight off the same pane snapshot the
+//! join above already fetched, no extra herdr call. `Unknown` is still the
+//! honest answer whenever the pane didn't resolve, or resolved but the
+//! hint hadn't taken effect yet (a pane launched before this fix, say).
+//! Liveness still comes from the transcript regardless of which case it
+//! is: `agent_status` says CURRENT state, not how long it's held, so
+//! `signal_engine::classify` keeps grounding the stalled tiers on
+//! transcript mtime rather than treating a status field as a duration. An
+//! IN-PROCESS teammate has no pane at all, so it still degrades to `None`
+//! on both counts.
 //!
 //! ## Task ownership matching
 //!
@@ -167,12 +176,6 @@ pub fn gather_team<H: HerdrApi>(
         .members
         .iter()
         .map(|member| {
-            let agent_status = if member.is_lead {
-                AgentActivity::from_status_str(lead_status.as_deref())
-            } else {
-                AgentActivity::Unknown
-            };
-
             let owned_task_blocked_by_incomplete =
                 any_owned_task_blocked(&tasks, &member.name, &member.agent_id);
 
@@ -183,6 +186,19 @@ pub fn gather_team<H: HerdrApi>(
             let teammate_pane = (!member.is_lead)
                 .then(|| resolve_teammate_pane(&panes, &paths.projects_root, team, &member.name))
                 .flatten();
+
+            let agent_status = if member.is_lead {
+                AgentActivity::from_status_str(lead_status.as_deref())
+            } else {
+                // Read straight off the same resolved pane snapshot
+                // (Defect D fix) — `from_status_str(None)` degrades an
+                // unresolved teammate to `Unknown`, same as before.
+                AgentActivity::from_status_str(
+                    teammate_pane
+                        .as_ref()
+                        .and_then(|resolved| resolved.agent_status.as_deref()),
+                )
+            };
 
             let seconds_since_transcript_activity = if member.is_lead {
                 // The lead's recorded `leadSessionId` only names the lead's
@@ -901,12 +917,15 @@ fn resolve_transcript_mtime(projects_root: &Path, session_id: &str) -> Option<Sy
     std::fs::metadata(&path).ok()?.modified().ok()
 }
 
-/// One non-lead member's resolved herdr pane, and the transcript whose
-/// mtime is its liveness signal.
+/// One non-lead member's resolved herdr pane, the transcript whose mtime is
+/// its liveness signal, and the pane's own `agent_status` (verbatim, wire
+/// string form — [`AgentActivity::from_status_str`] parses it the same way
+/// a lead's does).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedTeammatePane {
     pub pane_id: String,
     pub transcript_path: PathBuf,
+    pub agent_status: Option<String>,
 }
 
 /// Impure: resolve one non-lead member to its herdr pane, VERIFIED.
@@ -930,16 +949,22 @@ pub(crate) struct ResolvedTeammatePane {
 /// Any break in the chain returns `None`, which the caller degrades to
 /// absent facts. Never a guess: an unverifiable pane is not reported.
 ///
-/// What this deliberately does NOT do is ask herdr for the teammate's agent
-/// STATE. herdr cannot hold one: a teammate pane's agent-session identity
-/// already belongs to the official `herdr:claude` source, and
-/// `set_hook_authority_at`'s owner-conflict gate drops any state report
-/// from another source unless herdr's own detector confirms the agent —
-/// which it cannot, because the teammate runs as argv0
-/// `<versions-dir>/2.1.x` and herdr's `lookup_agent` matches on basename
-/// (Defect D). Measured live 2026-09-03: the report is accepted on a pane
-/// with no session owner and silently dropped on one with it. Hence
-/// liveness comes from the transcript, which nobody else owns.
+/// This pane's `agent_status` is returned too, read straight off the same
+/// snapshot — no extra herdr call. Historically that field was permanently
+/// `"unknown"`: a teammate's agent-session identity already belongs to
+/// herdr's official `herdr:claude` source, and `set_hook_authority_at`'s
+/// owner-conflict gate drops any *report* from another source unless
+/// herdr's own detector confirms the agent, which it could not while the
+/// teammate ran as argv0 `<versions-dir>/2.1.x` and `lookup_agent` matched
+/// on basename (Defect D). `teammux::respawn_pane` now tags the teammate's
+/// launch with `HERDR_AGENT=claude` — a hint that drives herdr's OWN
+/// detector rather than the guarded report path — so a resolved teammate's
+/// pane can carry a real status now (blocked/working/idle, live-verified
+/// against an actual teammate-shaped launch: findings §12/§12.1 and this
+/// fix's own confirmation). A pane launched before the fix, or one whose
+/// hint didn't take, still reads `"unknown"` here exactly as before; the
+/// transcript-mtime liveness this function also resolves does not depend on
+/// which case it is.
 fn resolve_teammate_pane(
     panes: &[PaneInfo],
     projects_root: &Path,
@@ -957,6 +982,7 @@ fn resolve_teammate_pane(
         ResolvedTeammatePane {
             pane_id: pane.pane_id.clone(),
             transcript_path,
+            agent_status: pane.agent_status.clone(),
         }
     })
 }
@@ -1781,6 +1807,33 @@ mod tests {
             .seconds_since_transcript_activity
             .expect("teammate transcript liveness resolved");
         assert!((1_195..=1_205).contains(&secs), "secs was {secs}");
+    }
+
+    #[test]
+    fn gather_team_surfaces_a_resolved_teammates_real_agent_status() {
+        // Defect D fix (findings §4/§12): teammux::respawn_pane now tags a
+        // teammate's launch with HERDR_AGENT=claude, so herdr's own
+        // detector can hold a real agent_status for that pane instead of
+        // the permanent "unknown" Defect D produced. Once a teammate's pane
+        // resolves (the verified join this module already does), its
+        // agent_status should be read off that SAME pane snapshot — no new
+        // herdr call — rather than hardcoded to Unknown.
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        let herdr = FakeHerdr::default();
+        teammate_fixture(&paths, &herdr, "team-x", Some("beta"));
+        // Overwrite the fixture's hardcoded "unknown" with a real status,
+        // exactly as a hinted teammate pane now reports live.
+        herdr.panes.borrow_mut()[0].agent_status = Some("blocked".to_owned());
+
+        let facts = gather_team(&paths, "team-x", &herdr, SystemTime::now());
+
+        let beta = facts.iter().find(|f| f.name == "beta").unwrap();
+        assert_eq!(beta.facts.agent_status, AgentActivity::Blocked);
     }
 
     #[test]
