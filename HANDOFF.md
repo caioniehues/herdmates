@@ -36,6 +36,9 @@ deleted-`--clear-token` mutant initially survived the whole suite because the on
 `FakeHerdr`, which reimplements the call instead of running it; `FakeBinary::recording_argv`
 now asserts on the real argv.
 
+**Next session has a brief:** `~/.claude/plans/herdmates-agent-detection-brief.md` — the
+`HERDR_AGENT` lead (item 3 below), scoped so the first move is a gate question, not a design.
+
 **Next steps, in the order they are worth doing:**
 
 1. **Installed 2026-09-03 17:04** from this worktree via the plugin's own build hook
