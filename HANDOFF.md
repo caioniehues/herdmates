@@ -133,8 +133,16 @@ now asserts on the real argv.
    teammate's `--parent-session-id` and share `gather::teammate_launches`. The
    recorded `leadSessionId` is still tried first, and a session that genuinely
    leads nothing still gets the honest error.
-5. Release when Caio says: bump the manifest + Cargo version (**owed** — these
-   commits change behaviour) and tag.
+5. **Landing this is a maintainer decision, and nobody has asked yet.** We hold
+   `pull` only on `caioniehues/herdmates` (`push: false`) — there is a `fork`
+   remote (`ZviBaratz/herdmates`) because contribution goes through a fork PR,
+   which is the path issue #133 already offers and which has never been opened.
+   The manifest + Cargo version bump and the tag are **Caio's**, not a chore
+   waiting for the next session: bumping a version asserts a release, and
+   CLAUDE.md is explicit that pushes to `main` ARE releases and need Caio's ask.
+   So the actual next step is asking — with Zvi's say-so, since the same brief
+   says do not post to GitHub without asking. What a session CAN do
+   unprompted: keep the gate green and keep this file honest.
 6. **Verification note:** do NOT use `grep <string> ~/.local/bin/herdmates` to
    confirm an install. Release builds inline short literal comparisons, so
    `--parent-session-id` is absent from the binary that demonstrably uses it.
