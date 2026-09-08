@@ -133,7 +133,17 @@ now asserts on the real argv.
    teammate's `--parent-session-id` and share `gather::teammate_launches`. The
    recorded `leadSessionId` is still tried first, and a session that genuinely
    leads nothing still gets the honest error.
-5. **Landing this is a maintainer decision, and nobody has asked yet.** We hold
+5. **ASKED 2026-09-08 — waiting on Caio.** herdmates#133 now carries a comment
+   asking whether he wants this as one PR or split into four
+   (`issuecomment-5582124564`). The branch is on the fork
+   (`ZviBaratz/herdmates`, `fix/teammate-idle-self-wake`, all 22 commits) and a
+   PR body is drafted, unopened, at
+   `~/.claude/plans/herdmates-fork-PR-body.md`. **Do not open the PR before he
+   answers** — the ask exists precisely so he picks the granularity. If he says
+   split, the four slices are the body's own four sections; they land in that
+   order without conflicts. The version bump and tag remain his.
+
+   Background, still true: we hold
    `pull` only on `caioniehues/herdmates` (`push: false`) — there is a `fork`
    remote (`ZviBaratz/herdmates`) because contribution goes through a fork PR,
    which is the path issue #133 already offers and which has never been opened.
