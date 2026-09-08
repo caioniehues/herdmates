@@ -14,9 +14,22 @@
 #     does not exist; typo it and you silently get nothing (see warning
 #     below), not an error.
 #   - Custom (from `pane report-metadata --token NAME=VALUE`): `$name`.
-#     herdmates' board pump (src/pump.rs, src/tokens.rs) publishes `$task`
-#     and `$status` for each native team's lead, under source id
-#     `herdmates-board`.
+#     herdmates' board pump (src/pump.rs, src/tokens.rs) publishes
+#     `$task`, `$status` and `$reap` for each native team's lead, under
+#     source id `herdmates-board`.
+#
+# `$model` was published by the pump from the very first board wave and
+# had no row here until 2026-09-03 — so it reached herdr and rendered
+# nowhere, for months, with nothing to notice. Found by
+# `scripts/check-token-seams.sh` on its first run, which is the whole
+# argument for that check.
+#
+# `$reap` is how many of that lead's teammates have finished and are
+# still running — a teammate is a persistent Claude Code session, so
+# nothing but `TaskStop` ends one, and the count is the only ambient
+# indication that they are piling up. It reads `N to stop`, and the pump
+# publishes no `$reap` token at all when the count is zero, so the row
+# disappears rather than showing `0` (see the omitted-row rule below).
 #
 # A row is omitted entirely — not rendered blank — when every token cell
 # in it resolves to nothing for a given pane. Safe to always include a
@@ -45,10 +58,19 @@
 # Only panes with a detected agent session (Claude, Codex, etc.) ever
 # appear in the sidebar at all — agent-less panes are never listed here,
 # regardless of this rows config.
+#
+# That is why the tokens above all sit on the LEAD's pane, `$reap`
+# included, even though `$reap` counts teammates. A split-pane teammate's
+# pane has no detected agent (herdr cannot name the version-numbered
+# binary it runs as) and so never appears in this panel at all — which is
+# also why `herdmates roster` exists and why the reap hint is per-lead
+# here but per-teammate there.
 
 [ui.sidebar.agents]
 rows = [
   ["state_icon", "agent", "state_text"],
   ["$task"],
   ["$status"],
+  ["$reap"],
+  ["$model"],
 ]

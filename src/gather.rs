@@ -8,22 +8,51 @@
 //! parsing/matching logic here is testable on tempdir fixtures without a
 //! live team (no live process, no live herdr, no live Claude Code state).
 //!
-//! ## Session-id resolution is lead-only (documented gap, not a guess)
+//! ## Session-id resolution: lead by config, split-pane teammate by pane
 //!
 //! Live team-config `members[]` entries carry no per-teammate session id
 //! field (verified against `docs/research/native-teamfiles-schema-
 //! 2026-07-16.md`'s captured 2-teammate sample and re-verified live against
 //! every team config on this machine, 2026-07-17) — only the top-level
-//! `leadSessionId` resolves to a Claude Code session. `src/pump.rs`
-//! already encodes this exact doctrine (`resolve_lead_pane`, reused here):
-//! non-lead teammates have no herdr-resolvable pane pre-shim, so they are
-//! always skipped rather than paired via an unreliable heuristic (e.g.
-//! cwd-matching, which risks silently binding the wrong agent). Concretely:
-//! only the team lead ever gets a non-`Unknown` `agent_status` or a
-//! `Some` transcript-liveness fact from this module; every other member
-//! degrades to `AgentActivity::Unknown` / `None`, which is exactly the
-//! engine's never-wrong-reason doctrine (a `None` here drives the
-//! reason-less `Waiting` degrade, never a guessed class).
+//! `leadSessionId` resolves a Claude Code session *from the config*. The
+//! lead is therefore resolved exactly as before, via `pump::
+//! resolve_lead_pane`.
+//!
+//! What changed 2026-09-03 is that the config is no longer the only
+//! source. A SPLIT-PANE teammate's herdr pane carries both halves of the
+//! join itself, measured live on four teammates:
+//!
+//! - `display_agent` is the teammate's NAME — herdmates published it
+//!   (`teammux::publish_display_agent`), and no other pane field names a
+//!   teammate; and
+//! - `agent_session.value` is the teammate's OWN session id, reported by
+//!   herdr's official `herdr:claude` integration even though herdr cannot
+//!   name the *agent* in that pane (Defect D).
+//!
+//! Both are still only candidates. [`resolve_teammate_pane`] confirms the
+//! pairing against the transcript that session id resolves to, which
+//! declares its own `agentName` and `teamName`, and refuses the binding
+//! when either disagrees or when two panes claim one name. Anything
+//! unverifiable degrades to `None` exactly as before — the never-guess
+//! doctrine is unchanged, it simply now has evidence to work with where it
+//! previously had none.
+//!
+//! What changed 2026-09-06 (Defect D fix, findings §4/§12): `agent_status`
+//! no longer stays `AgentActivity::Unknown` by construction for every
+//! non-lead member. `teammux::respawn_pane` now tags a teammate's launch
+//! with the documented `HERDR_AGENT=claude` env hint, which drives herdr's
+//! OWN detector (unlike the guarded *report* path `resolve_teammate_pane`'s
+//! doc comment still describes as blocked), so a RESOLVED teammate's pane
+//! can carry a real status — read straight off the same pane snapshot the
+//! join above already fetched, no extra herdr call. `Unknown` is still the
+//! honest answer whenever the pane didn't resolve, or resolved but the
+//! hint hadn't taken effect yet (a pane launched before this fix, say).
+//! Liveness still comes from the transcript regardless of which case it
+//! is: `agent_status` says CURRENT state, not how long it's held, so
+//! `signal_engine::classify` keeps grounding the stalled tiers on
+//! transcript mtime rather than treating a status field as a duration. An
+//! IN-PROCESS teammate has no pane at all, so it still degrades to `None`
+//! on both counts.
 //!
 //! ## Task ownership matching
 //!
@@ -45,7 +74,7 @@
 //! seconds_since_unread_inbox`] is derived, from the oldest entry with
 //! `read: false`.
 
-use crate::herdr::HerdrApi;
+use crate::herdr::{HerdrApi, PaneInfo};
 use crate::pump;
 use crate::signal_engine::{AgentActivity, ObservedFacts};
 use crate::teamfiles;
@@ -93,9 +122,13 @@ pub struct TeammateFacts {
     pub facts: ObservedFacts,
     /// Herdr pane id, when this teammate resolves to one (#99 jump-to-pane
     /// affordance). `None` degrades the affordance to hidden, never a
-    /// guess. Lead-only by construction today (see module doc's
-    /// session-id-resolution gap) — non-lead members have no
-    /// herdr-resolvable session id in the live team-config schema.
+    /// guess.
+    ///
+    /// Resolved two ways, per the module doc: the lead through its
+    /// config-recorded session id, a split-pane teammate through its own
+    /// pane's `display_agent` + `agent_session`, verified against that
+    /// session's transcript ([`resolve_teammate_pane`]). An in-process
+    /// teammate has no pane and stays `None`.
     pub pane_id: Option<String>,
 }
 
@@ -114,7 +147,18 @@ pub fn gather_team<H: HerdrApi>(
         return Vec::new();
     };
     let agents = herdr.agent_list().unwrap_or_default();
-    let lead_pane_id = pump::resolve_lead_pane(&config, &agents);
+    // Defect E: fall back to a live teammate's `--parent-session-id` when the
+    // config's recorded lead session no longer resolves. Guarded on the team
+    // actually having a split-pane teammate — the recovery reads one, and the
+    // probe costs a subprocess per candidate pane.
+    let lead_pane_id = pump::resolve_lead_pane(&config, &agents).or_else(|| {
+        config
+            .members
+            .iter()
+            .any(|member| !member.is_lead && member.backend_type.as_deref() == Some("tmux"))
+            .then(|| recover_lead_pane_via_teammates(herdr, team, &agents))
+            .flatten()
+    });
     let lead_status = lead_pane_id.as_ref().and_then(|pane_id| {
         agents
             .iter()
@@ -124,31 +168,66 @@ pub fn gather_team<H: HerdrApi>(
 
     let tasks = read_task_files(&paths.tasks_root.join(team));
     let inboxes_dir = paths.teams_root.join(team).join("inboxes");
+    // One pane snapshot for the whole pass, like `agent_list` above: the
+    // non-lead resolution below is per-member but the source is not.
+    let panes = herdr.pane_list(None).unwrap_or_default();
 
     config
         .members
         .iter()
         .map(|member| {
-            let agent_status = if member.is_lead {
-                AgentActivity::from_status_str(lead_status.as_deref())
-            } else {
-                AgentActivity::Unknown
-            };
-
             let owned_task_blocked_by_incomplete =
                 any_owned_task_blocked(&tasks, &member.name, &member.agent_id);
 
+            // A non-lead member resolves to a pane only through the
+            // verified chain in `resolve_teammate_pane`; its transcript is
+            // then the same liveness source the lead uses, read off the
+            // path that chain already proved belongs to this teammate.
+            let teammate_pane = (!member.is_lead)
+                .then(|| resolve_teammate_pane(&panes, &paths.projects_root, team, &member.name))
+                .flatten();
+
+            let agent_status = if member.is_lead {
+                AgentActivity::from_status_str(lead_status.as_deref())
+            } else {
+                // Read straight off the same resolved pane snapshot
+                // (Defect D fix) — `from_status_str(None)` degrades an
+                // unresolved teammate to `Unknown`, same as before.
+                AgentActivity::from_status_str(
+                    teammate_pane
+                        .as_ref()
+                        .and_then(|resolved| resolved.agent_status.as_deref()),
+                )
+            };
+
             let seconds_since_transcript_activity = if member.is_lead {
-                config
-                    .lead_session_id
-                    .as_deref()
+                // The lead's recorded `leadSessionId` only names the lead's
+                // CURRENT session while it still resolves to the lead's
+                // pane. A session id rotates (resume, `/clear`) and the
+                // team config keeps the one the team was created with —
+                // measured live 2026-09-03 on `session-95cbfad4`, whose
+                // config names 95cbfad4… while its lead pane runs
+                // 18b67557…. The abandoned session's transcript then sits
+                // still while the lead works, so attributing its mtime to
+                // the lead claims "stalled" about an agent mid-turn. Same
+                // ownership rule `enrich.rs` applies to a payload
+                // transcript, and the same one the teammate branch below
+                // applies: no verified owner, no fact.
+                lead_pane_id
+                    .as_ref()
+                    .and(config.lead_session_id.as_deref())
                     .and_then(|session_id| {
                         resolve_transcript_mtime(&paths.projects_root, session_id)
                     })
                     .and_then(|mtime| now.duration_since(mtime).ok())
                     .map(|elapsed| elapsed.as_secs())
             } else {
-                None
+                teammate_pane
+                    .as_ref()
+                    .and_then(|resolved| std::fs::metadata(&resolved.transcript_path).ok())
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|mtime| now.duration_since(mtime).ok())
+                    .map(|elapsed| elapsed.as_secs())
             };
 
             let seconds_since_unread_inbox =
@@ -167,7 +246,7 @@ pub fn gather_team<H: HerdrApi>(
                 pane_id: if member.is_lead {
                     lead_pane_id.clone()
                 } else {
-                    None
+                    teammate_pane.map(|resolved| resolved.pane_id)
                 },
             }
         })
@@ -608,7 +687,216 @@ pub fn team_mailbox_tail(
 // Stat only — the ADR-0013 cut line forbids parsing JSONL transcript
 // content in v1; only the file's mtime is read.
 
-fn resolve_transcript_mtime(projects_root: &Path, session_id: &str) -> Option<SystemTime> {
+/// What a live teammate process's argv reveals about its team (Defect E).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TeammateLaunch {
+    pub team_name: String,
+    /// The lead session that actually SPAWNED this teammate — which is the
+    /// lead's session id *now*, not the one recorded when the team was
+    /// created. Those differ whenever the lead's session has rotated.
+    pub lead_session_id: String,
+}
+
+/// Pure: read a teammate's team and its lead's live session id out of the
+/// argv Claude Code launched it with.
+///
+/// Claude Code spawns a teammate as `<versions-dir>/2.1.x --agent-id
+/// <name>@<team> --agent-name <name> --team-name <team> --parent-session-id
+/// <lead session> …` (captured verbatim from `pane process-info`). The
+/// `--parent-session-id` is the authority for Defect E: a lead's Claude Code
+/// session id rotates on resume or `/clear`, and
+/// `~/.claude/teams/<team>/config.json` keeps the id the team was created
+/// with, so `leadSessionId` can name a session that no longer exists while
+/// the team is perfectly alive.
+///
+/// Returns `None` unless BOTH flags are present with non-empty values — a
+/// plain shell, a lead's own `claude`, or a truncated argv all yield nothing
+/// rather than a partial guess.
+pub(crate) fn parse_teammate_launch(argv: &[String]) -> Option<TeammateLaunch> {
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = argv.iter().position(|part| part == flag)?;
+        argv.get(index + 1)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty() && !value.starts_with("--"))
+    }
+
+    Some(TeammateLaunch {
+        team_name: flag_value(argv, "--team-name")?.to_owned(),
+        lead_session_id: flag_value(argv, "--parent-session-id")?.to_owned(),
+    })
+}
+
+/// Impure: recover `team`'s lead pane when its recorded `leadSessionId` no
+/// longer resolves (Defect E).
+///
+/// A lead's Claude Code session id rotates on resume or `/clear`, and
+/// `~/.claude/teams/<team>/config.json` keeps the id the team was created
+/// with. `pump::resolve_lead_pane` then finds nothing, which costs the team
+/// its sidebar tokens and costs the lead its own `roster`/`why` verbs —
+/// measured 2026-09-06 on 3 of 7 live teams that have teammates.
+///
+/// A LIVE teammate knows better: it was spawned by the lead's current
+/// session and carries `--parent-session-id` in its argv. So this asks each
+/// teammate-looking pane what its team and parent are, keeps the ones
+/// claiming `team`, and resolves that parent session against `agents`.
+///
+/// Cost is why this is a fallback and not the primary path: `pane
+/// process-info` has no bulk form, so it is one subprocess per candidate
+/// pane. Only panes carrying a `display_agent` are probed — a pane herdmates
+/// never labelled is not a teammate it spawned.
+///
+/// Every failure degrades to `None`: no live teammate, a teammate of another
+/// team, a parent session that is not running (the team really is dead), or
+/// a herdr call that errors. A `None` leaves the caller exactly where it was
+/// before, which is a skipped team, never a wrong pane.
+pub(crate) fn recover_lead_pane_via_teammates<H: HerdrApi>(
+    herdr: &H,
+    team: &str,
+    agents: &[crate::herdr::AgentInfo],
+) -> Option<String> {
+    teammate_launches(herdr)
+        .into_iter()
+        .filter(|launch| launch.team_name == team)
+        .find_map(|launch| {
+            agents
+                .iter()
+                .find(|agent| {
+                    agent
+                        .agent_session
+                        .as_ref()
+                        .is_some_and(|session| session.value == launch.lead_session_id)
+                })
+                .map(|lead| lead.pane_id.clone())
+        })
+}
+
+/// Impure: the team `session_id` leads, discovered from the teammates it
+/// spawned rather than from any team config (Defect E, second half).
+///
+/// `brain::resolve_own_team` matches the calling session against each team's
+/// recorded `leadSessionId`, so a lead whose session has rotated is told it
+/// leads nothing and loses `roster`/`why` entirely — while its teammates are
+/// running in front of it. Those teammates carry `--parent-session-id`, which
+/// still names the session asking the question.
+///
+/// `None` whenever no live teammate names `session_id` as its parent, which
+/// keeps the honest "not a team lead" error for a session that genuinely
+/// leads nothing. Same cost profile and the same degrade rules as
+/// [`recover_lead_pane_via_teammates`]; both share [`teammate_launches`].
+pub(crate) fn recover_team_by_lead_session<H: HerdrApi>(
+    herdr: &H,
+    session_id: &str,
+) -> Option<String> {
+    teammate_launches(herdr)
+        .into_iter()
+        .find(|launch| launch.lead_session_id == session_id)
+        .map(|launch| launch.team_name)
+}
+
+/// Impure: every live teammate's self-declared `(team, lead session)`.
+///
+/// Only panes carrying a `display_agent` are probed — a pane herdmates never
+/// labelled is not a teammate it spawned — because `pane process-info` has no
+/// bulk form and costs one subprocess per pane. A herdr failure at either
+/// step drops that pane rather than the whole scan.
+fn teammate_launches<H: HerdrApi>(herdr: &H) -> Vec<TeammateLaunch> {
+    let Ok(panes) = herdr.pane_list(None) else {
+        return Vec::new();
+    };
+    panes
+        .iter()
+        .filter(|pane| pane.display_agent.is_some())
+        .filter_map(|pane| herdr.pane_process_info(&pane.pane_id).ok())
+        .filter_map(|info| {
+            info.foreground_processes
+                .iter()
+                .find_map(|process| parse_teammate_launch(&process.argv))
+        })
+        .collect()
+}
+
+/// Pure: the one pane in `panes` whose `display_agent` is exactly `name`.
+///
+/// `display_agent` is herdmates' own publication (`teammux::
+/// publish_display_agent`, called once per teammate right after its pane is
+/// split) and the only field on a pane snapshot that names a teammate.
+///
+/// Returns `None` for zero matches AND for more than one: two teams can
+/// each hold a teammate called `reviewer`, and picking either would
+/// attribute one team's pane to the other team's member. A caller that gets
+/// `None` degrades the fact to absent, which is this module's documented
+/// failure mode — an unverifiable binding is never guessed. The surviving
+/// single match is still verified against the pane's own transcript before
+/// it is used (see [`resolve_teammate_pane`]).
+pub(crate) fn match_teammate_pane<'a>(panes: &'a [PaneInfo], name: &str) -> Option<&'a PaneInfo> {
+    let mut matches = panes
+        .iter()
+        .filter(|pane| pane.display_agent.as_deref() == Some(name));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+/// Identity a Claude Code TEAMMATE transcript declares about itself.
+///
+/// Live-verified 2026-09-03 on four split-pane teammates: every `user` /
+/// `assistant` / `attachment` record in a teammate's transcript carries
+/// `agentName` and `teamName`, and a LEAD's transcript carries neither
+/// (checked against its own transcript over the same window). So this is
+/// both an identity and a positive discriminator: `None` means "not a
+/// teammate transcript", never "unknown".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranscriptIdentity {
+    pub agent_name: String,
+    pub team_name: String,
+}
+
+/// How many leading transcript records [`read_transcript_identity`] will
+/// read before giving up. The identity lands at record 3 or 4 in every live
+/// sample (the first three are `agent-setting` / `mode` /
+/// `permission-mode`, which carry no identity), so this is generous by two
+/// orders of magnitude — its job is to bound the read on a transcript that
+/// turns out not to be a teammate's, since those run to thousands of
+/// records.
+pub(crate) const IDENTITY_SCAN_RECORDS: usize = 64;
+
+/// Impure: read `path`'s self-declared teammate identity.
+///
+/// Never errors: a missing file, an unreadable one, malformed lines, or an
+/// identity past [`IDENTITY_SCAN_RECORDS`] all degrade to `None` — the same
+/// never-guess policy as every other source in this module. A `None` makes
+/// the caller refuse the binding rather than accept an unverified one.
+fn read_transcript_identity(path: &Path) -> Option<TranscriptIdentity> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file)
+        .lines()
+        .take(IDENTITY_SCAN_RECORDS)
+    {
+        let Ok(line) = line else {
+            return None;
+        };
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let agent_name = record.get("agentName").and_then(|value| value.as_str());
+        let team_name = record.get("teamName").and_then(|value| value.as_str());
+        if let (Some(agent_name), Some(team_name)) = (agent_name, team_name) {
+            return Some(TranscriptIdentity {
+                agent_name: agent_name.to_owned(),
+                team_name: team_name.to_owned(),
+            });
+        }
+    }
+    None
+}
+
+/// Impure: the transcript file for `session_id`, whichever per-project
+/// directory under `projects_root` holds it. Claude Code names transcripts
+/// `<session-id>.jsonl` inside a directory derived from the session's cwd,
+/// which a caller holding only a session id cannot reconstruct — hence the
+/// scan.
+fn resolve_transcript_path(projects_root: &Path, session_id: &str) -> Option<PathBuf> {
     let entries = std::fs::read_dir(projects_root).ok()?;
     let file_name = format!("{session_id}.jsonl");
     for entry in entries.filter_map(Result::ok) {
@@ -617,13 +905,86 @@ fn resolve_transcript_mtime(projects_root: &Path, session_id: &str) -> Option<Sy
             continue;
         }
         let candidate = dir_path.join(&file_name);
-        if let Ok(metadata) = std::fs::metadata(&candidate) {
-            if let Ok(modified) = metadata.modified() {
-                return Some(modified);
-            }
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     None
+}
+
+fn resolve_transcript_mtime(projects_root: &Path, session_id: &str) -> Option<SystemTime> {
+    let path = resolve_transcript_path(projects_root, session_id)?;
+    std::fs::metadata(&path).ok()?.modified().ok()
+}
+
+/// One non-lead member's resolved herdr pane, the transcript whose mtime is
+/// its liveness signal, and the pane's own `agent_status` (verbatim, wire
+/// string form — [`AgentActivity::from_status_str`] parses it the same way
+/// a lead's does).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedTeammatePane {
+    pub pane_id: String,
+    pub transcript_path: PathBuf,
+    pub agent_status: Option<String>,
+}
+
+/// Impure: resolve one non-lead member to its herdr pane, VERIFIED.
+///
+/// This is the join the module doc used to call impossible, and it is a
+/// three-step chain in which every step is a fact rather than a heuristic
+/// (measured live 2026-09-03, four teammates):
+///
+/// 1. [`match_teammate_pane`] finds the single pane whose `display_agent`
+///    is this member's name — herdmates' own publication.
+/// 2. That pane carries an `agent_session` under herdr's official
+///    `herdr:claude` source whose value is the TEAMMATE's own Claude Code
+///    session id. (The module doc previously recorded that no per-teammate
+///    session id exists anywhere; it exists here, reported by herdr, and
+///    that is what makes the rest possible.)
+/// 3. That session's transcript declares its own `agentName` and
+///    `teamName`, which must both match — so a `beta` pane belonging to
+///    another team, or a lead's pane that happens to carry a matching
+///    display label, is rejected rather than bound.
+///
+/// Any break in the chain returns `None`, which the caller degrades to
+/// absent facts. Never a guess: an unverifiable pane is not reported.
+///
+/// This pane's `agent_status` is returned too, read straight off the same
+/// snapshot — no extra herdr call. Historically that field was permanently
+/// `"unknown"`: a teammate's agent-session identity already belongs to
+/// herdr's official `herdr:claude` source, and `set_hook_authority_at`'s
+/// owner-conflict gate drops any *report* from another source unless
+/// herdr's own detector confirms the agent, which it could not while the
+/// teammate ran as argv0 `<versions-dir>/2.1.x` and `lookup_agent` matched
+/// on basename (Defect D). `teammux::respawn_pane` now tags the teammate's
+/// launch with `HERDR_AGENT=claude` — a hint that drives herdr's OWN
+/// detector rather than the guarded report path — so a resolved teammate's
+/// pane can carry a real status now (blocked/working/idle, live-verified
+/// against an actual teammate-shaped launch: findings §12/§12.1 and this
+/// fix's own confirmation). A pane launched before the fix, or one whose
+/// hint didn't take, still reads `"unknown"` here exactly as before; the
+/// transcript-mtime liveness this function also resolves does not depend on
+/// which case it is.
+fn resolve_teammate_pane(
+    panes: &[PaneInfo],
+    projects_root: &Path,
+    team: &str,
+    member_name: &str,
+) -> Option<ResolvedTeammatePane> {
+    let pane = match_teammate_pane(panes, member_name)?;
+    let session = pane.agent_session.as_ref()?;
+    if session.kind != "id" {
+        return None;
+    }
+    let transcript_path = resolve_transcript_path(projects_root, &session.value)?;
+    let identity = read_transcript_identity(&transcript_path)?;
+    (identity.agent_name == member_name && identity.team_name == team).then(|| {
+        ResolvedTeammatePane {
+            pane_id: pane.pane_id.clone(),
+            transcript_path,
+            agent_status: pane.agent_status.clone(),
+        }
+    })
 }
 
 // ─── Minimal ISO-8601 UTC parser (no external time crate) ─────────────────────
@@ -663,7 +1024,7 @@ pub(crate) fn parse_iso8601_utc(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::herdr::test_support::FakeHerdr;
-    use crate::herdr::{AgentInfo, AgentSession};
+    use crate::herdr::{AgentInfo, AgentSession, PaneInfo};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -691,6 +1052,375 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    // ── teammate launch argv (Defect E: the lead's session id rotates) ──────
+
+    /// A live teammate's argv, in the order Claude Code emits it (captured
+    /// verbatim from `pane process-info` on this machine).
+    fn teammate_argv(team: &str, name: &str, parent: Option<&str>) -> Vec<String> {
+        let mut argv = vec![
+            "/home/zvi/.local/share/claude/versions/2.1.263".to_owned(),
+            "--agent-id".to_owned(),
+            format!("{name}@{team}"),
+            "--agent-name".to_owned(),
+            name.to_owned(),
+            "--team-name".to_owned(),
+            team.to_owned(),
+            "--agent-color".to_owned(),
+            "blue".to_owned(),
+        ];
+        if let Some(parent) = parent {
+            argv.push("--parent-session-id".to_owned());
+            argv.push(parent.to_owned());
+        }
+        argv.extend(
+            [
+                "--agent-type",
+                "general-purpose",
+                "--permission-mode",
+                "auto",
+            ]
+            .iter()
+            .map(|part| (*part).to_owned()),
+        );
+        argv
+    }
+
+    #[test]
+    fn teammate_argv_yields_its_team_and_the_leads_current_session() {
+        let argv = teammate_argv("session-95cbfad4", "mns-stale", Some("18b67557-live"));
+
+        let launch = parse_teammate_launch(&argv).expect("a teammate launch");
+
+        assert_eq!(launch.team_name, "session-95cbfad4");
+        assert_eq!(launch.lead_session_id, "18b67557-live");
+    }
+
+    #[test]
+    fn argv_without_a_parent_session_yields_nothing() {
+        let argv = teammate_argv("session-x", "beta", None);
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn a_non_teammate_process_argv_yields_nothing() {
+        let argv = vec!["/usr/bin/zsh".to_owned()];
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn a_trailing_flag_with_no_value_yields_nothing_rather_than_panicking() {
+        let argv = vec![
+            "claude".to_owned(),
+            "--team-name".to_owned(),
+            "session-x".to_owned(),
+            "--parent-session-id".to_owned(),
+        ];
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn an_empty_flag_value_is_refused_like_an_absent_one() {
+        let argv = teammate_argv("session-x", "beta", Some(""));
+
+        assert_eq!(parse_teammate_launch(&argv), None);
+    }
+
+    #[test]
+    fn a_resumed_lead_finds_its_own_team_through_its_live_teammates() {
+        // The other half of Defect E: `brain::resolve_own_team` matches the
+        // CALLING session against each team's recorded `leadSessionId`, so a
+        // lead that has resumed cannot invoke its own verbs at all — it is
+        // told it is "not registered as any team's lead" while its teammates
+        // are running in front of it.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("my-live-session"))),
+        );
+
+        assert_eq!(
+            recover_team_by_lead_session(&herdr, "my-live-session").as_deref(),
+            Some("team-x")
+        );
+    }
+
+    #[test]
+    fn a_session_no_teammate_claims_as_parent_recovers_no_team() {
+        // A plain session that leads nothing must still get the honest
+        // "not a team lead" error, never someone else's team.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv(
+                "team-x",
+                "beta",
+                Some("someone-elses-session"),
+            )),
+        );
+
+        assert_eq!(
+            recover_team_by_lead_session(&herdr, "my-live-session"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rotated_leads_pane_is_recovered_from_its_live_teammates_argv() {
+        // Defect E end to end: the config names a session that no longer
+        // exists, a live teammate names the one that does, and that one
+        // resolves to a pane.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("live-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        let recovered = recover_lead_pane_via_teammates(&herdr, "team-x", &agents);
+
+        assert_eq!(recovered.as_deref(), Some("w4:pT"));
+    }
+
+    #[test]
+    fn recovery_ignores_teammates_belonging_to_another_team() {
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("some-other-team", "beta", Some("live-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        assert_eq!(
+            recover_lead_pane_via_teammates(&herdr, "team-x", &agents),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_yields_nothing_when_the_named_lead_session_has_no_pane() {
+        // The team is genuinely dead: its teammates point at a lead session
+        // that is not running anywhere. Skipping is correct.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("ghost-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "someone-else", "idle")];
+
+        assert_eq!(
+            recover_lead_pane_via_teammates(&herdr, "team-x", &agents),
+            None
+        );
+    }
+
+    #[test]
+    fn recovery_only_inspects_panes_that_look_like_teammates() {
+        // process-info costs one subprocess per pane and there is no bulk
+        // form, so a pane with no display_agent is never probed.
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![
+            teammate_pane("w4:pT", None, Some("live-lead")),
+            teammate_pane("w4:p14", Some("beta"), Some("mate-1")),
+        ];
+        herdr.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            process_info(teammate_argv("team-x", "beta", Some("live-lead"))),
+        );
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        recover_lead_pane_via_teammates(&herdr, "team-x", &agents);
+
+        let probed = herdr
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("pane_process_info"))
+            .collect::<Vec<_>>();
+        assert_eq!(probed, ["pane_process_info:w4:p14"]);
+    }
+
+    #[test]
+    fn recovery_degrades_to_none_when_process_info_fails() {
+        let herdr = FakeHerdr::default();
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), Some("mate-1"))];
+        herdr.fail_process_info.set(true);
+        let agents = vec![agent_with_session("w4:pT", "live-lead", "idle")];
+
+        assert_eq!(
+            recover_lead_pane_via_teammates(&herdr, "team-x", &agents),
+            None
+        );
+    }
+
+    // ── teammate pane matching ──────────────────────────────────────────────
+
+    fn process_info(argv: Vec<String>) -> crate::herdr::PaneProcessInfo {
+        crate::herdr::PaneProcessInfo {
+            foreground_processes: vec![crate::herdr::ForegroundProcess {
+                name: "2.1.263".to_owned(),
+                argv,
+            }],
+        }
+    }
+
+    fn teammate_pane(
+        pane_id: &str,
+        display_agent: Option<&str>,
+        session: Option<&str>,
+    ) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_owned(),
+            workspace_id: "w1".to_owned(),
+            tab_id: None,
+            agent: None,
+            agent_id: None,
+            agent_session: session.map(|value| AgentSession {
+                source: "herdr:claude".to_owned(),
+                agent: "claude".to_owned(),
+                kind: "id".to_owned(),
+                value: value.to_owned(),
+            }),
+            agent_status: Some("unknown".to_owned()),
+            display_agent: display_agent.map(str::to_owned),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn matches_the_single_pane_whose_display_agent_is_the_members_name() {
+        let panes = vec![
+            teammate_pane("w1:p1", None, Some("lead-session")),
+            teammate_pane("w1:p2", Some("reviewer"), Some("mate-session")),
+        ];
+
+        assert_eq!(
+            match_teammate_pane(&panes, "reviewer").map(|pane| pane.pane_id.as_str()),
+            Some("w1:p2")
+        );
+    }
+
+    #[test]
+    fn matches_no_pane_when_no_display_agent_carries_the_name() {
+        let panes = vec![teammate_pane("w1:p2", Some("other"), Some("s"))];
+
+        assert!(match_teammate_pane(&panes, "reviewer").is_none());
+    }
+
+    #[test]
+    fn refuses_to_pick_between_two_panes_claiming_the_same_teammate_name() {
+        // Two teams can each hold a teammate called `reviewer`. Binding
+        // either one would silently attribute one team's pane to another
+        // team's member — the exact mis-binding this module's never-guess
+        // doctrine forbids.
+        let panes = vec![
+            teammate_pane("w1:p2", Some("reviewer"), Some("s1")),
+            teammate_pane("w4:p9", Some("reviewer"), Some("s2")),
+        ];
+
+        assert!(match_teammate_pane(&panes, "reviewer").is_none());
+    }
+
+    #[test]
+    fn display_agent_matching_is_case_sensitive() {
+        // One candidate per case on purpose: with both in the same snapshot
+        // a loosened comparison would match BOTH and the ambiguity guard
+        // would return `None` anyway, so the test would pass without the
+        // exactness it claims to check.
+        let panes = vec![teammate_pane("w1:p2", Some("Reviewer"), Some("s1"))];
+
+        assert!(match_teammate_pane(&panes, "reviewer").is_none());
+    }
+
+    #[test]
+    fn display_agent_matching_is_not_a_prefix_match() {
+        let panes = vec![teammate_pane("w1:p3", Some("reviewer-2"), Some("s2"))];
+
+        assert!(match_teammate_pane(&panes, "reviewer").is_none());
+    }
+
+    // ── teammate transcript identity ────────────────────────────────────────
+
+    /// Write a transcript whose leading records carry no identity (exactly
+    /// how a live one starts: `agent-setting`, `mode`, `permission-mode`)
+    /// followed by `body`.
+    fn write_transcript(dir: &Path, session_id: &str, body: &[&str]) -> PathBuf {
+        fs::create_dir_all(dir).expect("create transcript dir");
+        let path = dir.join(format!("{session_id}.jsonl"));
+        let mut lines = vec![
+            r#"{"type":"agent-setting","sessionId":"s","agentSetting":{}}"#.to_owned(),
+            r#"{"type":"mode","sessionId":"s"}"#.to_owned(),
+            r#"{"type":"permission-mode","sessionId":"s"}"#.to_owned(),
+        ];
+        lines.extend(body.iter().map(|line| (*line).to_owned()));
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write transcript");
+        path
+    }
+
+    #[test]
+    fn teammate_transcript_declares_its_own_agent_and_team() {
+        let temp = TempDir::new();
+        let path = write_transcript(
+            temp.path(),
+            "sess-1",
+            &[r#"{"type":"user","agentName":"mns-stale","teamName":"session-95cbfad4"}"#],
+        );
+
+        let identity = read_transcript_identity(&path).expect("identity record present");
+
+        assert_eq!(identity.agent_name, "mns-stale");
+        assert_eq!(identity.team_name, "session-95cbfad4");
+    }
+
+    #[test]
+    fn lead_transcript_declares_no_identity_so_it_never_binds_to_a_teammate() {
+        let temp = TempDir::new();
+        let path = write_transcript(
+            temp.path(),
+            "sess-lead",
+            &[
+                r#"{"type":"user","userType":"external"}"#,
+                r#"{"type":"assistant","requestId":"r1"}"#,
+            ],
+        );
+
+        assert_eq!(read_transcript_identity(&path), None);
+    }
+
+    #[test]
+    fn transcript_identity_scan_is_bounded_and_skips_malformed_lines() {
+        let temp = TempDir::new();
+        let mut body = vec![r#"not json at all"#.to_owned()];
+        body.resize(
+            IDENTITY_SCAN_RECORDS + 4,
+            r#"{"type":"assistant"}"#.to_owned(),
+        );
+        body.push(r#"{"type":"user","agentName":"late","teamName":"session-late"}"#.to_owned());
+        let borrowed = body.iter().map(String::as_str).collect::<Vec<_>>();
+        let path = write_transcript(temp.path(), "sess-late", &borrowed);
+
+        assert_eq!(
+            read_transcript_identity(&path),
+            None,
+            "an identity past the scan bound degrades to None rather than an unbounded read"
+        );
+    }
+
+    #[test]
+    fn missing_transcript_file_degrades_to_no_identity() {
+        let temp = TempDir::new();
+        assert_eq!(
+            read_transcript_identity(&temp.path().join("absent.jsonl")),
+            None
+        );
     }
 
     // ── ISO-8601 parsing ────────────────────────────────────────────────────
@@ -926,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn gather_team_computes_transcript_liveness_for_lead_only() {
+    fn gather_team_computes_transcript_liveness_for_lead_and_not_in_process_members() {
         let dir = TempDir::new();
         let paths = GatherPaths {
             teams_root: dir.path().join("teams"),
@@ -940,7 +1670,11 @@ mod tests {
         let transcript_path = paths.projects_root.join("proj1/session-lead-1.jsonl");
         write(&transcript_path, "{}");
 
+        // The lead's pane has to resolve for its transcript to count as the
+        // lead's — see `lead_transcript_liveness_needs_the_lead_pane_to_
+        // resolve_first` for the live case that rule exists for.
         let herdr = FakeHerdr::default();
+        *herdr.agents.borrow_mut() = vec![agent_with_session("w1:pLead", "session-lead-1", "idle")];
         let now = SystemTime::now() + Duration::from_secs(120);
 
         let facts = gather_team(&paths, "team-x", &herdr, now);
@@ -951,8 +1685,233 @@ mod tests {
             .expect("lead transcript resolved");
         assert!((115..=125).contains(&secs), "secs was {secs}");
 
+        // `alpha` is IN-PROCESS: it has no herdr pane, so there is no
+        // pane to carry a session id and nothing to resolve a transcript
+        // from. A split-pane teammate does resolve — see
+        // `gather_team_resolves_a_split_pane_teammates_pane_and_transcript_liveness`.
         let alpha = facts.iter().find(|f| f.name == "alpha").unwrap();
         assert_eq!(alpha.facts.seconds_since_transcript_activity, None);
+        assert_eq!(alpha.pane_id, None);
+    }
+
+    #[test]
+    fn lead_transcript_liveness_needs_the_lead_pane_to_resolve_first() {
+        // Measured live 2026-09-03: team `session-95cbfad4`'s config records
+        // `leadSessionId` 95cbfad4… while the lead's pane actually runs
+        // session 18b67557… — a Claude Code session id rotates (resume,
+        // `/clear`) and the team config keeps the id the team was created
+        // with. The recorded session's transcript then goes quiet while the
+        // lead works on, and reporting its mtime as the LEAD's liveness
+        // reads as "stalled 41m" about an agent that is mid-turn.
+        //
+        // So the fact needs the same ownership proof the teammate path and
+        // `enrich.rs` both require: no verified owner, no fact. An
+        // unresolvable lead pane is exactly that case.
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        write(
+            &paths.teams_root.join("team-x/config.json"),
+            &two_member_config("session-lead-1"),
+        );
+        write(
+            &paths.projects_root.join("proj1/session-lead-1.jsonl"),
+            "{}",
+        );
+
+        // No agents at all: the lead's recorded session matches no pane.
+        let herdr = FakeHerdr::default();
+        let facts = gather_team(&paths, "team-x", &herdr, SystemTime::now());
+
+        let lead = facts.iter().find(|f| f.is_lead).unwrap();
+        assert_eq!(lead.pane_id, None);
+        assert_eq!(
+            lead.facts.seconds_since_transcript_activity, None,
+            "an unconfirmable lead session must not ground a liveness claim"
+        );
+    }
+
+    // ── non-lead (split-pane teammate) pane + liveness resolution ───────────
+
+    /// A team whose second member is a SPLIT-PANE teammate: `backendType`
+    /// `tmux` and a `tmuxPaneId` of the `%N` shape herdmates' shim mints.
+    fn split_pane_team_config(lead_session_id: &str) -> String {
+        format!(
+            r#"{{
+                "name": "team-x",
+                "leadSessionId": "{lead_session_id}",
+                "members": [
+                    {{"agentId":"team-lead@team-x","name":"team-lead","agentType":"team-lead","tmuxPaneId":"leader","backendType":"in-process"}},
+                    {{"agentId":"beta@team-x","name":"beta","agentType":"general-purpose","tmuxPaneId":"%1","backendType":"tmux"}}
+                ]
+            }}"#
+        )
+    }
+
+    /// The three-file fixture a resolvable split-pane teammate needs: the
+    /// team config, the teammate's herdr pane (carrying `display_agent` and
+    /// its own session id), and that session's transcript.
+    fn teammate_fixture(
+        paths: &GatherPaths,
+        herdr: &FakeHerdr,
+        transcript_team: &str,
+        transcript_agent: Option<&str>,
+    ) {
+        write(
+            &paths.teams_root.join("team-x/config.json"),
+            &split_pane_team_config("session-lead-1"),
+        );
+        *herdr.panes.borrow_mut() = vec![teammate_pane(
+            "w4:p14",
+            Some("beta"),
+            Some("mate-session-1"),
+        )];
+        let identity = match transcript_agent {
+            Some(agent) => {
+                format!(r#"{{"type":"user","agentName":"{agent}","teamName":"{transcript_team}"}}"#)
+            }
+            None => r#"{"type":"user","userType":"external"}"#.to_owned(),
+        };
+        write_transcript(
+            &paths.projects_root.join("proj1"),
+            "mate-session-1",
+            &[identity.as_str()],
+        );
+    }
+
+    #[test]
+    fn gather_team_resolves_a_split_pane_teammates_pane_and_transcript_liveness() {
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        let herdr = FakeHerdr::default();
+        teammate_fixture(&paths, &herdr, "team-x", Some("beta"));
+        let now = SystemTime::now() + Duration::from_secs(1_200);
+
+        let facts = gather_team(&paths, "team-x", &herdr, now);
+
+        let beta = facts.iter().find(|f| f.name == "beta").unwrap();
+        assert_eq!(
+            beta.pane_id.as_deref(),
+            Some("w4:p14"),
+            "a teammate pane verified against its own transcript resolves"
+        );
+        let secs = beta
+            .facts
+            .seconds_since_transcript_activity
+            .expect("teammate transcript liveness resolved");
+        assert!((1_195..=1_205).contains(&secs), "secs was {secs}");
+    }
+
+    #[test]
+    fn gather_team_surfaces_a_resolved_teammates_real_agent_status() {
+        // Defect D fix (findings §4/§12): teammux::respawn_pane now tags a
+        // teammate's launch with HERDR_AGENT=claude, so herdr's own
+        // detector can hold a real agent_status for that pane instead of
+        // the permanent "unknown" Defect D produced. Once a teammate's pane
+        // resolves (the verified join this module already does), its
+        // agent_status should be read off that SAME pane snapshot — no new
+        // herdr call — rather than hardcoded to Unknown.
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        let herdr = FakeHerdr::default();
+        teammate_fixture(&paths, &herdr, "team-x", Some("beta"));
+        // Overwrite the fixture's hardcoded "unknown" with a real status,
+        // exactly as a hinted teammate pane now reports live.
+        herdr.panes.borrow_mut()[0].agent_status = Some("blocked".to_owned());
+
+        let facts = gather_team(&paths, "team-x", &herdr, SystemTime::now());
+
+        let beta = facts.iter().find(|f| f.name == "beta").unwrap();
+        assert_eq!(beta.facts.agent_status, AgentActivity::Blocked);
+    }
+
+    #[test]
+    fn gather_team_refuses_a_pane_whose_transcript_names_another_team() {
+        // The display_agent match alone is ambiguous across teams (two teams
+        // can each hold a `beta`). The transcript is what settles it, and a
+        // mismatch has to degrade to absent rather than bind.
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        let herdr = FakeHerdr::default();
+        teammate_fixture(&paths, &herdr, "some-other-team", Some("beta"));
+
+        let facts = gather_team(&paths, "team-x", &herdr, SystemTime::now());
+
+        let beta = facts.iter().find(|f| f.name == "beta").unwrap();
+        assert_eq!(beta.pane_id, None);
+        assert_eq!(beta.facts.seconds_since_transcript_activity, None);
+    }
+
+    #[test]
+    fn gather_team_refuses_a_pane_whose_transcript_names_another_teammate() {
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        let herdr = FakeHerdr::default();
+        teammate_fixture(&paths, &herdr, "team-x", Some("gamma"));
+
+        let facts = gather_team(&paths, "team-x", &herdr, SystemTime::now());
+
+        let beta = facts.iter().find(|f| f.name == "beta").unwrap();
+        assert_eq!(beta.pane_id, None);
+        assert_eq!(beta.facts.seconds_since_transcript_activity, None);
+    }
+
+    #[test]
+    fn gather_team_refuses_a_pane_whose_transcript_declares_no_teammate_identity() {
+        // A LEAD's transcript carries no `agentName`/`teamName`, so this is
+        // also the guard against binding a member to a lead's pane.
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        let herdr = FakeHerdr::default();
+        teammate_fixture(&paths, &herdr, "team-x", None);
+
+        let facts = gather_team(&paths, "team-x", &herdr, SystemTime::now());
+
+        let beta = facts.iter().find(|f| f.name == "beta").unwrap();
+        assert_eq!(beta.pane_id, None);
+        assert_eq!(beta.facts.seconds_since_transcript_activity, None);
+    }
+
+    #[test]
+    fn gather_team_refuses_a_teammate_pane_carrying_no_session_id() {
+        let dir = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        let herdr = FakeHerdr::default();
+        teammate_fixture(&paths, &herdr, "team-x", Some("beta"));
+        *herdr.panes.borrow_mut() = vec![teammate_pane("w4:p14", Some("beta"), None)];
+
+        let facts = gather_team(&paths, "team-x", &herdr, SystemTime::now());
+
+        let beta = facts.iter().find(|f| f.name == "beta").unwrap();
+        assert_eq!(beta.pane_id, None);
+        assert_eq!(beta.facts.seconds_since_transcript_activity, None);
     }
 
     #[test]

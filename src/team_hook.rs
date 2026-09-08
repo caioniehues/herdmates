@@ -130,6 +130,57 @@ pub(crate) fn resolve_team_bucket(payload: &Value, teams: &[(String, Option<Stri
     "_unknown".to_owned()
 }
 
+/// Pure: does `payload` come from `team`'s own LEAD session?
+///
+/// This is the direction check the enrichment push needs.
+/// [`crate::lead_post::SocketTarget::from_env`] resolves the inbox socket
+/// out of the HOOK PROCESS's inherited environment, and a hook is a child
+/// of whichever session fired the event — so the socket is the lead's only
+/// when the EVENT is the lead's.
+///
+/// Which teammate kind fired it decides that, and the two differ:
+///
+/// - A **split-pane** teammate is its own Claude Code session, so its
+///   `TeammateIdle` carries its own `session_id`. Posting on it injects the
+///   enrichment back into that same teammate, waking it on a notification it
+///   generated itself, instead of telling the lead anything. Measured
+///   2026-09-02: 208 such injections into teammates, none into any lead.
+/// - An **in-process** teammate runs inside the lead's session and its hook
+///   carries the LEAD's `session_id` (the same blurring `enrich.rs`'s
+///   `transcript_is_teammates_own` exists for, and ADR-0016 §Context
+///   records from the #123 review). Those posts do reach the lead, and this
+///   predicate lets them through.
+///
+/// So this is not "suppress `TeammateIdle`" — it is "post only where the
+/// inherited socket actually belongs to the team's lead".
+///
+/// The `team` argument matters: a real lead of a DIFFERENT team is not this
+/// team's lead, and its socket is not the one we want.
+///
+/// Fails closed. An absent `session_id`, an unresolved team bucket
+/// (`"_unknown"`), or a team whose config carries no `leadSessionId` all
+/// return `false` — silence is the safe outcome here, since the failure
+/// mode being prevented is injecting into the wrong session.
+pub(crate) fn is_lead_session(
+    payload: &Value,
+    teams: &[(String, Option<String>)],
+    team: &str,
+) -> bool {
+    // Reuses `brain::resolve_team_by_session` rather than re-deriving the
+    // comparison: that resolver already turns a session id plus
+    // `discover_teams_at`'s pairs into exactly the three outcomes this
+    // question needs — `NoSessionId`, `NotATeamLead`, or the team it leads.
+    // Both error arms mean "not this team's lead", and so does `Ok` naming a
+    // DIFFERENT team, so all three fail closed here.
+    matches!(
+        crate::brain::resolve_team_by_session(
+            payload.get("session_id").and_then(Value::as_str),
+            teams,
+        ),
+        Ok(resolved) if resolved == team
+    )
+}
+
 /// Impure: every team under `gather::GatherPaths::from_env`'s
 /// `teams_root`, paired with its `leadSessionId` (`None` when the config
 /// has none). Reuses `gather::list_team_dirs` + `teamfiles::
@@ -415,6 +466,7 @@ fn hook_command_from(
         paths,
         socket,
         spool_base,
+        &teams,
         &bucket,
         event_name,
         &envelope.payload,
@@ -449,11 +501,35 @@ const ENRICH_DEBOUNCE_MS: u64 = 30_000;
 /// refused, timed-out, or held post → one stderr line and exit 0. The
 /// spool write above already happened either way, so an unreachable lead
 /// never costs us the observation.
+///
+/// ## Direction guard — the post only ever goes to OUR OWN session
+///
+/// [`crate::lead_post::SocketTarget::from_env`] resolves the socket from
+/// this hook process's inherited environment, and a hook is a child of the
+/// session that fired the event. So the socket is only the lead's when the
+/// EVENT is the lead's — which a `TeammateIdle` from a SPLIT-PANE teammate
+/// never is. Posting on those injected the enrichment back into the
+/// teammate that produced it: a self-wake, measured 2026-09-02 as 208
+/// injections into teammates and none into any lead.
+///
+/// [`is_lead_session`] is therefore checked HERE rather than at the call
+/// site, so no future caller can route a post to the wrong session by
+/// forgetting it. See its doc comment for why in-process teammates are the
+/// other case and still get through.
+///
+/// What survives the guard, so this is not read as "the push is now dead":
+/// in-process teammates' events, and lead-fired task events — which carry
+/// neither `team_name` nor `teammate_name` (see this module's doc comment)
+/// and so resolve by session id to the lead's own team. What does not is
+/// the split-pane self-wake. Restoring delivery for THAT case needs a
+/// transport that does not depend on the hook's own environment; it is not
+/// something a direction check can fix.
 #[allow(clippy::too_many_arguments)]
 fn push_enrichment(
     paths: Option<&crate::gather::GatherPaths>,
     socket: Option<&crate::lead_post::SocketTarget>,
     spool_base: Option<&Path>,
+    teams: &[(String, Option<String>)],
     team: &str,
     event_name: &str,
     payload: &Value,
@@ -462,6 +538,9 @@ fn push_enrichment(
     let (Some(paths), Some(socket)) = (paths, socket) else {
         return;
     };
+    if !is_lead_session(payload, teams, team) {
+        return;
+    }
     let Some(text) = crate::enrich::enrichment_for_event(paths, team, event_name, payload, now)
     else {
         return;
@@ -812,6 +891,12 @@ mod tests {
             r#"{"id":"2","status":"pending","owner":"alpha","blockedBy":["1"]}"#,
         )
         .unwrap();
+        // The post only fires for the team's own lead (see `is_lead_session`),
+        // so this fixture must name the payload's `session_id` as the lead.
+        // Before the direction guard this test passed with no team config at
+        // all — i.e. while asserting a post from a session belonging to no
+        // known team, which is the very case the guard now refuses.
+        write_team_config(&paths.teams_root, "wave3", "abc");
 
         let socket_path = dir.path().join("inbox.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
@@ -868,10 +953,15 @@ mod tests {
             tasks_root: dir.path().join("tasks"),
             projects_root: dir.path().join("projects"),
         };
+        // Same fixture requirement as above: the debounce is only reached on
+        // a post, and a post is only made for the team's own lead.
+        write_team_config(&paths.teams_root, "wave3", "the-lead");
+
         let socket_path = dir.path().join("inbox.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
 
         let payload = json!({
+            "session_id": "the-lead",
             "hook_event_name": "TeammateIdle",
             "teammate_name": "alpha",
             "team_name": "wave3",
@@ -908,6 +998,7 @@ mod tests {
         // inside the window is a different key and must still post
         // (review finding: a team+teammate-only key would drop it).
         let task_payload = json!({
+            "session_id": "the-lead",
             "hook_event_name": "TaskCompleted",
             "teammate_name": "alpha",
             "team_name": "wave3",
@@ -949,6 +1040,175 @@ mod tests {
             std::fs::read_to_string(dir.path().join("state/herdmates/hook-spool/wave3.jsonl"))
                 .unwrap();
         assert_eq!(spool.lines().count(), 3, "{spool}");
+    }
+
+    // ── self-wake guard: the TeammateIdle direction bug ──────────────────────
+
+    /// Writes a minimal `teams/<team>/config.json` naming `lead_session_id` —
+    /// the shape `teamfiles::read_team_config` parses and `discover_teams_at`
+    /// enumerates.
+    fn write_team_config(teams_root: &Path, team: &str, lead_session_id: &str) {
+        let dir = teams_root.join(team);
+        std::fs::create_dir_all(&dir).expect("create team dir");
+        std::fs::write(
+            dir.join("config.json"),
+            json!({"name": team, "leadSessionId": lead_session_id, "members": []}).to_string(),
+        )
+        .expect("write team config");
+    }
+
+    #[test]
+    fn is_lead_session_matches_only_the_named_teams_lead() {
+        let teams = [
+            ("wave3".to_owned(), Some("lead-3".to_owned())),
+            ("wave4".to_owned(), Some("lead-4".to_owned())),
+        ];
+        assert!(is_lead_session(
+            &json!({"session_id": "lead-3"}),
+            &teams,
+            "wave3"
+        ));
+        // A teammate of that team.
+        assert!(!is_lead_session(
+            &json!({"session_id": "teammate-a"}),
+            &teams,
+            "wave3"
+        ));
+        // A real lead — of a DIFFERENT team. Its socket is not this team's
+        // lead's, so it must not be mistaken for one.
+        assert!(!is_lead_session(
+            &json!({"session_id": "lead-4"}),
+            &teams,
+            "wave3"
+        ));
+        // Fail closed: no session_id, and an unresolved team bucket.
+        assert!(!is_lead_session(&json!({}), &teams, "wave3"));
+        assert!(!is_lead_session(
+            &json!({"session_id": "lead-3"}),
+            &teams,
+            "_unknown"
+        ));
+    }
+
+    /// The bug this guard exists for. `TeammateIdle` fires inside the
+    /// TEAMMATE's session, so the hook inherits the teammate's
+    /// `CLAUDE_CODE_MESSAGING_SOCKET` and `lead_post::post` injects the
+    /// enrichment straight back into the teammate that produced it.
+    /// Measured live 2026-09-02: 8 `[herdmates] TeammateIdle review-imp3093`
+    /// user messages in review-imp3093's OWN transcript, 0 in the lead's;
+    /// 335/335 spooled payloads carry a teammate session id.
+    ///
+    /// Reds on the pre-fix code, which posts.
+    #[test]
+    fn a_teammates_own_idle_event_never_posts_back_into_that_teammate() {
+        let dir = TempDir::new();
+        let paths = crate::gather::GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        write_team_config(&paths.teams_root, "wave3", "the-lead-session");
+
+        let socket_path = dir.path().join("inbox.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        // Real captured field shape: session_id is the TEAMMATE's own.
+        let payload = json!({
+            "session_id": "the-teammate-session",
+            "hook_event_name": "TeammateIdle",
+            "permission_mode": "auto",
+            "teammate_name": "alpha",
+            "team_name": "wave3",
+        });
+        let exit_code = hook_command_from(
+            "TeammateIdle",
+            std::io::Cursor::new(payload.to_string().into_bytes()),
+            Some(&paths),
+            Some(&dir.path().join("state")),
+            Some(&crate::lead_post::SocketTarget {
+                path: socket_path,
+                token: Some("tok".to_owned()),
+            }),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(format!("{exit_code:?}"), format!("{:?}", ExitCode::SUCCESS));
+
+        match listener.accept() {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("a teammate's own idle event must not post, got {other:?}"),
+        }
+
+        // The observation is never lost: the recorder stays unfiltered.
+        let spool =
+            std::fs::read_to_string(dir.path().join("state/herdmates/hook-spool/wave3.jsonl"))
+                .expect("spool line still written");
+        assert_eq!(spool.lines().count(), 1, "{spool}");
+    }
+
+    /// Positive arm, paired with the negative one above so neither can go
+    /// vacuously green: delete the post path entirely and the test above
+    /// still passes while this one fails.
+    #[test]
+    fn an_event_from_the_teams_own_lead_still_posts() {
+        use std::io::Read as _;
+
+        let dir = TempDir::new();
+        let paths = crate::gather::GatherPaths {
+            teams_root: dir.path().join("teams"),
+            tasks_root: dir.path().join("tasks"),
+            projects_root: dir.path().join("projects"),
+        };
+        write_team_config(&paths.teams_root, "wave3", "the-lead-session");
+
+        let socket_path = dir.path().join("inbox.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        // Bounded, non-blocking accept — the same shape
+        // `a_repeated_event_within_the_debounce_window_posts_once` already
+        // uses, and for the same reason: a plain blocking `accept()` turns
+        // "the post stopped happening" into a hung test (a CI job timeout,
+        // not a test failure). This arm exists to fail loudly when the post
+        // path is deleted, so it must not be the one that hangs.
+        listener.set_nonblocking(true).unwrap();
+
+        let payload = json!({
+            "session_id": "the-lead-session",
+            "hook_event_name": "TeammateIdle",
+            "teammate_name": "alpha",
+            "team_name": "wave3",
+        });
+        let exit_code = hook_command_from(
+            "TeammateIdle",
+            std::io::Cursor::new(payload.to_string().into_bytes()),
+            Some(&paths),
+            Some(&dir.path().join("state")),
+            Some(&crate::lead_post::SocketTarget {
+                path: socket_path,
+                token: Some("tok".to_owned()),
+            }),
+            SystemTime::UNIX_EPOCH,
+        );
+        assert_eq!(format!("{exit_code:?}"), format!("{:?}", ExitCode::SUCCESS));
+
+        let mut connection = None;
+        for _ in 0..50 {
+            match listener.accept() {
+                Ok((accepted, _)) => {
+                    connection = Some(accepted);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        }
+        let mut connection = connection
+            .expect("the team's own lead must still be posted to — the post path is gone");
+        connection.set_nonblocking(false).unwrap();
+        let mut received = String::new();
+        connection.read_to_string(&mut received).unwrap();
+        assert!(received.contains("TeammateIdle alpha"), "{received}");
     }
 
     /// The host must never notice an unreachable lead: the spool line is
