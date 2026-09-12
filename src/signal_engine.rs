@@ -71,6 +71,32 @@ impl AgentActivity {
     fn is_quiescent(self) -> bool {
         matches!(self, Self::Idle | Self::Done)
     }
+
+    /// May a transcript-grounded stalled tier be claimed for an agent in
+    /// this state?
+    ///
+    /// `Idle`/`Done` are pane-backed quiescence. `Unknown` is admitted too,
+    /// and that is the load-bearing part: it means "no pane-backed status",
+    /// not "busy", and transcript mtime is a liveness fact that owes
+    /// nothing to the status field. Every split-pane TEAMMATE used to be
+    /// `Unknown` here unconditionally (Defect D: herdr's `lookup_agent`
+    /// could not name their version-path argv0), so excluding it discarded
+    /// the only liveness signal they had — the block below already carried
+    /// a `WaitingReason::Waiting` arm for `Unknown`, unreachable while
+    /// `is_quiescent` gated entry, which is the shape this restores. Defect
+    /// D is now fixed for teammates launched with the `HERDR_AGENT` hint
+    /// (`teammux::respawn_pane`, `gather::resolve_teammate_pane`), so a
+    /// resolved teammate can arrive as `Idle`/`Working`/`Blocked` too —
+    /// `Unknown` remains the honest degrade for one that didn't resolve, or
+    /// resolved before the hint took effect.
+    ///
+    /// `Working` is the veto: a positive pane-backed "working" outranks
+    /// transcript quiet, so an agent herdr says is mid-turn is never called
+    /// stalled. `Blocked` never arrives (it short-circuits to
+    /// `PermissionPrompt` first).
+    fn admits_transcript_staleness(self) -> bool {
+        self.is_quiescent() || matches!(self, Self::Unknown)
+    }
 }
 
 /// Configurable stalled-tier boundaries (#92: "T configurable"). Defaults
@@ -127,7 +153,7 @@ pub fn classify(facts: &ObservedFacts, thresholds: &StalledThresholds) -> Waitin
         return WaitingReason::BlockedOnDependency;
     }
 
-    if facts.agent_status.is_quiescent() {
+    if facts.agent_status.admits_transcript_staleness() {
         let transcript_secs = facts.seconds_since_transcript_activity;
         let inbox_secs = facts.seconds_since_unread_inbox;
 
@@ -348,6 +374,71 @@ mod tests {
         assert_eq!(
             classify(&f, &StalledThresholds::default()),
             WaitingReason::Waiting
+        );
+    }
+
+    #[test]
+    fn unknown_status_with_a_stale_transcript_is_stalled_not_a_reason_less_degrade() {
+        // The population this matters for is split-pane TEAMMATES: before
+        // the HERDR_AGENT fix, herdr could not report their agent_status at
+        // all (Defect D — their argv0 was the version-path binary, so
+        // `lookup_agent` never named them), so every teammate arrived here
+        // as `Unknown`; a teammate whose pane never resolved, or whose
+        // launch predates the fix, still does. Their transcript mtime is a
+        // real, pane-independent liveness fact, and discarding it because
+        // the status field is empty is what left a teammate that finished
+        // hours ago indistinguishable from one mid-turn.
+        let mut f = facts(AgentActivity::Unknown);
+        f.seconds_since_transcript_activity = Some(3 * 3_600);
+
+        assert_eq!(
+            classify(&f, &StalledThresholds::default()),
+            WaitingReason::Stalled {
+                tier: StalledTier::Stalled,
+                secs: 3 * 3_600,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_status_with_a_quiet_transcript_is_the_soft_tier() {
+        let mut f = facts(AgentActivity::Unknown);
+        f.seconds_since_transcript_activity = Some(6 * 60);
+
+        assert_eq!(
+            classify(&f, &StalledThresholds::default()),
+            WaitingReason::Stalled {
+                tier: StalledTier::Quiet,
+                secs: 6 * 60,
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_status_with_a_fresh_transcript_stays_a_reason_less_degrade() {
+        // Fresh transcript, nothing else: quiescence itself is unverified,
+        // so there is no class to name — the same degrade as no signal at
+        // all, NOT a claim the agent finished.
+        let mut f = facts(AgentActivity::Unknown);
+        f.seconds_since_transcript_activity = Some(5);
+
+        assert_eq!(
+            classify(&f, &StalledThresholds::default()),
+            WaitingReason::Waiting
+        );
+    }
+
+    #[test]
+    fn a_working_agent_is_never_called_stalled_however_old_its_transcript() {
+        // The veto that keeps this honest: a positive pane-backed
+        // "working" outranks transcript quiet, which is why the gate admits
+        // `Unknown` rather than simply dropping the quiescence check.
+        let mut f = facts(AgentActivity::Working);
+        f.seconds_since_transcript_activity = Some(3 * 3_600);
+
+        assert_eq!(
+            classify(&f, &StalledThresholds::default()),
+            WaitingReason::TurnComplete
         );
     }
 

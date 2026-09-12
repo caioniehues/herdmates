@@ -164,7 +164,24 @@ pub fn pump_once<H: HerdrApi>(paths: &GatherPaths, herdr: &H) {
         let Ok(config) = teamfiles::read_team_config(&team_dir.join("config.json")) else {
             continue;
         };
-        let Some(pane_id) = resolve_lead_pane(&config, &agents) else {
+        // Defect E: a lead's session id rotates on resume/`/clear` while the
+        // team config keeps the original, so the recorded id can name a
+        // session that no longer exists for a team that is perfectly alive.
+        // Falling back to a live teammate's `--parent-session-id` costs one
+        // `pane process-info` per teammate-looking pane, and only on the
+        // teams that failed the cheap path.
+        // Only attempted when the team actually HAS a split-pane teammate:
+        // the recovery reads a live teammate's argv, so a team without one
+        // has nothing to recover from and should not pay a `pane_list`.
+        let has_split_pane_teammate = config
+            .members
+            .iter()
+            .any(|member| !member.is_lead && member.backend_type.as_deref() == Some("tmux"));
+        let Some(pane_id) = resolve_lead_pane(&config, &agents).or_else(|| {
+            has_split_pane_teammate
+                .then(|| gather::recover_lead_pane_via_teammates(herdr, team_name, &agents))
+                .flatten()
+        }) else {
             continue;
         };
         let inboxes = read_inboxes(&team_dir.join("inboxes"));
@@ -187,15 +204,28 @@ pub fn pump_once<H: HerdrApi>(paths: &GatherPaths, herdr: &H) {
         let reason = signal_engine::classify(&lead_facts.facts, &thresholds);
         let state = brain::five_state(lead_facts.facts.agent_status, reason);
 
-        let token_set = tokens::teammate_tokens(lead, state);
+        // The reap count is the team's, not the lead's own state: how many
+        // of its teammates finished and are still running (brain::
+        // reapable_count over the same `facts` the state above came from,
+        // so the sidebar and `roster` cannot disagree — rule #90).
+        let token_set =
+            tokens::teammate_tokens(lead, state, brain::reapable_count(&facts, &thresholds));
+        // Clear whatever this pass did NOT publish. `--token` only sets, so
+        // a name that stops being published keeps its last value on the pane
+        // indefinitely — and for `reap` the N -> 0 transition is the success
+        // path, so the badge asking you to reap would survive the reaping.
+        // Cleared unconditionally rather than tracked: herdr treats clearing
+        // an absent token as a no-op, and the pump holds no memory of the
+        // previous pass to diff against.
+        let clear = tokens::absent_names(&token_set);
         let pairs = token_set
             .into_iter()
             .map(|token| (token.name, token.value))
             .collect::<Vec<_>>();
-        if pairs.is_empty() {
+        if pairs.is_empty() && clear.is_empty() {
             continue;
         }
-        let _ = herdr.pane_report_tokens(&pane_id, tokens::SOURCE, &pairs);
+        let _ = herdr.pane_report_tokens(&pane_id, tokens::SOURCE, &pairs, &clear);
     }
 }
 
@@ -246,7 +276,7 @@ pub fn resolve_lead_pane(config: &TeamConfig, agents: &[AgentInfo]) -> Option<St
 mod tests {
     use super::*;
     use crate::brain::FiveState;
-    use crate::herdr::{test_support::FakeHerdr, AgentSession};
+    use crate::herdr::{test_support::FakeHerdr, AgentSession, PaneInfo};
     use crate::teamfiles::{Member, Teammate};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -285,6 +315,28 @@ mod tests {
             teams_root: teams_root.to_path_buf(),
             tasks_root: teams_root.join("__tasks_unused"),
             projects_root: teams_root.join("__projects_unused"),
+        }
+    }
+
+    /// A teammate's herdr pane as `pane list` reports one: no detected
+    /// agent (Defect D), a `display_agent` herdmates published, and the
+    /// teammate's own session id under herdr's official claude source.
+    fn teammate_pane(pane_id: &str, display_agent: &str, session_value: &str) -> PaneInfo {
+        PaneInfo {
+            pane_id: pane_id.to_owned(),
+            workspace_id: "w4".to_owned(),
+            tab_id: None,
+            agent: None,
+            agent_id: None,
+            agent_session: Some(AgentSession {
+                source: "herdr:claude".to_owned(),
+                agent: "claude".to_owned(),
+                kind: "id".to_owned(),
+                value: session_value.to_owned(),
+            }),
+            agent_status: Some("unknown".to_owned()),
+            display_agent: Some(display_agent.to_owned()),
+            cwd: None,
         }
     }
 
@@ -432,6 +484,86 @@ mod tests {
     // ── pump_once (integration smoke) ───────────────────────────────────────
 
     #[test]
+    fn pump_once_clears_the_reap_token_when_nothing_is_left_to_reap() {
+        // The live defect this fixes, reproduced: `pane report-metadata
+        // --token` only SETS. A lead whose teammates have all been reaped
+        // publishes no `reap` token, and the pane keeps the last value it
+        // was given — measured on a real lead frozen at "10 to stop" for
+        // three days with zero teammates left. The N -> 0 transition is the
+        // SUCCESS path, so the badge telling you to reap must go quiet
+        // exactly when you have done it.
+        let temp = TempDir::new();
+        let paths = paths_for(temp.path());
+        write_team(&paths.teams_root, "session-t", "lead-session", "");
+
+        let fake = FakeHerdr::default();
+        *fake.agents.borrow_mut() = vec![agent_with_session("w1:pLead", "lead-session")];
+
+        pump_once(&paths, &fake);
+
+        let published = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("pane_report_tokens"))
+            .expect("the lead's tokens were published");
+        assert!(
+            published.contains("-reap"),
+            "a zero count must CLEAR reap, not merely omit it; call was: {published}"
+        );
+    }
+
+    #[test]
+    fn pump_once_publishes_a_reap_token_when_a_teammate_finished_and_was_never_stopped() {
+        // End-to-end over the real pipeline: a team config naming a
+        // split-pane teammate, that teammate's herdr pane carrying the
+        // display_agent herdmates publishes plus its own session id, and
+        // that session's transcript declaring the matching agentName /
+        // teamName with an mtime well past the hard stalled threshold.
+        let temp = TempDir::new();
+        let paths = GatherPaths {
+            teams_root: temp.path().join("teams"),
+            tasks_root: temp.path().join("tasks"),
+            projects_root: temp.path().join("projects"),
+        };
+        write_team(
+            &paths.teams_root,
+            "session-t",
+            "lead-session",
+            r#", {"agentId":"beta@session-t","name":"beta","agentType":"general-purpose","tmuxPaneId":"%1","backendType":"tmux"}"#,
+        );
+        let transcript_dir = paths.projects_root.join("proj1");
+        fs::create_dir_all(&transcript_dir).expect("create transcript dir");
+        fs::write(
+            transcript_dir.join("mate-session.jsonl"),
+            "{\"type\":\"user\",\"agentName\":\"beta\",\"teamName\":\"session-t\"}\n",
+        )
+        .expect("write transcript");
+        let stale = SystemTime::now() - std::time::Duration::from_secs(3 * 3_600);
+        fs::File::options()
+            .write(true)
+            .open(transcript_dir.join("mate-session.jsonl"))
+            .expect("reopen transcript")
+            .set_modified(stale)
+            .expect("age the transcript");
+
+        let fake = FakeHerdr::default();
+        *fake.agents.borrow_mut() = vec![agent_with_session("w1:pLead", "lead-session")];
+        *fake.panes.borrow_mut() = vec![teammate_pane("w4:p14", "beta", "mate-session")];
+
+        pump_once(&paths, &fake);
+
+        let published = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("pane_report_tokens"))
+            .expect("the lead's tokens were published");
+        assert!(
+            published.contains("reap=1 to stop"),
+            "published tokens were: {published}"
+        );
+    }
+
+    #[test]
     fn pump_once_publishes_tokens_for_resolvable_lead_and_skips_unresolvable_team() {
         let temp = TempDir::new();
         write_team(temp.path(), "session-resolvable", "resolvable-session", "");
@@ -452,10 +584,13 @@ mod tests {
             [
                 "agent_list",
                 "agent_list",
-                "pane_report_tokens:w1:pLead:herdmates-board:task=Coordinate the team,status=online"
+                "pane_list",
+                "pane_report_tokens:w1:pLead:herdmates-board:task=Coordinate the team,status=online,-reap,-model"
             ],
             "two agent_list calls: pump_once's own lead-pane resolution, then \
-             gather::gather_team's inside the state-classification path"
+             gather::gather_team's inside the state-classification path; the \
+             pane_list is gather_team's non-lead teammate resolution, one \
+             snapshot per pass rather than one per member"
         );
     }
 
@@ -480,7 +615,10 @@ mod tests {
             .into_iter()
             .find(|call| call.starts_with("pane_report_tokens"))
             .expect("a report call");
-        assert!(report.ends_with("status=!! needs-you"), "{report}");
+        assert!(
+            report.ends_with("status=!! needs-you,-reap,-model"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -499,7 +637,55 @@ mod tests {
             .into_iter()
             .find(|call| call.starts_with("pane_report_tokens"))
             .expect("a report call");
-        assert!(report.ends_with("status=waiting"), "{report}");
+        assert!(report.ends_with("status=waiting,-reap,-model"), "{report}");
+    }
+
+    #[test]
+    fn pump_once_publishes_for_a_team_whose_lead_session_rotated() {
+        // Defect E: config.json names the session the team was CREATED with;
+        // the lead has since resumed and runs under a new id. Before the
+        // teammate-argv fallback this team got no tokens at all — no status,
+        // no reap count — for as long as it lived.
+        let temp = TempDir::new();
+        let paths = paths_for(temp.path());
+        write_team(
+            &paths.teams_root,
+            "session-t",
+            "stale-lead-session",
+            r#", {"agentId":"beta@session-t","name":"beta","agentType":"general-purpose","tmuxPaneId":"%1","backendType":"tmux"}"#,
+        );
+
+        let fake = FakeHerdr::default();
+        // Only the ROTATED session is live; the recorded one resolves to nothing.
+        *fake.agents.borrow_mut() = vec![agent_with_session("w1:pLead", "rotated-lead-session")];
+        *fake.panes.borrow_mut() = vec![teammate_pane("w4:p14", "beta", "mate-session")];
+        fake.process_info.borrow_mut().insert(
+            "w4:p14".to_owned(),
+            crate::herdr::PaneProcessInfo {
+                foreground_processes: vec![crate::herdr::ForegroundProcess {
+                    name: "2.1.263".to_owned(),
+                    argv: vec![
+                        "claude".to_owned(),
+                        "--team-name".to_owned(),
+                        "session-t".to_owned(),
+                        "--parent-session-id".to_owned(),
+                        "rotated-lead-session".to_owned(),
+                    ],
+                }],
+            },
+        );
+
+        pump_once(&paths, &fake);
+
+        let published = fake
+            .calls()
+            .into_iter()
+            .find(|call| call.starts_with("pane_report_tokens"));
+        assert!(
+            published.as_deref().is_some_and(|c| c.contains("w1:pLead")),
+            "the rotated lead's pane should still receive tokens; calls: {:?}",
+            fake.calls()
+        );
     }
 
     #[test]
@@ -552,7 +738,7 @@ mod tests {
         let teammates = teamfiles::build_teammates(&config, &BTreeMap::new());
         let lead: &Teammate = teammates.iter().find(|t| t.is_lead).unwrap();
 
-        let token_set = tokens::teammate_tokens(lead, FiveState::Online);
+        let token_set = tokens::teammate_tokens(lead, FiveState::Online, 0);
 
         assert_eq!(
             token_set

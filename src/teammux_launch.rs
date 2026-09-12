@@ -268,6 +268,7 @@ mod tests {
             agent_id: None,
             agent_session: None,
             agent_status: None,
+            display_agent: None,
             cwd: None,
         }
     }

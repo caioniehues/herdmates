@@ -80,6 +80,28 @@ like, how to cross-compare, and which check (if any) is mechanical.
   `current_exe` spawn against the live arms.
 - **Check**: `scripts/check-subcommand-seams.sh` (wired into CI already).
 
+## tokens.rs published names <-> sidebar-rows.toml `$name` rows
+
+- **Producer**: `src/tokens.rs`'s `Token { name: … }` literals — the names
+  the board pump publishes via `pane report-metadata --token`.
+- **Consumer**: `docs/sidebar-rows.toml`'s `[ui.sidebar.agents] rows`, the
+  table a user merges into `~/.config/herdr/config.toml`.
+- **Drift looks like**: `$model` was published from the first board wave and
+  had no row for months — the token reached herdr and rendered NOWHERE, with
+  the pump, `pane list` and every test looking healthy. Found 2026-09-03 by
+  the check below on its first run, not by review.
+- **Both directions are silent**, which is what makes this a real seam rather
+  than a naming convention: a published token with no row is invisible, and a
+  row naming no producer makes `herdr server reload-config` return `"partial"`
+  and keep the OLD layout — no crash, no error, edits just stop taking
+  effect. The second failure is worse, because it disables rows that *were*
+  working.
+- **Cross-compare, never existence-check**: the presence of a `$reap` row
+  proves nothing about whether anything publishes `reap`, and vice versa.
+- **Check**: `scripts/check-token-seams.sh` (wired into CI). Mutation-proven
+  in three directions — missing row, phantom row, and a producer shape change
+  (which fails with a misleading tag, documented in the script's header).
+
 ## Doc staleness (commit-count heuristic)
 
 - **Producer**: source files that describe behavior a doc depends on (e.g.

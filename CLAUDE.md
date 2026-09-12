@@ -144,6 +144,11 @@ reviewer treats doc-code drift as HIGH severity.
 - **Worktree appears as a gitlink in a commit** → `git add -A` staged an
   agent worktree dir as mode 160000 → remove from index → gitignore agent
   worktree dirs; check for 160000 entries before committing.
+- **A published sidebar token renders nowhere** → `src/tokens.rs` publishes
+  a `$name` the shipped `docs/sidebar-rows.toml` has no row for; both
+  directions of that seam fail silently (`$model` was invisible for months)
+  → add the row → `scripts/check-token-seams.sh` in the gate; cross-compare
+  both sides, never existence-check one.
 - **Check passes but guards nothing** → the code it checked was deleted;
   the check still exits 0 → re-point or delete the check → before citing
   any check as evidence, name what it would catch and mutation-prove it.

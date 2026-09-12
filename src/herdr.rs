@@ -65,6 +65,13 @@ pub struct PaneInfo {
     pub agent_id: Option<String>,
     pub agent_session: Option<AgentSession>,
     pub agent_status: Option<String>,
+    /// Display-only pane metadata (`pane report-metadata --display-agent`),
+    /// which for a teammate pane is the teammate's NAME — herdmates
+    /// publishes it itself at spawn (`teammux::publish_display_agent`).
+    /// It is the only field on a pane snapshot that names a teammate, so
+    /// `gather::match_teammate_pane` joins non-lead members through it.
+    /// `None` on every pane nobody has reported metadata for.
+    pub display_agent: Option<String>,
     pub cwd: Option<PathBuf>,
 }
 
@@ -97,6 +104,8 @@ struct PaneInfoWire {
     agent: Option<String>,
     agent_session: Option<AgentSession>,
     agent_status: Option<String>,
+    #[serde(default)]
+    display_agent: Option<String>,
     cwd: Option<PathBuf>,
 }
 
@@ -118,6 +127,7 @@ impl<'de> Deserialize<'de> for PaneInfo {
             agent_id,
             agent_session: wire.agent_session,
             agent_status: wire.agent_status,
+            display_agent: wire.display_agent,
             cwd: wire.cwd,
         })
     }
@@ -152,6 +162,35 @@ impl<'de> Deserialize<'de> for AgentInfo {
             status: wire.status,
         })
     }
+}
+
+/// One process in a pane's foreground job (`pane process-info`). Only the
+/// fields herdmates reads are modelled; herdr also reports `pid`, `cwd` and
+/// `cmdline`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ForegroundProcess {
+    pub name: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PaneProcessInfo {
+    #[serde(default)]
+    pub foreground_processes: Vec<ForegroundProcess>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneProcessInfoResult {
+    #[serde(rename = "type")]
+    kind: String,
+    process_info: PaneProcessInfo,
+}
+
+fn parse_pane_process_info(stdout: &str) -> Result<PaneProcessInfo, String> {
+    let result: PaneProcessInfoResult = parse_response(stdout)?;
+    expect_kind(&result.kind, "pane_process_info")?;
+    Ok(result.process_info)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +331,18 @@ pub trait HerdrApi {
         _pane_id: &str,
         _source: &str,
         _tokens: &[(String, String)],
+        _clear: &[&str],
     ) -> Result<(), HerdrError> {
+        Err(unsupported_api())
+    }
+    /// `pane process-info <pane>`: the pane's foreground processes, with
+    /// their argv. herdmates uses it only to recover a rotated lead session
+    /// from a live teammate's `--parent-session-id` (Defect E).
+    ///
+    /// There is no bulk form — passing no `--pane` returns the FOCUSED pane
+    /// only (live-verified) — so this costs one subprocess per pane and
+    /// callers should scope it to panes they already have reason to inspect.
+    fn pane_process_info(&self, _pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
         Err(unsupported_api())
     }
     fn notification_show(&self, _: &str, _: &str, _: &str) -> Result<(), HerdrError> {
@@ -556,11 +606,26 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Publish `tokens` and remove `clear`, in ONE `pane report-metadata`
+    /// call — herdr accepts `--token` and `--clear-token` together, so a
+    /// pass that both sets and clears costs no extra subprocess and leaves
+    /// no window in which the pane shows a mix of old and new.
+    ///
+    /// `clear` is required because `--token` only ever SETS: a name simply
+    /// omitted keeps whatever value the pane already holds (measured
+    /// 2026-09-06 — a lead sat frozen at `reap: 10 to stop` with no
+    /// teammates left). Clearing a name that was never set is a no-op and
+    /// still exits 0, so callers can clear unconditionally.
+    ///
+    /// ⚠ Clearing is NOT scoped to `source`: this call will remove a token
+    /// of the same name published by a DIFFERENT source (measured). Pass
+    /// only names herdmates owns — see [`crate::tokens::PUBLISHABLE_TOKEN_NAMES`].
     pub fn pane_report_tokens(
         &self,
         pane_id: &str,
         source: &str,
         tokens: &[(String, String)],
+        clear: &[&str],
     ) -> Result<(), HerdrError> {
         let mut command = args(["pane", "report-metadata"])
             .with(pane_id)
@@ -569,8 +634,20 @@ impl HerdrClient {
         for (name, value) in tokens {
             command = command.with("--token").with(format!("{name}={value}"));
         }
+        for name in clear {
+            command = command.with("--clear-token").with(*name);
+        }
         self.invoke(&command.finish())?;
         Ok(())
+    }
+
+    pub fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        let args = args(["pane", "process-info"])
+            .with("--pane")
+            .with(pane_id)
+            .finish();
+        let stdout = self.invoke(&args)?;
+        parse_pane_process_info(&stdout).map_err(|message| self.invalid_response(&args, message))
     }
 
     pub fn notification_show(
@@ -707,8 +784,12 @@ impl HerdrApi for HerdrClient {
         pane_id: &str,
         source: &str,
         tokens: &[(String, String)],
+        clear: &[&str],
     ) -> Result<(), HerdrError> {
-        Self::pane_report_tokens(self, pane_id, source, tokens)
+        Self::pane_report_tokens(self, pane_id, source, tokens, clear)
+    }
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        Self::pane_process_info(self, pane_id)
     }
     fn notification_show(&self, title: &str, body: &str, sound: &str) -> Result<(), HerdrError> {
         Self::notification_show(self, title, body, sound)
@@ -812,6 +893,9 @@ pub(crate) mod test_support {
         pub layout_result: SyncRefCell<Option<PaneLayoutSnapshot>>,
         pub fail_layout: SyncCell<bool>,
         pub agents: SyncRefCell<Vec<AgentInfo>>,
+        /// Per-pane `pane process-info` responses (Defect E recovery).
+        pub process_info: SyncRefCell<BTreeMap<String, PaneProcessInfo>>,
+        pub fail_process_info: SyncCell<bool>,
         pub waits: SyncRefCell<VecDeque<WaitOutcome>>,
     }
 
@@ -1013,6 +1097,7 @@ pub(crate) mod test_support {
                     },
                 ),
                 agent_status: Some("idle".to_owned()),
+                display_agent: None,
                 cwd: None,
             })
         }
@@ -1046,6 +1131,7 @@ pub(crate) mod test_support {
                     agent_id: None,
                     agent_session: None,
                     agent_status: None,
+                    display_agent: None,
                     cwd: None,
                 }),
             }
@@ -1133,15 +1219,36 @@ pub(crate) mod test_support {
                 .push(format!("pane_report_metadata:{pane_id}"));
             Ok(())
         }
+        fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("pane_process_info:{pane_id}"));
+            if self.fail_process_info.get() {
+                return Err(Self::command_error());
+            }
+            Ok(self
+                .process_info
+                .borrow()
+                .get(pane_id)
+                .cloned()
+                .unwrap_or(PaneProcessInfo {
+                    foreground_processes: Vec::new(),
+                }))
+        }
         fn pane_report_tokens(
             &self,
             pane_id: &str,
             source: &str,
             tokens: &[(String, String)],
+            clear: &[&str],
         ) -> Result<(), HerdrError> {
+            // Cleared names record as `-name`, so a test can tell "published
+            // nothing for reap" apart from "explicitly cleared reap" — the
+            // whole distinction the clear path exists for.
             let pairs = tokens
                 .iter()
                 .map(|(name, value)| format!("{name}={value}"))
+                .chain(clear.iter().map(|name| format!("-{name}")))
                 .collect::<Vec<_>>()
                 .join(",");
             self.calls
@@ -1459,6 +1566,42 @@ mod tests {
     }
 
     impl FakeBinary {
+        /// A fake herdr that also APPENDS its argv to a log, so a test can
+        /// assert on the command line actually built rather than only on
+        /// what a hand-written fake chose to record. Added 2026-09-06: the
+        /// `--clear-token` wiring could be deleted wholesale and every test
+        /// in the suite still passed, because the only coverage was
+        /// `FakeHerdr`, which reimplements the call instead of running it.
+        fn recording_argv(stdout: &str) -> Self {
+            let fake = Self::returning(stdout);
+            let log = fake._directory.join("argv");
+            let response = fake._directory.join("response");
+            fs::write(
+                &fake.path,
+                format!(
+                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\ncat '{}'\n",
+                    log.display(),
+                    response.display()
+                ),
+            )
+            .expect("rewrite fake Herdr executable");
+            let mut permissions = fs::metadata(&fake.path)
+                .expect("stat fake Herdr executable")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake.path, permissions)
+                .expect("make fake Herdr executable runnable");
+            fake
+        }
+
+        fn recorded_argv(&self) -> Vec<String> {
+            fs::read_to_string(self._directory.join("argv"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
         fn returning(stdout: &str) -> Self {
             let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let nanos = SystemTime::now()
@@ -1590,6 +1733,47 @@ mod tests {
         );
     }
 
+    /// Verbatim `herdr pane list` response for a live SPLIT-PANE TEAMMATE
+    /// pane, captured 2026-09-03. Two fields matter and neither is on the
+    /// codex sample above:
+    ///
+    /// - `display_agent` carries the teammate's NAME (herdmates publishes it
+    ///   itself, `teammux::publish_display_agent`) — the only pane field
+    ///   that names a teammate, and so the join key
+    ///   `gather::gather_team` resolves non-lead members through.
+    /// - `agent` is absent and `agent_status` is `"unknown"` while
+    ///   `agent_session` IS present, carrying the teammate's OWN Claude Code
+    ///   session id under herdr's official `herdr:claude` source. That is
+    ///   Defect D (herdr's `lookup_agent` cannot name the version-path
+    ///   argv0 a teammate runs as) sitting next to the session id the
+    ///   findings doc recorded as nonexistent.
+    const LIVE_TEAMMATE_PANE_LIST: &str = r#"{"id":"cli:pane:list","result":{"panes":[{"agent_session":{"agent":"claude","kind":"id","source":"herdr:claude","value":"1991368b-f1dd-408c-9b54-b30c0270fef3"},"agent_status":"unknown","cwd":"/home/zvi/Projects/nanoclaw","display_agent":"fix3-imp3093","focused":false,"foreground_cwd":"/home/zvi/Projects/nanoclaw","label":"fix3-imp3093","pane_id":"w3:p22","revision":1388,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":41},"tab_id":"w3:tJ","terminal_id":"term_65a830cdb763a4d","terminal_title":"\u2733 general-purpose","terminal_title_stripped":"general-purpose","tokens":{"clauth":"unknown","ctx_ok":"\u2584 48%","eff_xhigh":"xhigh","idle_crit":"idle 36m","mdl":"\u273b Opus 5 1M"},"workspace_id":"w3"}],"type":"pane_list"}}"#;
+
+    #[test]
+    fn parses_a_live_teammate_panes_display_agent_and_own_session_id() {
+        let panes = parse_pane_list(LIVE_TEAMMATE_PANE_LIST).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_id, "w3:p22");
+        assert_eq!(
+            panes[0].display_agent.as_deref(),
+            Some("fix3-imp3093"),
+            "display_agent is the only pane field naming a teammate"
+        );
+        assert_eq!(
+            panes[0].agent, None,
+            "Defect D: herdr never detects a teammate pane's agent"
+        );
+        assert_eq!(panes[0].agent_status.as_deref(), Some("unknown"));
+        assert_eq!(
+            panes[0]
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.as_str()),
+            Some("1991368b-f1dd-408c-9b54-b30c0270fef3"),
+            "the teammate's OWN session id, under herdr's official source"
+        );
+    }
+
     #[test]
     fn parses_live_agent_wait_match_sample() {
         let fixture = r#"{"id":"cli:agent:wait:resolve","result":{"agent":{"agent":"codex","agent_status":"working","pane_id":"wG:p6","workspace_id":"wG"},"type":"agent_info"}}"#;
@@ -1605,6 +1789,91 @@ mod tests {
         let null = r#"{"id":"cli:agent:list","result":{"agents":[{"agent":"codex","agent_session":null,"agent_status":"working","pane_id":"opaque-pane","workspace_id":"opaque-workspace"}],"type":"agent_list"}}"#;
         let agents = parse_agent_list(null).unwrap();
         assert_eq!(agents[0].agent_id, None);
+    }
+
+    /// Verbatim `pane process-info` for a live split-pane teammate, captured
+    /// 2026-09-06. The argv is the only place a lead's CURRENT session id is
+    /// recoverable once `config.json`'s `leadSessionId` has gone stale.
+    const LIVE_TEAMMATE_PROCESS_INFO: &str = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":665286,"foreground_processes":[{"argv":["/home/zvi/.local/share/claude/versions/2.1.263","--agent-id","review-pr436@session-c5ac985c","--agent-name","review-pr436","--team-name","session-c5ac985c","--agent-color","blue","--parent-session-id","c5ac985c-1bd3-407e-8438-1ba344d4eb13","--agent-type","general-purpose","--permission-mode","auto"],"cmdline":"irrelevant","cwd":"/home/zvi","name":"2.1.263","pid":665286}],"pane_id":"w3:p2T","shell_pid":665000},"type":"pane_process_info"}}"#;
+
+    #[test]
+    fn parses_a_live_teammate_process_info_argv() {
+        let info = parse_pane_process_info(LIVE_TEAMMATE_PROCESS_INFO).unwrap();
+
+        assert_eq!(info.foreground_processes.len(), 1);
+        let process = &info.foreground_processes[0];
+        assert_eq!(
+            process.name, "2.1.263",
+            "Defect D: the version-path binary herdr's detector cannot name"
+        );
+        assert!(process.argv.windows(2).any(
+            |w| w[0] == "--parent-session-id" && w[1] == "c5ac985c-1bd3-407e-8438-1ba344d4eb13"
+        ));
+    }
+
+    #[test]
+    fn process_info_tolerates_a_pane_with_no_foreground_processes() {
+        let empty = r#"{"id":"x","result":{"process_info":{"pane_id":"w1:p1","shell_pid":1},"type":"pane_process_info"}}"#;
+
+        assert!(parse_pane_process_info(empty)
+            .unwrap()
+            .foreground_processes
+            .is_empty());
+    }
+
+    #[test]
+    fn report_tokens_emits_clear_token_flags_for_every_cleared_name() {
+        // Guards the REAL command line, not a fake's summary of it. The
+        // live defect was that nothing removed a token once published, so
+        // this asserts the flag herdr needs actually reaches herdr.
+        let binary = FakeBinary::recording_argv("");
+        binary
+            .client()
+            .pane_report_tokens(
+                "w1:pLead",
+                "herdmates-board",
+                &[("status".to_owned(), "online".to_owned())],
+                &["reap", "model"],
+            )
+            .expect("report-metadata accepts sets and clears together");
+
+        let argv = binary.recorded_argv();
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--token" && w[1] == "status=online"),
+            "{argv:?}"
+        );
+        for cleared in ["reap", "model"] {
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "--clear-token" && w[1] == cleared),
+                "no `--clear-token {cleared}` in {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_tokens_sets_and_clears_travel_in_one_invocation() {
+        // One call, not two: herdr accepts both flags together, so the pane
+        // never shows a mix of old and new and the pump costs no extra
+        // subprocess per pass.
+        let binary = FakeBinary::recording_argv("");
+        binary
+            .client()
+            .pane_report_tokens(
+                "w1:pLead",
+                "herdmates-board",
+                &[("status".to_owned(), "online".to_owned())],
+                &["reap"],
+            )
+            .expect("report-metadata call");
+
+        let argv = binary.recorded_argv();
+        assert_eq!(
+            argv.iter().filter(|a| *a == "report-metadata").count(),
+            1,
+            "expected exactly one report-metadata invocation: {argv:?}"
+        );
     }
 
     #[test]
