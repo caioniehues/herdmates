@@ -94,6 +94,7 @@ pub fn dispatch<H: HerdrApi>(
     idmap: &IdMap,
     call: tmuxargs::ParsedCall,
 ) -> DispatchOutcome {
+    let lead_width = lead_width_override();
     match call.verb {
         Verb::ShowMouse => DispatchOutcome::Ok {
             stdout: "off\n".to_owned(),
@@ -129,11 +130,18 @@ pub fn dispatch<H: HerdrApi>(
             direction,
             size,
             ..
-        } => split_window(herdr, idmap, &target, direction, size.as_deref()),
+        } => split_window(
+            herdr,
+            idmap,
+            &target,
+            direction,
+            size.as_deref(),
+            lead_width,
+        ),
         Verb::RespawnPane { pane, command } => respawn_pane(herdr, idmap, &pane, &command),
         Verb::KillPane { pane } => kill_pane(herdr, idmap, &pane),
         Verb::SelectPaneTitle { pane, title } => select_pane_title(herdr, idmap, &pane, &title),
-        Verb::ResizePane { pane, amount } => resize_pane(herdr, idmap, &pane, &amount),
+        Verb::ResizePane { pane, amount } => resize_pane(herdr, idmap, &pane, &amount, lead_width),
         Verb::SetWindowStyle { pane, style } => styling_noop(format!(
             "set-option -p -t {} window-style {style}",
             pane.as_str()
@@ -390,6 +398,7 @@ fn resize_pane<H: HerdrApi>(
     idmap: &IdMap,
     pane: &TmuxId,
     amount: &str,
+    lead_width: Option<f64>,
 ) -> DispatchOutcome {
     let herdr_pane_id = match idmap.lookup(pane.as_str()) {
         Some(id) => id.to_owned(),
@@ -404,6 +413,12 @@ fn resize_pane<H: HerdrApi>(
                 ),
             };
         }
+    };
+    // `TEAMMUX_LEAD_WIDTH` replaces the 30% Claude Code hard-codes for the
+    // lead; a teammate's own resize keeps the requested target.
+    let ratio = match lead_width {
+        Some(width) if pane.as_str() == crate::teammux_launch::LEAD_TMUX_PANE => width,
+        _ => ratio,
     };
     // Convert the absolute target into the delta from the pane's current
     // width; see `absolute_width_resize`. An unreadable layout degrades to
@@ -479,7 +494,12 @@ fn split_window<H: HerdrApi>(
     target: &TmuxId,
     direction: tmuxargs::SplitDirection,
     size: Option<&str>,
+    lead_width: Option<f64>,
 ) -> DispatchOutcome {
+    // The override names the LEAD's share; a split off any other pane keeps
+    // the requested size.
+    let lead_width =
+        lead_width.filter(|_| target.as_str() == crate::teammux_launch::LEAD_TMUX_PANE);
     let herdr_target = match idmap.lookup(target.as_str()) {
         Some(id) => id.to_owned(),
         None => return unknown_tmux_id("split-window", target.as_str()),
@@ -519,9 +539,17 @@ fn split_window<H: HerdrApi>(
             // untouched, and its width is Claude Code's `resize-pane -x` to set.
             Some(bottom) => (bottom.to_owned(), "down", None),
             // Lead-only tab: the request IS main-vertical (`-t <lead> -h -l 70%`).
-            None => (herdr_target, herdr_direction, ratio),
+            None => (
+                herdr_target,
+                herdr_direction,
+                lead_split_ratio(ratio, lead_width),
+            ),
         },
-        Err(_) => (herdr_target, herdr_direction, ratio),
+        Err(_) => (
+            herdr_target,
+            herdr_direction,
+            lead_split_ratio(ratio, lead_width),
+        ),
     };
     let info = match herdr.pane_split_pane(&herdr_target, herdr_direction, ratio) {
         Ok(info) => info,
@@ -545,6 +573,48 @@ fn split_window<H: HerdrApi>(
 /// the only shape herdr's `--ratio` float accepts (confirmed against
 /// `docs/herdr-api-schema.snapshot.json`'s `PaneSplitParams.ratio`, a plain
 /// nullable float, not a percentage string).
+/// tmux's `-l 70%` sizes the NEW pane; herdr's `--ratio` is the share the
+/// ORIGINAL pane keeps. Passing the request through hands the lead 70% on the
+/// first split instead of 30% (measured live: 124 of 177 columns, herdr
+/// 0.9.0), so the request is inverted here. `TEAMMUX_LEAD_WIDTH`, when set,
+/// names the lead's share directly, so the split already lands where Claude
+/// Code's follow-up `resize-pane -x` would otherwise have to drag it.
+pub(crate) fn lead_split_ratio(requested: Option<f64>, lead_width: Option<f64>) -> Option<f64> {
+    match (lead_width, requested) {
+        (Some(width), _) => Some(width),
+        (None, Some(new_pane_share)) => {
+            Some(((1.0 - new_pane_share) * 10_000.0).round() / 10_000.0)
+        }
+        (None, None) => None,
+    }
+}
+
+/// Env var naming the lead pane's share of the tab as a percentage (`50` or
+/// `50%`), overriding the 30% Claude Code hard-codes for split-pane teams.
+pub(crate) const LEAD_WIDTH_ENV: &str = "TEAMMUX_LEAD_WIDTH";
+
+/// Read [`LEAD_WIDTH_ENV`] once per shim invocation. Unset is the default
+/// (Claude Code's own 30%); anything unparseable or outside 5–95 is ignored,
+/// loudly under `TEAMMUX_LOG`, because a bad value must never fail a spawn.
+fn lead_width_override() -> Option<f64> {
+    let raw = std::env::var(LEAD_WIDTH_ENV).ok()?;
+    let parsed = parse_lead_width(&raw);
+    if parsed.is_none() && std::env::var_os("TEAMMUX_LOG").is_some() {
+        eprintln!(
+            "teammux: ignoring {LEAD_WIDTH_ENV}={raw:?} (expected a percentage between 5 and 95)"
+        );
+    }
+    parsed
+}
+
+/// Pure half of [`lead_width_override`]: `"50"`, `"50%"`, `" 50 % "` all
+/// mean half the tab; out-of-range and non-numeric values are `None`.
+pub(crate) fn parse_lead_width(raw: &str) -> Option<f64> {
+    let digits = raw.trim().trim_end_matches('%').trim();
+    let percent: f64 = digits.parse().ok()?;
+    (5.0..=95.0).contains(&percent).then_some(percent / 100.0)
+}
+
 fn parse_percentage(size: &str) -> Option<f64> {
     let digits = size.strip_suffix('%')?;
     let percent: f64 = digits.parse().ok()?;
@@ -1267,10 +1337,13 @@ mod tests {
                 stdout: "%1\n".to_owned()
             }
         );
-        assert!(fake
-            .calls()
-            .iter()
-            .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.7)"));
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.3)"),
+            "tmux -l 70% sizes the new pane; herdr keeps 30% for the lead: {:?}",
+            fake.calls()
+        );
 
         // The new mapping is persisted, not just returned.
         let reloaded = IdMap::load(idmap.path()).unwrap();
@@ -1901,10 +1974,13 @@ mod tests {
     }
 
     /// The FIRST teammate is the one case Claude Code already gets right:
-    /// `-t <lead> -h -l 70%` IS main-vertical for a two-pane tab. Honour it,
-    /// ratio included, so the lead keeps its column.
+    /// `-t <lead> -h -l 70%` IS main-vertical for a two-pane tab. Honour the
+    /// shape, but invert the ratio: tmux `-l 70%` sizes the NEW pane, herdr
+    /// `--ratio` is what the ORIGINAL keeps. Passed through, the lead kept 124
+    /// of 177 columns (measured on herdr 0.9.0); inverted, it keeps 30%, as
+    /// tmux would have left it.
     #[test]
-    fn split_window_honours_the_request_when_the_lead_is_alone() {
+    fn split_window_inverts_the_request_when_the_lead_is_alone() {
         let idmap = temp_idmap(&[("%0", "w1A:lead")]);
         let fake = FakeHerdr::default();
         *fake.layout_result.borrow_mut() =
@@ -1924,10 +2000,143 @@ mod tests {
         assert!(
             fake.calls()
                 .iter()
-                .any(|call| call == "pane_split_pane:w1A:lead:right:Some(0.7)"),
+                .any(|call| call == "pane_split_pane:w1A:lead:right:Some(0.3)"),
             "{:?}",
             fake.calls()
         );
+    }
+
+    /// `TEAMMUX_LEAD_WIDTH` names the lead's share outright, so the lead-only
+    /// split lands there and Claude Code's follow-up `resize-pane -x 30%`
+    /// (also overridden) has nothing left to move.
+    #[test]
+    fn split_window_uses_the_lead_width_override_when_the_lead_is_alone() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() =
+            Some(layout((0, 0, 100, 60), &[("w1A:lead", (0, 0, 100, 60))]));
+        *fake.split_result.borrow_mut() = Some(pane("w1A:t0", Some("w1A:t1")));
+
+        split_window(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%0").unwrap(),
+            tmuxargs::SplitDirection::Horizontal,
+            Some("70%"),
+            Some(0.5),
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call == "pane_split_pane:w1A:lead:right:Some(0.5)"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// The override is about the LEAD's column. A split off a teammate keeps
+    /// the requested size (inverted, as any tmux `-l` is), even when the
+    /// layout is unreadable and the arrangement falls back to the request.
+    #[test]
+    fn split_window_ignores_the_lead_width_override_for_a_teammate_target() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead"), ("%1", "w1A:t0")]);
+        let fake = FakeHerdr::default();
+        fake.fail_layout.set(true);
+        *fake.split_result.borrow_mut() = Some(pane("w1A:t1", Some("w1A:t1")));
+
+        split_window(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%1").unwrap(),
+            tmuxargs::SplitDirection::Vertical,
+            Some("70%"),
+            Some(0.5),
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call == "pane_split_pane:w1A:t0:down:Some(0.3)"),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// Lead at 30% of the tab, Claude Code asking for 30%: nothing to do.
+    /// With `TEAMMUX_LEAD_WIDTH=50` the same call widens the lead instead.
+    #[test]
+    fn resize_pane_uses_the_lead_width_override_for_the_lead() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(layout(
+            (0, 0, 200, 60),
+            &[("w1A:lead", (0, 0, 60, 60)), ("w1A:t0", (60, 0, 140, 60))],
+        ));
+
+        resize_pane(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%0").unwrap(),
+            "30%",
+            Some(0.5),
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.starts_with("pane_resize:w1A:lead:right:")),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    /// A teammate's own `resize-pane -x` keeps its requested target: 70% wide
+    /// asked to be 80% moves right; the lead override (50%) would have moved
+    /// it left.
+    #[test]
+    fn resize_pane_keeps_the_requested_target_for_a_teammate() {
+        let idmap = temp_idmap(&[("%0", "w1A:lead"), ("%1", "w1A:t0")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(layout(
+            (0, 0, 200, 60),
+            &[("w1A:lead", (0, 0, 60, 60)), ("w1A:t0", (60, 0, 140, 60))],
+        ));
+
+        resize_pane(
+            &fake,
+            &idmap,
+            &TmuxId::parse("%1").unwrap(),
+            "80%",
+            Some(0.5),
+        );
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|call| call.starts_with("pane_resize:w1A:t0:right:")),
+            "{:?}",
+            fake.calls()
+        );
+    }
+
+    #[test]
+    fn lead_split_ratio_inverts_the_request_unless_overridden() {
+        assert_eq!(lead_split_ratio(Some(0.7), None), Some(0.3));
+        assert_eq!(lead_split_ratio(Some(0.25), None), Some(0.75));
+        assert_eq!(lead_split_ratio(Some(0.7), Some(0.5)), Some(0.5));
+        assert_eq!(lead_split_ratio(None, Some(0.4)), Some(0.4));
+        assert_eq!(lead_split_ratio(None, None), None);
+    }
+
+    #[test]
+    fn parse_lead_width_accepts_percent_forms_and_rejects_the_rest() {
+        assert_eq!(parse_lead_width("50"), Some(0.5));
+        assert_eq!(parse_lead_width("50%"), Some(0.5));
+        assert_eq!(parse_lead_width(" 45 % "), Some(0.45));
+        assert_eq!(parse_lead_width("5"), Some(0.05));
+        assert_eq!(parse_lead_width("95"), Some(0.95));
+        assert_eq!(parse_lead_width("4"), None);
+        assert_eq!(parse_lead_width("96"), None);
+        assert_eq!(parse_lead_width("0.5"), None);
+        assert_eq!(parse_lead_width(""), None);
+        assert_eq!(parse_lead_width("half"), None);
     }
 
     /// Arrangement is cosmetic; spawning a teammate is not. An unreadable
