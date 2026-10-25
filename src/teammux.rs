@@ -279,14 +279,13 @@ fn publish_display_agent<H: HerdrApi>(herdr: &H, herdr_pane_id: &str, name: &str
     let _ = herdr.pane_report_metadata(herdr_pane_id, &update);
 }
 
-/// `resize-pane -t %N -x AMOUNT`: herdr models resize as a directional
-/// border move (`--direction left|right|up|down [--amount FLOAT]`), not
-/// tmux's absolute-size-target `-x`. Documented assumption (findings.md,
-/// live `herdr pane --help`): `-x` (horizontal) maps onto a fixed `right`
-/// direction, with the percentage converted to the same 0-1 ratio
-/// `split-window` uses — there is no tmux-side direction to carry over,
-/// only every observed spike call moving one lead pane. `-y` is not in the
-/// verb inventory and is not parsed.
+/// `resize-pane -t %N -x AMOUNT`: set the pane's width to AMOUNT of the tab,
+/// as tmux's absolute `-x` does. herdr only moves a split border by a ratio
+/// delta (`--direction left` shrinks the pane, `right` grows it; live-measured
+/// against herdr), so the shim reads the pane's current share of the tab from
+/// `pane layout` and moves the border by the difference. Every observed call
+/// targets the lead, whose split spans the whole tab, so the tab width is the
+/// split's width. `-y` is not in the verb inventory and is not parsed.
 fn resize_pane<H: HerdrApi>(
     herdr: &H,
     idmap: &IdMap,
@@ -297,7 +296,7 @@ fn resize_pane<H: HerdrApi>(
         Some(id) => id.to_owned(),
         None => return unknown_tmux_id("resize-pane", pane.as_str()),
     };
-    let ratio = match parse_percentage(amount) {
+    let target = match parse_percentage(amount) {
         Some(ratio) => ratio,
         None => {
             return DispatchOutcome::Error {
@@ -307,7 +306,39 @@ fn resize_pane<H: HerdrApi>(
             };
         }
     };
-    match herdr.pane_resize(&herdr_pane_id, "right", Some(ratio)) {
+    let layout = match herdr.pane_layout(&herdr_pane_id) {
+        Ok(layout) => layout,
+        Err(error) => {
+            return DispatchOutcome::Error {
+                message: format!("teammux: resize-pane: herdr pane layout failed: {error}"),
+            };
+        }
+    };
+    let Some(rect) = layout
+        .panes
+        .iter()
+        .find(|candidate| candidate.pane_id == herdr_pane_id)
+        .map(|candidate| &candidate.rect)
+    else {
+        return DispatchOutcome::Error {
+            message: format!(
+                "teammux: resize-pane: herdr pane `{herdr_pane_id}` missing from its own layout snapshot"
+            ),
+        };
+    };
+    if layout.area.width == 0 {
+        return DispatchOutcome::Ok {
+            stdout: String::new(),
+        };
+    }
+    let delta = f64::from(rect.width) / f64::from(layout.area.width) - target;
+    if delta.abs() < 0.01 {
+        return DispatchOutcome::Ok {
+            stdout: String::new(),
+        };
+    }
+    let direction = if delta > 0.0 { "left" } else { "right" };
+    match herdr.pane_resize(&herdr_pane_id, direction, Some(round_ratio(delta.abs()))) {
         Ok(()) => DispatchOutcome::Ok {
             stdout: String::new(),
         },
@@ -315,6 +346,11 @@ fn resize_pane<H: HerdrApi>(
             message: format!("teammux: resize-pane: herdr pane resize failed: {error}"),
         },
     }
+}
+
+/// Round a 0-1 ratio to two decimals, so float noise never reaches herdr.
+fn round_ratio(ratio: f64) -> f64 {
+    (ratio * 100.0).round() / 100.0
 }
 
 /// `split-window -h/-v [-l SIZE] -P -F #{pane_id} -- cat`: split `target`
@@ -340,10 +376,12 @@ fn split_window<H: HerdrApi>(
         tmuxargs::SplitDirection::Horizontal => "right",
         tmuxargs::SplitDirection::Vertical => "down",
     };
+    // tmux's `-l` sizes the new pane; herdr's `--ratio` is the share the
+    // split pane keeps (live-measured), so the new pane's share is inverted.
     let ratio = match size {
         None => None,
         Some(size) => match parse_percentage(size) {
-            Some(ratio) => Some(ratio),
+            Some(ratio) => Some(round_ratio(1.0 - ratio)),
             None => {
                 return DispatchOutcome::Error {
                     message: format!(
@@ -1160,7 +1198,7 @@ mod tests {
         assert!(fake
             .calls()
             .iter()
-            .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.7)"));
+            .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.3)"));
 
         // The new mapping is persisted, not just returned.
         let reloaded = IdMap::load(idmap.path()).unwrap();
@@ -1302,7 +1340,7 @@ mod tests {
         assert!(fake
             .calls()
             .iter()
-            .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.7)"));
+            .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.3)"));
         let reloaded = IdMap::load(idmap.path()).unwrap();
         assert!(reloaded.is_spawned("w1A:p2"));
         assert!(!reloaded.is_spawned("w1A:p1"));
@@ -1708,9 +1746,27 @@ mod tests {
     }
 
     #[test]
-    fn resize_pane_converts_percentage_and_maps_x_to_a_fixed_direction() {
+    fn resize_pane_shrinks_the_pane_to_the_requested_share_of_the_tab() {
         let idmap = temp_idmap(&[("%0", "w1A:p1")]);
         let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(PaneLayoutSnapshot {
+            area: PaneLayoutRect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 50,
+            },
+            panes: vec![PaneLayoutPane {
+                pane_id: "w1A:p1".to_owned(),
+                focused: true,
+                rect: PaneLayoutRect {
+                    x: 0,
+                    y: 0,
+                    width: 140,
+                    height: 50,
+                },
+            }],
+        });
 
         let outcome = dispatch(
             &fake,
@@ -1729,7 +1785,81 @@ mod tests {
         assert!(fake
             .calls()
             .iter()
-            .any(|call| call == "pane_resize:w1A:p1:right:Some(0.3)"));
+            .any(|call| call == "pane_resize:w1A:p1:left:Some(0.4)"));
+    }
+
+    #[test]
+    fn resize_pane_grows_a_pane_narrower_than_the_requested_share() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(PaneLayoutSnapshot {
+            area: PaneLayoutRect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 50,
+            },
+            panes: vec![PaneLayoutPane {
+                pane_id: "w1A:p1".to_owned(),
+                focused: true,
+                rect: PaneLayoutRect {
+                    x: 0,
+                    y: 0,
+                    width: 40,
+                    height: 50,
+                },
+            }],
+        });
+
+        dispatch(
+            &fake,
+            &idmap,
+            call(Verb::ResizePane {
+                pane: TmuxId::parse("%0").unwrap(),
+                amount: "30%".to_owned(),
+            }),
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_resize:w1A:p1:right:Some(0.1)"));
+    }
+
+    #[test]
+    fn resize_pane_already_at_the_requested_share_does_nothing() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1")]);
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(PaneLayoutSnapshot {
+            area: PaneLayoutRect {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 50,
+            },
+            panes: vec![PaneLayoutPane {
+                pane_id: "w1A:p1".to_owned(),
+                focused: true,
+                rect: PaneLayoutRect {
+                    x: 0,
+                    y: 0,
+                    width: 60,
+                    height: 50,
+                },
+            }],
+        });
+
+        dispatch(
+            &fake,
+            &idmap,
+            call(Verb::ResizePane {
+                pane: TmuxId::parse("%0").unwrap(),
+                amount: "30%".to_owned(),
+            }),
+        );
+        assert!(!fake
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("pane_resize")));
     }
 
     #[test]
