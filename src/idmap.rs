@@ -24,6 +24,8 @@ use fs4::FileExt;
 /// Env var the launcher sets to the per-session idmap state file path.
 pub const STATE_PATH_ENV: &str = "TEAMMUX_STATE_PATH";
 
+const SPAWNED_PREFIX: &str = "spawned:";
+
 #[derive(Debug, Error)]
 pub enum IdMapError {
     #[error("{STATE_PATH_ENV} is not set")]
@@ -141,6 +143,24 @@ impl IdMap {
         transact(path, |entries| {
             entries.remove(tmux_id);
         })
+    }
+
+    /// Record `herdr_id` as a pane this teammux session split off for a
+    /// teammate, so placement can tell teammates from the lead and from
+    /// foreign panes that share the tab. Stored as a `spawned:` key beside
+    /// the `%N`/`@N` entries; [`IdMap::allocate`] and the lookups only ever
+    /// read `%`/`@` keys and herdr-id values, so the marker is invisible to them.
+    pub fn mark_spawned(path: &Path, herdr_id: impl Into<String>) -> Result<(), IdMapError> {
+        let key = format!("{SPAWNED_PREFIX}{}", herdr_id.into());
+        transact(path, move |entries| {
+            entries.insert(key, String::new());
+        })
+    }
+
+    /// Whether [`IdMap::mark_spawned`] recorded `herdr_id`.
+    pub fn is_spawned(&self, herdr_id: &str) -> bool {
+        self.entries
+            .contains_key(&format!("{SPAWNED_PREFIX}{herdr_id}"))
     }
 
     /// Allocate the next unused tmux id with the given `prefix` (`'%'` for a
@@ -353,6 +373,20 @@ mod tests {
         let path = temp_state_path();
         IdMap::remove(&path, "%9").expect("removing an absent key must not error");
         assert_eq!(IdMap::load(&path).unwrap().lookup("%9"), None);
+    }
+
+    #[test]
+    fn a_spawned_marker_is_invisible_to_allocation_and_lookups() {
+        let path = temp_state_path();
+        IdMap::insert(&path, "%0", "w1A:p1").unwrap();
+        IdMap::mark_spawned(&path, "w1A:p2").unwrap();
+
+        assert_eq!(IdMap::allocate(&path, '%', "w1A:p2").unwrap(), "%1");
+        let map = IdMap::load(&path).unwrap();
+        assert!(map.is_spawned("w1A:p2"));
+        assert!(!map.is_spawned("w1A:p1"));
+        assert_eq!(map.reverse_lookup("w1A:p2"), Some("%1"));
+        assert_eq!(map.lookup("%1"), Some("w1A:p2"));
     }
 
     #[test]
