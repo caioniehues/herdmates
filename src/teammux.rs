@@ -73,7 +73,7 @@
 //! `list_pane_ids` already uses) and reads that pane's layout snapshot's
 //! `area` instead — one pane's snapshot already describes its whole tab.
 
-use crate::herdr::HerdrApi;
+use crate::herdr::{HerdrApi, PaneLayoutPane, PaneLayoutRect, PaneLayoutSnapshot};
 use crate::idmap::IdMap;
 use crate::metadata::{MetadataCapabilities, MetadataUpdate};
 use crate::tmuxargs::{self, DisplayField, ParseError, TmuxId, Verb};
@@ -353,6 +353,20 @@ fn split_window<H: HerdrApi>(
             }
         },
     };
+    // A teammate-on-teammate split is re-placed onto the roomiest teammate
+    // pane so the team fills a grid; the lead's own split keeps Claude Code's
+    // requested shape (the lead column).
+    let (herdr_target, herdr_direction, ratio) = if idmap.is_spawned(&herdr_target) {
+        match herdr.pane_layout(&herdr_target) {
+            Ok(layout) => match place_teammate(&layout, |id| idmap.is_spawned(id)) {
+                Some((pane, direction)) => (pane, direction, None),
+                None => (herdr_target, herdr_direction, ratio),
+            },
+            Err(_) => (herdr_target, herdr_direction, ratio),
+        }
+    } else {
+        (herdr_target, herdr_direction, ratio)
+    };
     let info = match herdr.pane_split_pane(&herdr_target, herdr_direction, ratio) {
         Ok(info) => info,
         Err(error) => {
@@ -361,6 +375,11 @@ fn split_window<H: HerdrApi>(
             };
         }
     };
+    if let Err(error) = IdMap::mark_spawned(idmap.path(), info.pane_id.clone()) {
+        return DispatchOutcome::Error {
+            message: format!("teammux: split-window: failed to record new pane: {error}"),
+        };
+    }
     match IdMap::allocate(idmap.path(), '%', info.pane_id) {
         Ok(new_tmux_id) => DispatchOutcome::Ok {
             stdout: format!("{new_tmux_id}\n"),
@@ -369,6 +388,48 @@ fn split_window<H: HerdrApi>(
             message: format!("teammux: split-window: failed to register new pane: {error}"),
         },
     }
+}
+
+/// Narrowest a teammate pane may become from a side-by-side split, in columns.
+const MIN_TEAMMATE_COLS: u16 = 80;
+/// Shortest a teammate pane may become from a top/bottom split, in rows.
+const MIN_TEAMMATE_ROWS: u16 = 12;
+
+/// Pick the teammate pane to split and the direction, so teammates fill a
+/// grid: the largest teammate pane is split along its longer side, side by
+/// side while both halves keep [`MIN_TEAMMATE_COLS`], else top/bottom while
+/// both keep [`MIN_TEAMMATE_ROWS`]. A terminal cell is about twice as tall as
+/// it is wide, so a pane counts as wide when its columns are at least twice
+/// its rows. `None` when no teammate pane can take either split.
+fn place_teammate(
+    layout: &PaneLayoutSnapshot,
+    is_teammate: impl Fn(&str) -> bool,
+) -> Option<(String, &'static str)> {
+    let fits_right = |rect: &PaneLayoutRect| rect.width.saturating_sub(1) / 2 >= MIN_TEAMMATE_COLS;
+    let fits_down = |rect: &PaneLayoutRect| rect.height.saturating_sub(1) / 2 >= MIN_TEAMMATE_ROWS;
+    let mut teammates: Vec<&PaneLayoutPane> = layout
+        .panes
+        .iter()
+        .filter(|pane| is_teammate(&pane.pane_id))
+        .filter(|pane| fits_right(&pane.rect) || fits_down(&pane.rect))
+        .collect();
+    // Largest first; ties go to reading order so the grid fills left to right, top to bottom.
+    teammates.sort_by_key(|pane| {
+        let rect = &pane.rect;
+        (
+            std::cmp::Reverse(u32::from(rect.width) * u32::from(rect.height)),
+            rect.y,
+            rect.x,
+        )
+    });
+    let pane = teammates.first()?;
+    let rect = &pane.rect;
+    let wide = u32::from(rect.width) >= 2 * u32::from(rect.height);
+    let direction = match (wide, fits_right(rect), fits_down(rect)) {
+        (true, true, _) | (false, true, false) => "right",
+        _ => "down",
+    };
+    Some((pane.pane_id.clone(), direction))
 }
 
 /// Parse tmux's `-l SIZE` percentage shape (e.g. `"70%"`) into a 0–1 ratio —
@@ -1104,6 +1165,175 @@ mod tests {
         // The new mapping is persisted, not just returned.
         let reloaded = IdMap::load(idmap.path()).unwrap();
         assert_eq!(reloaded.lookup("%1"), Some("w1A:p2"));
+    }
+
+    fn layout_of(panes: &[(&str, u16, u16, u16, u16)]) -> PaneLayoutSnapshot {
+        PaneLayoutSnapshot {
+            area: PaneLayoutRect {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 80,
+            },
+            panes: panes
+                .iter()
+                .map(|(id, x, y, width, height)| PaneLayoutPane {
+                    pane_id: (*id).to_owned(),
+                    focused: false,
+                    rect: PaneLayoutRect {
+                        x: *x,
+                        y: *y,
+                        width: *width,
+                        height: *height,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn teammates(ids: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |id| ids.contains(&id)
+    }
+
+    #[test]
+    fn a_wide_teammate_pane_is_split_side_by_side() {
+        let layout = layout_of(&[("lead", 0, 0, 90, 80), ("t1", 90, 0, 210, 80)]);
+        assert_eq!(
+            place_teammate(&layout, teammates(&["t1"])),
+            Some(("t1".to_owned(), "right"))
+        );
+    }
+
+    #[test]
+    fn a_teammate_column_too_narrow_to_halve_is_split_top_and_bottom() {
+        let layout = layout_of(&[
+            ("lead", 0, 0, 90, 80),
+            ("t1", 90, 0, 105, 80),
+            ("t2", 195, 0, 105, 80),
+        ]);
+        assert_eq!(
+            place_teammate(&layout, teammates(&["t1", "t2"])),
+            Some(("t1".to_owned(), "down"))
+        );
+    }
+
+    #[test]
+    fn the_largest_teammate_pane_takes_the_next_split() {
+        let layout = layout_of(&[
+            ("lead", 0, 0, 90, 80),
+            ("t1", 90, 0, 105, 40),
+            ("t3", 90, 40, 105, 40),
+            ("t2", 195, 0, 105, 80),
+        ]);
+        assert_eq!(
+            place_teammate(&layout, teammates(&["t1", "t2", "t3"])),
+            Some(("t2".to_owned(), "down"))
+        );
+    }
+
+    #[test]
+    fn the_lead_and_foreign_panes_are_never_chosen() {
+        let layout = layout_of(&[("lead", 0, 0, 200, 80), ("t1", 200, 0, 100, 20)]);
+        assert_eq!(place_teammate(&layout, teammates(&["t1"])), None);
+    }
+
+    #[test]
+    fn a_short_wide_pane_still_splits_side_by_side() {
+        let layout = layout_of(&[("t1", 0, 0, 170, 20)]);
+        assert_eq!(
+            place_teammate(&layout, teammates(&["t1"])),
+            Some(("t1".to_owned(), "right"))
+        );
+    }
+
+    #[test]
+    fn a_teammate_split_is_placed_on_the_roomiest_teammate_pane() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1"), ("%1", "w1A:p2"), ("%2", "w1A:p3")]);
+        IdMap::mark_spawned(idmap.path(), "w1A:p2").unwrap();
+        IdMap::mark_spawned(idmap.path(), "w1A:p3").unwrap();
+        let idmap = IdMap::load(idmap.path()).unwrap();
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(layout_of(&[
+            ("w1A:p1", 0, 0, 90, 80),
+            ("w1A:p2", 90, 0, 210, 40),
+            ("w1A:p3", 90, 40, 210, 40),
+        ]));
+        *fake.split_result.borrow_mut() = Some(pane("w1A:p4", Some("w1A:t1")));
+
+        let outcome = dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%2").unwrap(),
+                direction: tmuxargs::SplitDirection::Vertical,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Ok {
+                stdout: "%3\n".to_owned()
+            }
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_split_pane:w1A:p2:right:None"));
+        assert!(IdMap::load(idmap.path()).unwrap().is_spawned("w1A:p4"));
+    }
+
+    #[test]
+    fn the_leads_own_split_keeps_the_requested_shape_and_marks_the_teammate() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1")]);
+        let fake = FakeHerdr::default();
+        *fake.split_result.borrow_mut() = Some(pane("w1A:p2", Some("w1A:t1")));
+
+        dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%0").unwrap(),
+                direction: tmuxargs::SplitDirection::Horizontal,
+                size: Some("70%".to_owned()),
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_split_pane:w1A:p1:right:Some(0.7)"));
+        let reloaded = IdMap::load(idmap.path()).unwrap();
+        assert!(reloaded.is_spawned("w1A:p2"));
+        assert!(!reloaded.is_spawned("w1A:p1"));
+    }
+
+    #[test]
+    fn a_teammate_split_falls_back_to_the_request_when_no_pane_has_room() {
+        let idmap = temp_idmap(&[("%0", "w1A:p1"), ("%1", "w1A:p2")]);
+        IdMap::mark_spawned(idmap.path(), "w1A:p2").unwrap();
+        let idmap = IdMap::load(idmap.path()).unwrap();
+        let fake = FakeHerdr::default();
+        *fake.layout_result.borrow_mut() = Some(layout_of(&[
+            ("w1A:p1", 0, 0, 200, 80),
+            ("w1A:p2", 200, 0, 100, 20),
+        ]));
+        *fake.split_result.borrow_mut() = Some(pane("w1A:p3", Some("w1A:t1")));
+
+        dispatch(
+            &fake,
+            &idmap,
+            call(Verb::SplitWindow {
+                target: TmuxId::parse("%1").unwrap(),
+                direction: tmuxargs::SplitDirection::Vertical,
+                size: None,
+                command: vec!["cat".to_owned()],
+            }),
+        );
+        assert!(fake
+            .calls()
+            .iter()
+            .any(|call| call == "pane_split_pane:w1A:p2:down:None"));
     }
 
     #[test]
